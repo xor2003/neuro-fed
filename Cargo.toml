@@ -22,7 +22,7 @@ reqwest = { version = "0.13.2", features = ["json"], default-features = false }
 tokio = { version = "1.0", features = ["full"] }
 
 # Nostr protocol
-nostr-sdk = "0.44.1"
+nstr-sdk = "0.44.1"
 
 # Configuration and persistence
 config = "0.15.19"
@@ -40,6 +40,11 @@ rand = "0.10.0"
 rayon = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rand_distr = "0.6.0"
+
+# Serialization for ndarray and DateTime
+ndarray-rand = "0.16.0"
+serde_with = "3.0.0"
+chrono-serde = "0.9.0"
 
 # Tracing for logging
 tracing = "0.1"
