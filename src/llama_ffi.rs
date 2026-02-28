@@ -1,118 +1,76 @@
-// src/llama_ffi.rs
-// Simplified FFI bindings to llama.cpp for embeddings
-
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use std::path::Path;
 use std::sync::Arc;
+use std::path::Path;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
-use ndarray::{Array2, Array3};
-use thiserror::Error;
-use tracing::{debug, error, info, warn};
-
-/// FFI bindings to llama.cpp for embeddings and model operations
 #[derive(Debug)]
-pub struct LlamaContext {
-    model: *mut LlamaModel,
-    ctx: *mut LlamaContextHandle,
-    embedding_dim: usize,
-}
-
-/// Error types for llama FFI operations
-#[derive(Debug, Error)]
 pub enum LlamaError {
-    #[error("FFI call failed: {0}")]
-    FfiError(String),
-    #[error("Model loading failed: {0}")]
     ModelLoadError(String),
-    #[error("Embedding generation failed: {0}")]
-    EmbeddingError(String),
-    #[error("Invalid model path: {0}")]
-    InvalidPath(String),
-    #[error("Null pointer encountered")]
-    NullPointer,
+    InferenceError(String),
+    InvalidInput(String),
 }
 
-impl LlamaContext {
-    /// Create a new llama context with the specified model
-    pub async fn new(model_path: &str, context_size: usize) -> Result<Self, LlamaError> {
-        // Simplified implementation - in a real implementation this would call llama.cpp
-        info!("Creating llama context with model: {}", model_path);
-        
-        // Simulate model loading
-        if !Path::new(model_path).exists() {
-            return Err(LlamaError::InvalidPath(format!("Model not found: {}", model_path)));
+impl fmt::Display for LlamaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LlamaError::ModelLoadError(msg) => write!(f, "Model load error: {}", msg),
+            LlamaError::InferenceError(msg) => write!(f, "Inference error: {}", msg),
+            LlamaError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
         }
-        
-        // Simulate embedding dimension (typically 1024 or 2048)
-        let embedding_dim = 1024;
-        
-        Ok(Self {
-            model: std::ptr::null_mut(),
-            ctx: std::ptr::null_mut(),
-            embedding_dim,
-        })
-    }
-    
-    /// Generate embeddings for the given text
-    pub async fn generate_embedding(&self, text: &str) -> Result<Array2<f32>, LlamaError> {
-        debug!("Generating embedding for text: {:?}", text);
-        
-        // Simulate embedding generation - in a real implementation this would call llama.cpp
-        let dim = self.embedding_dim;
-        let embedding = Array2::ones((1, dim)); // Simplified - would normally be actual embedding
-        
-        Ok(embedding)
-    }
-    
-    /// Get the embedding dimension
-    pub fn embedding_dim(&self) -> usize {
-        self.embedding_dim
-    }
-    
-    /// Cleanup resources
-    pub fn cleanup(&mut self) {
-        info!("Cleaning up llama context");
-        // In a real implementation, this would free the llama.cpp resources
     }
 }
 
-// Simplified FFI declarations - in a real implementation these would be actual llama.cpp bindings
-#[repr(C)]
-struct LlamaModel;
-#[repr(C)]
-struct LlamaContextHandle;
+impl Error for LlamaError {}
 
-// Simplified FFI functions - in a real implementation these would be actual llama.cpp bindings
-extern "C" {
-    fn llama_context_create(model: *mut LlamaModel, n_ctx: i32) -> *mut LlamaContextHandle;
-    fn llama_get_embedding_dim(model: *mut LlamaModel) -> i32;
-    fn llama_get_embedding(embedding: *mut f32, dim: i32) -> *mut f32;
+pub struct LlamaModel {
+    model: Option<Arc<LlamaModelImpl>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_context_creation() {
-        let ctx = LlamaContext::new("test-model.gguf", 512).await;
-        assert!(ctx.is_ok());
+struct LlamaModelImpl {
+    // Implementation details would go here
+}
+
+impl LlamaModelImpl {
+    pub fn load<P: AsRef<Path>>(_path: P) -> Result<Arc<Self>, LlamaError> {
+        // Placeholder implementation
+        Ok(Arc::new(LlamaModelImpl {}))
     }
-    
-    #[tokio::test]
-    async fn test_embedding_generation() {
-        let ctx = LlamaContext::new("test-model.gguf", 512).await.unwrap();
-        let embedding = ctx.generate_embedding("test text").await;
-        assert!(embedding.is_ok());
-        let embedding = embedding.unwrap();
-        assert_eq!(embedding.shape(), &[1, 1024]);
+
+    pub fn infer(&self, _input: &str) -> Result<String, LlamaError> {
+        // Placeholder implementation
+        Ok("Hello from Llama model!".to_string())
     }
-    
-    #[tokio::test]
-    async fn test_embedding_dim() {
-        let ctx = LlamaContext::new("test-model.gguf", 512).await.unwrap();
-        assert_eq!(ctx.embedding_dim(), 1024);
+
+    pub fn get_embedding(&self, _input: &str) -> Result<Vec<f32>, LlamaError> {
+        // Placeholder implementation
+        Ok(vec![0.0; 768])
+    }
+}
+
+impl LlamaModel {
+    pub fn new() -> Self {
+        LlamaModel { model: None }
+    }
+
+    pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), LlamaError> {
+        self.model = Some(LlamaModelImpl::load(path)?);
+        Ok(())
+    }
+
+    pub fn infer(&self, input: &str) -> Result<String, LlamaError> {
+        if let Some(model) = &self.model {
+            model.infer(input)
+        } else {
+            Err(LlamaError::ModelLoadError("Model not loaded".to_string()))
+        }
+    }
+
+    pub fn get_embedding(&self, input: &str) -> Result<Vec<f32>, LlamaError> {
+        if let Some(model) = &self.model {
+            model.get_embedding(input)
+        } else {
+            Err(LlamaError::ModelLoadError("Model not loaded".to_string()))
+        }
     }
 }

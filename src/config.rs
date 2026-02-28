@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error, debug, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeConfig {
     pub model_path: String,
     pub context_size: usize,
@@ -21,7 +21,7 @@ pub struct NodeConfig {
     pub wallet_address: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MLConfig {
     pub model_path: String,
     pub device_type: String,
@@ -30,7 +30,7 @@ pub struct MLConfig {
     pub use_gpu: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NostrConfig {
     pub relay_urls: Vec<String>,
     pub public_key: String,
@@ -39,7 +39,7 @@ pub struct NostrConfig {
     pub publish_interval: u64, // seconds
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PCConfig {
     pub n_levels: usize,
     pub dim_per_level: Vec<usize>,
@@ -47,7 +47,7 @@ pub struct PCConfig {
     pub muPC_scaling: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BootstrapConfig {
     pub model_path: String,
     pub embedding_dim: usize,

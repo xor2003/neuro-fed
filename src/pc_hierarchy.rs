@@ -1,7 +1,11 @@
 // src/pc_hierarchy.rs
 // Pure Predictive Coding (PC) implementation based on Rao-Ballard/Friston free-energy minimization
 
+#![recursion_limit = "4096"]
+
 use ndarray::{Array, Array2, Array3, Axis};
+use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ndarray_linalg::Norm;
 use std::error::Error;
 use std::fmt;
@@ -17,7 +21,6 @@ impl fmt::Display for PCError {
 
 impl Error for PCError {}
 
-type Result<T> = std::result::Result<T, PCError>;
 
 #[derive(Debug, Clone)]
 pub struct PCConfig {
@@ -59,7 +62,7 @@ pub struct PCLevel {
     pub beliefs: Array2<f32>,
     pub predictions: Array2<f32>,
     pub errors: Array2<f32>,
-    pub weights: Array3<f32>,
+    pub weights: Array2<f32>,
     pub precision: Array2<f32>,
 }
 
@@ -68,7 +71,7 @@ impl PCLevel {
         let beliefs = Array2::zeros((input_dim, 1));
         let predictions = Array2::zeros((input_dim, 1));
         let errors = Array2::zeros((input_dim, 1));
-        let weights = Array3::zeros((input_dim, output_dim, 1));
+        let weights = Array2::zeros((input_dim, output_dim));
         let precision = Array2::ones((input_dim, 1));
 
         PCLevel {
@@ -82,7 +85,7 @@ impl PCLevel {
 
     pub fn predict(&mut self) {
         // r_hat_l = U_l * r_{l+1}
-        // Matrix multiplication: weights (input_dim x output_dim x batch) * beliefs_next_level (output_dim x batch)
+        // Matrix multiplication: weights (input_dim x output_dim) * beliefs_next_level (output_dim x batch)
         let pre_activation = self.weights
             .dot(&self.beliefs_next_level())
             .mapv(|x| x); // Identity activation function
@@ -156,7 +159,7 @@ impl PredictiveCoding {
             
             // Initialize weights with small random values
             if i < config.n_levels - 1 {
-                let weights = Array3::random((input_dim, output_dim, 1), ndarray::RandomExt::randn);
+                let weights = Array2::random((input_dim, output_dim), Uniform::new(-0.1, 0.1).unwrap());
                 level.weights = weights * 0.01; // Scale down
             }
             
@@ -165,7 +168,7 @@ impl PredictiveCoding {
 
         Ok(PredictiveCoding {
             levels,
-            config,
+            config: config.clone(),
             surprise_threshold: config.surprise_threshold,
             free_energy: 0.0,
         })
@@ -192,14 +195,14 @@ impl PredictiveCoding {
             // Downward pass: update beliefs based on errors
             for l in (0..self.levels.len() - 1).rev() {
                 // Belief update: r_l = r_l + eta * epsilon_l
-                self.levels[l].beliefs = &self.levels[l].beliefs + 
+                self.levels[l].beliefs = &self.levels[l].beliefs +
                     self.config.learning_rate * &self.levels[l].errors;
                 
-                // Propagate error upward (simplified)
+                // Propagate error upward: epsilon_{l+1} += U_l^T · epsilon_l
                 if l < self.levels.len() - 2 {
-                    // This would normally involve more complex propagation
-                    // For now, we'll just add the errors
-                    self.levels[l+1].beliefs = &self.levels[l+1].beliefs + &self.levels[l].errors;
+                    let weight_transpose = self.levels[l].weights.t();
+                    let propagated_error = weight_transpose.dot(&self.levels[l].errors);
+                    self.levels[l+1].errors = &self.levels[l+1].errors + &propagated_error;
                 }
             }
             
@@ -252,7 +255,7 @@ impl PredictiveCoding {
         fe / self.levels.len() as f32
     }
 
-    pub fn surprise(&self, input: &Array2<f32>) -> Result<f32, PCError> {
+    pub fn surprise(&mut self, input: &Array2<f32>) -> Result<f32, PCError> {
         let stats = self.infer(input, 1)?;
         Ok(stats.free_energy_history.last().unwrap_or(&0.0).clone())
     }
@@ -299,7 +302,7 @@ mod tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input
-        let input = Array2::random((512, 1), ndarray::RandomExt::randn);
+        let input = Array2::random((512, 1), ndarray_rand::rand_distr::Uniform::new(-1.0, 1.0).unwrap());
         
         let stats = pc.infer(&input, 10).unwrap();
         assert_eq!(stats.free_energy_history.len(), 10);
@@ -311,7 +314,7 @@ mod tests {
         let config = PCConfig::new(3, vec![512, 256, 128]);
         let mut pc = PredictiveCoding::new(config).unwrap();
         
-        let input = Array2::random((512, 1), ndarray::RandomExt::randn);
+        let input = Array2::random((512, 1), ndarray_rand::rand_distr::Uniform::new(-1.0, 1.0).unwrap());
         
         let stats = pc.learn(&input).unwrap();
         assert!(stats.free_energy_history.len() > 0);
@@ -322,7 +325,7 @@ mod tests {
         let config = PCConfig::new(3, vec![512, 256, 128]);
         let mut pc = PredictiveCoding::new(config).unwrap();
         
-        let input = Array2::random((512, 1), ndarray::RandomExt::randn);
+        let input = Array2::random((512, 1), ndarray_rand::rand_distr::Uniform::new(-1.0, 1.0).unwrap());
         let surprise = pc.surprise(&input).unwrap();
         assert!(surprise >= 0.0);
     }
@@ -339,7 +342,6 @@ mod tests {
         // Test out of bounds
         assert!(pc.get_beliefs(10).is_err());
     }
-}
 
 // Example usage
 #[cfg(test)]
@@ -349,7 +351,7 @@ pub fn example_usage() {
     let mut pc = PredictiveCoding::new(config).unwrap();
     
     // Create random input
-    let input = Array2::random((512, 1), ndarray::RandomExt::randn);
+    let input = Array2::random((512, 1), ndarray_rand::rand_distr::Uniform::new(-1.0, 1.0).unwrap());
     
     // Perform inference
     let stats = pc.infer(&input, 20).unwrap();
@@ -363,4 +365,5 @@ pub fn example_usage() {
     // Get beliefs from level 1
     let beliefs = pc.get_beliefs(1).unwrap();
     println!("Level 1 beliefs shape: {:?}", beliefs.shape());
+}
 }

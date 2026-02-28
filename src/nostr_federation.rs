@@ -67,9 +67,10 @@ pub struct NostrFederation {
 
 impl NostrFederation {
     pub fn new(config: NostrConfig) -> Self {
+        let relays = config.relay_urls.clone();
         Self {
             config,
-            relays: config.relay_urls.clone(),
+            relays,
             event_cache: HashMap::new(),
             shutdown_signal: Arc::new(AtomicBool::new(false)),
         }
