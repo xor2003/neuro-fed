@@ -198,11 +198,11 @@ impl PredictiveCoding {
                 self.levels[l].beliefs = &self.levels[l].beliefs +
                     self.config.learning_rate * &self.levels[l].errors;
                 
-                // Propagate error upward: epsilon_{l+1} += U_l^T · epsilon_l
+                // Propagate error upward to influence beliefs at next level: r_{l+1} += eta * U_l^T · epsilon_l
                 if l < self.levels.len() - 2 {
                     let weight_transpose = self.levels[l].weights.t();
-                    let propagated_error = weight_transpose.dot(&self.levels[l].errors);
-                    self.levels[l+1].errors = &self.levels[l+1].errors + &propagated_error;
+                    let belief_update = self.config.learning_rate * weight_transpose.dot(&self.levels[l].errors);
+                    self.levels[l+1].beliefs = &self.levels[l+1].beliefs + &belief_update;
                 }
             }
             
