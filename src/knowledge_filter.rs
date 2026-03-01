@@ -423,9 +423,7 @@ fn test_precision_clamping() {
 mod integration_tests {
     use super::*;
     use crate::pc_hierarchy::{PCConfig, PredictiveCoding};
-    use ndarray::Array2;
-    use ndarray_rand::RandomExt;
-    use ndarray_rand::rand_distr::Uniform;
+    use candle_core::{Device, Tensor};
 
     #[test]
     fn test_precision_weighting_integration() {
@@ -438,7 +436,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // First inference to establish baseline free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
@@ -470,7 +469,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
@@ -503,7 +503,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
@@ -537,7 +538,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
@@ -569,7 +571,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // First learning iteration
         let context1 = None;
@@ -605,7 +608,8 @@ mod integration_tests {
         let mut pc = PredictiveCoding::new(config).unwrap();
         
         // Create random input data with correct shape (10 rows, 1 column)
-        let input = Array2::random((10, 1), Uniform::new(-1.0, 1.0).unwrap());
+        let device = Device::Cpu;
+        let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
         
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();

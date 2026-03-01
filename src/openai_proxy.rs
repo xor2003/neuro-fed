@@ -14,7 +14,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tracing::{info, error, debug, warn};
-use ndarray::Array2;
+use candle_core::Tensor;
 
 use crate::ml_engine::MLEngine;
 use crate::config::{NodeConfig, BackendConfig};
@@ -425,10 +425,14 @@ impl OpenAiProxy {
             }
         };
         
-        // Convert embedding to ndarray for PC hierarchy
-        let embedding_clone = embedding.clone();
-        let embedding_array = Array2::from_shape_vec((1, embedding_clone.len()), embedding_clone)
-            .expect("Failed to create embedding array");
+        // Convert embedding to Tensor for PC hierarchy
+        let embedding_len = embedding.len();
+        let embedding_tensor = Tensor::from_vec(embedding.clone(), (1, embedding_len), &candle_core::Device::Cpu)
+            .map_err(|e| {
+                error!("Failed to create embedding tensor: {}", e);
+                std::process::exit(1);
+            })
+            .expect("Failed to create embedding tensor");
         
         // Clone the PC hierarchy for spawn_blocking
         let pc_hierarchy = self.pc_hierarchy.clone();
@@ -436,7 +440,7 @@ impl OpenAiProxy {
         // Perform heavy CPU inference in spawn_blocking
         match tokio::task::spawn_blocking(move || {
             let mut pc = pc_hierarchy.blocking_lock();
-            pc.infer(&embedding_array, 10)
+            pc.infer(&embedding_tensor, 10)
         }).await {
             Ok(Ok(stats)) => {
                 debug!("PC inference completed with surprise: {}", stats.total_surprise);
@@ -473,8 +477,9 @@ impl OpenAiProxy {
         combined.extend(resp_data);
         
         // Ensure dimensions match PC hierarchy input
-        let combined_array = Array2::from_shape_vec((1, combined.len()), combined)
-            .map_err(|e| ProxyError::PCError(format!("Failed to create learning array: {}", e)))?;
+        let combined_len = combined.len();
+        let combined_tensor = Tensor::from_vec(combined, (1, combined_len), &candle_core::Device::Cpu)
+            .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))?;
         
         // Clone the PC hierarchy for spawn_blocking
         let pc_hierarchy = self.pc_hierarchy.clone();
@@ -482,7 +487,7 @@ impl OpenAiProxy {
         // Perform heavy CPU learning in spawn_blocking
         tokio::task::spawn_blocking(move || {
             let mut pc = pc_hierarchy.blocking_lock();
-            pc.learn_legacy(&combined_array)
+            pc.learn_legacy(&combined_tensor)
         }).await
         .map_err(|join_err| ProxyError::PCError(format!("PC learning task panicked: {}", join_err)))?
         .map_err(|e| ProxyError::PCError(format!("PC learning failed: {}", e)))?;

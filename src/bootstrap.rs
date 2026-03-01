@@ -213,7 +213,7 @@ impl BootstrapResult {
     
     pub fn from_ndarray(beliefs: Vec<Array2<f32>>, weights: Vec<Array3<f32>>, metadata: BootstrapMetadata) -> Self {
         Self {
-            beliefs: beliefs.iter().map(|arr| {
+            beliefs: beliefs.iter().map(|arr: &Array2<f32>| {
                 // Convert Array2<f32> back to Vec<Vec<f32>>
                 let (rows, _cols) = arr.dim();
                 let mut result = Vec::with_capacity(rows);
@@ -223,7 +223,7 @@ impl BootstrapResult {
                 }
                 result
             }).collect(),
-            weights: weights.iter().map(|arr| {
+            weights: weights.iter().map(|arr: &Array3<f32>| {
                 // Convert Array3<f32> back to Vec<Vec<Vec<f32>>>
                 let (depth, rows, _cols) = arr.dim();
                 let mut result = Vec::with_capacity(depth);

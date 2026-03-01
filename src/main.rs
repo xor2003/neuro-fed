@@ -11,6 +11,7 @@ use neuro_fed_node::federation_manager::{FederationManager, FederationManagerCon
 use neuro_fed_node::payment_verifier::PaymentVerifier;
 use neuro_fed_node::pow_verifier::PoWVerifier;
 use neuro_fed_node::privacy_networks::PrivacyNetworkManager;
+use candle_core::{Tensor, Device};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,7 +193,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         if counter % 5 == 0 {
             info!("Running inference...");
-            let input = ndarray::Array2::ones((1, 2048));
+            let input = Tensor::ones((1, 2048), candle_core::DType::F32, &Device::Cpu)
+                .expect("Failed to create input tensor");
             
             // Update metrics
             {
