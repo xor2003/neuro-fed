@@ -88,3 +88,25 @@ NeuroFed will immediately begin intercepting requests. If it knows the answer, i
 *   **Mesh Networking (Yggdrasil):** End-to-end encrypted IPv6 mesh networking for direct, NAT-bypassing peer communication.
 *   **Darknet Routing (Tor / I2P):** Optional SOCKS5 proxy routing via `.onion` and `.b32.i2p` addresses to hide node IP addresses from corporate surveillance.
 *   **Web of Trust:** Strict cryptographic signature verification. Nodes only accept knowledge deltas from pubkeys in the user's NIP-02 Contact List or economically verified events.
+
+---
+
+## 📚 Scientific Foundations
+
+NeuroFed is not a "black box" neural network. It is a direct implementation of decades of neuroscience research into how the biological cortex actually learns and reasons.
+
+### 1. The Core Engine: Predictive Coding
+The architecture is based on the **Rao-Ballard model**, which posits that the brain is a hierarchical inference engine that constantly generates top-down predictions and minimizes bottom-up prediction errors (Free Energy).
+*   *Rao, R. P., & Ballard, D. H. (1999).* **[Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects.](https://www.nature.com/articles/nn0199_79)** *Nature Neuroscience*.
+
+### 2. The Learning Objective: Free Energy Principle
+We minimize "Surprise" (thermodynamic Free Energy) rather than just "Loss". This allows the node to learn continuously from a single example without the catastrophic forgetting common in backpropagation-based systems.
+*   *Friston, K. (2010).* **[The free-energy principle: a unified brain theory?](https://www.nature.com/articles/nrn2787)** *Nature Reviews Neuroscience*.
+
+### 3. The Federation Protocol: Collective Predictive Coding (CPC)
+NeuroFed implements Taniguchi's hypothesis that shared symbols (language/logic) emerge from decentralized Bayesian inference across a population of agents, rather than from a central training run.
+*   *Taniguchi, T., et al. (2023).* **[Collective predictive coding hypothesis: symbol emergence as decentralized Bayesian inference.](https://www.frontiersin.org/articles/10.3389/frobt.2023.1233777/full)** *Frontiers in Robotics and AI*.
+
+### 4. Scaling to Deep Hierarchies: μPC
+To handle complex reasoning tasks, we utilize the "Micro Predictive Coding" (μPC) parameterization, allowing deep hierarchical networks to be trained stably using local learning rules.
+*   *Innocenti, F., et al. (2025).* **[μPC: Scaling Predictive Coding to 100+ Layer Networks.](https://arxiv.org/abs/2505.13124)** *arXiv preprint*.

@@ -68,6 +68,22 @@ impl MLEngine {
     pub fn new(model_path: &str, device_type: DeviceType) -> Result<Self, MLError> {
         info!("Creating ML engine with legacy API for model: {}", model_path);
         
+        // Ensure models directory exists
+        let models_dir = std::path::Path::new(model_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+        if !models_dir.exists() {
+            std::fs::create_dir_all(models_dir).map_err(|e| {
+                MLError::ModelLoadError(format!("Failed to create models directory: {}", e))
+            })?;
+            info!("Created models directory: {:?}", models_dir);
+        }
+        
+        // Check if model file exists
+        let model_file = std::path::Path::new(model_path);
+        if !model_file.exists() {
+            warn!("Model file {} does not exist. Using dummy embeddings.", model_path);
+            info!("To download a small model, run: mkdir -p models && curl -L https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q2_K.gguf -o {}", model_path);
+        }
+        
         // Create a default ModelManager for backward compatibility
         let config = crate::config::NodeConfig::default();
         let model_manager = Arc::new(ModelManager::new(config));
@@ -150,8 +166,10 @@ impl MLEngine {
         // This maintains backward compatibility with existing tests expecting shape [10]
         if self.model_info.is_none() {
             warn!("No model loaded, returning dummy tensor for compatibility");
-            let data = vec![0.0; 10];
-            return Ok(Tensor::from_slice(&data, (10,), &self.device)
+            // Create dummy tensor with size 512 to match PC hierarchy input dimension
+            // Must be 2D tensor with shape (512, 1) for PC hierarchy compatibility
+            let data: Vec<f32> = vec![0.0; 512];
+            return Ok(Tensor::from_slice(&data, (512, 1), &self.device)
                 .map_err(|e| MLError::ModelLoadError(format!("Failed to create dummy tensor: {}", e)))?);
         }
         
@@ -265,8 +283,8 @@ mod tests {
         };
         let engine = MLEngine::new("test-model", device_type).unwrap();
         let result = engine.process_text("test").await.unwrap();
-        // Should return tensor of shape [10] for compatibility
-        assert_eq!(result.shape().dims(), &[10]);
+        // Should return tensor of shape [512, 1] for PC hierarchy compatibility
+        assert_eq!(result.shape().dims(), &[512, 1]);
     }
     
     #[tokio::test]
@@ -280,5 +298,22 @@ mod tests {
         let info = engine.get_model_info();
         assert!(info.contains_key("device"));
         assert!(info.contains_key("model_name"));
+    }
+
+    #[tokio::test]
+    async fn test_dummy_tensor_shape() {
+        // Test that dummy tensor has correct shape (512, 1) for PC hierarchy compatibility
+        let device_type = DeviceType {
+            name: "CPU".to_string(),
+            description: "".to_string(),
+            supported: true,
+        };
+        let engine = MLEngine::new("test-model", device_type).unwrap();
+        let result = engine.process_text("test").await.unwrap();
+        assert_eq!(result.shape().dims(), &[512, 1], "Dummy tensor should have shape (512, 1) for PC hierarchy compatibility");
+        
+        // Verify tensor has correct number of elements
+        let total_elements: usize = result.shape().dims().iter().product();
+        assert_eq!(total_elements, 512, "Dummy tensor should have 512 elements");
     }
 }

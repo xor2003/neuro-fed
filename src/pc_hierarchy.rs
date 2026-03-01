@@ -458,6 +458,45 @@ mod tests {
     }
 
     #[test]
+    fn test_dimension_mismatch_error() -> Result<(), PCError> {
+        // Test that incorrect input dimension triggers proper error
+        let config = PCConfig::new(3, vec![512, 256, 128]);
+        let mut pc = PredictiveCoding::new(config)?;
+        
+        let device = Device::Cpu;
+        // Create input with wrong dimension (1 instead of 512) - must be 2D tensor
+        let wrong_input = Tensor::ones((1, 1), candle_core::DType::F32, &device)?;
+        
+        // This should fail with dimension mismatch error
+        let result = pc.infer(&wrong_input, 10);
+        assert!(result.is_err());
+        
+        // Verify error message contains dimension information
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("dimension"));
+        assert!(err_msg.contains("512"));
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_correct_dimension_works() -> Result<(), PCError> {
+        // Test that correct input dimension works
+        let config = PCConfig::new(3, vec![512, 256, 128]);
+        let mut pc = PredictiveCoding::new(config)?;
+        
+        let device = Device::Cpu;
+        let correct_input = Tensor::ones((512, 1), candle_core::DType::F32, &device)?;
+        
+        // This should succeed
+        let result = pc.infer(&correct_input, 10);
+        assert!(result.is_ok());
+        
+        Ok(())
+    }
+
+    #[test]
     fn test_surprise() -> Result<(), PCError> {
         let config = PCConfig::new(3, vec![512, 256, 128]);
         let mut pc = PredictiveCoding::new(config)?;

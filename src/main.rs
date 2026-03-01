@@ -27,14 +27,26 @@ use tracing_subscriber;
 #[command(name = "neurofed")]
 #[command(about = "NeuroFed Node - Decentralized Federated AGI System")]
 #[command(version = "0.1.0")]
+#[command(arg_required_else_help(false))]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the NeuroFed daemon (OpenAI proxy server)
+    /// Start both proxy daemon and interactive chat (default)
+    Default {
+        /// Port for the daemon
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+        
+        /// Host for the daemon
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    
+    /// Start only the NeuroFed daemon (OpenAI proxy server)
     Daemon {
         /// Port to listen on
         #[arg(short, long, default_value_t = 8080)]
@@ -52,7 +64,7 @@ enum Commands {
         url: String,
     },
     
-    /// Run the full NeuroFed node with all components (default)
+    /// Run the full NeuroFed node with all components
     Run {
         /// Enable brain sharing
         #[arg(long)]
@@ -86,24 +98,23 @@ fn spawn_metrics_dashboard(
             let pc = pc_hierarchy.lock().await;
             let metrics = metrics.lock().await;
             
-            // Clear screen (optional, gives it a top/htop feel)
-            print!("\x1B[2J\x1B[1;1H");
-
+            // Print separator and timestamp instead of clearing screen
+            let now = chrono::Utc::now();
+            println!("\n--- Dashboard Update: {} ---", now.format("%H:%M:%S"));
+            println!("🧠 NEUROFED NODE STATUS");
             println!("=========================================================");
-            println!("🧠 NEUROFED NODE STATUS                 🟢 ONLINE");
-            println!("=========================================================\n");
             
             println!("[ COGNITION & PC HIERARCHY ]");
             println!("  Current Free Energy (Surprise): {:.4}", pc.free_energy);
             println!("  Hierarchy Depth:                {} levels", pc.levels.len());
             println!("  Total Inference Cycles:         {}", metrics.inference_count);
             println!("  Total Learning Cycles:          {}", metrics.learning_count);
-            println!("  Free Energy (Latest):           {:.4}\n", metrics.free_energy);
+            println!("  Free Energy (Latest):           {:.4}", metrics.free_energy);
             
             println!("[ FEDERATION & NETWORK ]");
             println!("  Privacy Network:                {:?}", "Not implemented in dashboard");
             println!("  Federation Strategy:            {:?}", "Not implemented in dashboard");
-            println!("=========================================================");
+            println!("=========================================================\n");
         }
     });
 }
@@ -146,6 +157,33 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
 
     info!("Starting OpenAI proxy server on {}:{}", host, port);
     proxy.start(port).await?;
+    
+    Ok(())
+}
+
+/// Start both daemon and chat in parallel
+async fn start_both(port: u16, host: String) -> Result<(), Box<dyn Error>> {
+    use tokio::task;
+    
+    // Start daemon in a separate task
+    let daemon_handle = task::spawn(async move {
+        if let Err(e) = start_daemon(port, host).await {
+            eprintln!("Daemon error: {}", e);
+        }
+    });
+    
+    // Give daemon a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
+    // Start chat in the main task
+    let url = format!("http://{}:{}", "127.0.0.1", port);
+    println!("Starting chat client connecting to {}", url);
+    if let Err(e) = start_chat(url).await {
+        eprintln!("Chat error: {}", e);
+    }
+    
+    // Wait for daemon (it will run forever)
+    daemon_handle.await?;
     
     Ok(())
 }
@@ -258,9 +296,28 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
                             "content": content
                         }));
                         
-                        // Print response with single-line statistics
-                        println!("🧠 {}", content);
-                        println!("📊 Response time: {:.2}s, History: {} messages", elapsed.as_secs_f32(), message_history.len());
+                        // Determine color based on model source
+                        let model = response_json.get("model")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown");
+                        
+                        // ANSI color codes
+                        let green = "\x1b[32m";
+                        let yellow = "\x1b[33m";
+                        let red = "\x1b[31m";
+                        let reset = "\x1b[0m";
+                        
+                        let (color, source) = if model.contains("neurofed") || model.contains("pc") {
+                            (green, "PC Model")
+                        } else if model.contains("gpt-3.5") || model.contains("gpt-4") {
+                            (yellow, "OpenAI Remote")
+                        } else {
+                            (red, "Local Model")
+                        };
+                        
+                        // Print colored response
+                        println!("{}🧠 {} (Source: {}){}", color, content, source, reset);
+                        println!("📊 Model: {}, Response time: {:.2}s, History: {} messages", model, elapsed.as_secs_f32(), message_history.len());
                     } else {
                         println!("⚠️  No valid response from daemon");
                         println!("📊 Response time: {:.2}s", elapsed.as_secs_f32());
@@ -422,7 +479,7 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
 
         if counter % 5 == 0 {
             info!("Running inference...");
-            let input = Tensor::ones((1, 2048), candle_core::DType::F32, &Device::Cpu)
+            let input = Tensor::ones((2048,), candle_core::DType::F32, &Device::Cpu)
                 .expect("Failed to create input tensor");
             
             // Update metrics
@@ -453,14 +510,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon { port, host } => {
+        Some(Commands::Default { port, host }) => {
+            start_both(port, host).await
+        }
+        Some(Commands::Daemon { port, host }) => {
             start_daemon(port, host).await
         }
-        Commands::Chat { url } => {
+        Some(Commands::Chat { url }) => {
             start_chat(url).await
         }
-        Commands::Run { brain_sharing, privacy } => {
+        Some(Commands::Run { brain_sharing, privacy }) => {
             run_full_node(brain_sharing, privacy).await
+        }
+        None => {
+            // Default behavior: start both proxy and chat
+            start_both(8080, "127.0.0.1".to_string()).await
         }
     }
 }

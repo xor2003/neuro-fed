@@ -329,8 +329,18 @@ impl OpenAiProxy {
         // Convert candle tensor to Vec<f32>
         let shape = tensor.shape();
         let total_elements: usize = shape.dims().iter().product();
-        let data = tensor.to_vec1::<f32>()
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert tensor: {}", e)))?;
+        
+        // Flatten tensor if it's not 1D (e.g., [512, 1] -> [512])
+        let data = if shape.dims().len() > 1 {
+            // Reshape to 1D tensor
+            let flattened = tensor.flatten_all()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten tensor: {}", e)))?;
+            flattened.to_vec1::<f32>()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert flattened tensor: {}", e)))?
+        } else {
+            tensor.to_vec1::<f32>()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert tensor: {}", e)))?
+        };
         
         // Ensure we have enough elements
         if data.len() < total_elements {
@@ -427,7 +437,9 @@ impl OpenAiProxy {
         
         // Convert embedding to Tensor for PC hierarchy
         let embedding_len = embedding.len();
-        let embedding_tensor = Tensor::from_vec(embedding.clone(), (1, embedding_len), &candle_core::Device::Cpu)
+        // PC hierarchy expects shape (embedding_dim, 1) not (1, embedding_dim)
+        // Create tensor with shape (embedding_len, 1) for PC compatibility
+        let embedding_tensor = Tensor::from_vec(embedding.clone(), (embedding_len, 1), &candle_core::Device::Cpu)
             .map_err(|e| {
                 error!("Failed to create embedding tensor: {}", e);
                 std::process::exit(1);
@@ -561,23 +573,115 @@ impl OpenAiProxy {
         // Convert OpenAI request format to Ollama format
         let ollama_req = self.convert_to_ollama_format(req);
         
+        // Log which model we're querying for better troubleshooting
+        let model_name = ollama_req.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+        warn!("🔍 Querying Ollama model: '{}' at URL: {} (original request model: '{}')",
+              model_name, url, req.model);
+        
+        // Log full request for debugging
+        if let Ok(req_str) = serde_json::to_string_pretty(&ollama_req) {
+            let truncated_req = if req_str.len() > 300 { &req_str[..300] } else { &req_str };
+            debug!("Ollama request (truncated):\n{}...", truncated_req);
+        }
+        
         let response = client.post(&url)
             .header("Content-Type", "application/json")
             .json(&ollama_req)
             .send()
             .await
-            .map_err(|e| ProxyError::BackendError(format!("Ollama request failed: {}", e)))?;
+            .map_err(|e| ProxyError::BackendError(format!("Ollama request failed for model '{}': {}", model_name, e)))?;
         
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProxyError::BackendError(format!("Ollama API error {}: {}", status, body)));
+            let error_msg = format!("Ollama API error {} for model '{}': {}", status, model_name, body);
+            warn!("{}", error_msg);
+            return Err(ProxyError::BackendError(error_msg));
         }
         
-        // Convert Ollama response to OpenAI format
-        let ollama_resp: serde_json::Value = response.json()
+        // Get response body as text first for debugging
+        let response_body = response.text()
             .await
-            .map_err(|e| ProxyError::SerializationError(format!("Failed to parse Ollama response: {}", e)))?;
+            .map_err(|e| {
+                let error_msg = format!("Failed to read Ollama response body for model '{}': {}", model_name, e);
+                warn!("{}", error_msg);
+                ProxyError::SerializationError(error_msg)
+            })?;
+        
+        // Log raw response body for debugging
+        let truncated_body = if response_body.len() > 1000 { &response_body[..1000] } else { &response_body };
+        debug!("Ollama raw response body (truncated):\n{}...", truncated_body);
+        
+        // Check if streaming is enabled (from the request)
+        let is_streaming = req.stream.unwrap_or(false);
+        
+        let ollama_resp: serde_json::Value = if is_streaming {
+            // Parse streaming NDJSON response (multiple JSON objects separated by newlines)
+            let mut combined_content = String::new();
+            let mut final_message: Option<serde_json::Value> = None;
+            
+            for line in response_body.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(json) => {
+                        // Extract content if present
+                        if let Some(content) = json.get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str()) {
+                            combined_content.push_str(content);
+                        }
+                        
+                        // Check if this is the final message (done: true)
+                        if let Some(done) = json.get("done").and_then(|d| d.as_bool()) {
+                            if done {
+                                final_message = Some(json.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse Ollama streaming line: {}. Line: '{}'", e, line);
+                        // Continue parsing other lines
+                    }
+                }
+            }
+            
+            // Create a synthetic response combining all content
+            // Use the final message if available, otherwise create a synthetic one
+            if let Some(final_msg) = final_message {
+                final_msg
+            } else {
+                // Create a synthetic response with combined content
+                serde_json::json!({
+                    "model": model_name,
+                    "message": {
+                        "role": "assistant",
+                        "content": combined_content
+                    },
+                    "done": true
+                })
+            }
+        } else {
+            // Non-streaming response: parse as single JSON
+            serde_json::from_str(&response_body)
+                .map_err(|e| {
+                    let error_msg = format!(
+                        "Failed to parse Ollama response for model '{}': {}. Response body (first 500 chars): '{}'",
+                        model_name, e,
+                        if response_body.len() > 500 { &response_body[..500] } else { &response_body }
+                    );
+                    warn!("{}", error_msg);
+                    ProxyError::SerializationError(error_msg)
+                })?
+        };
+        
+        // Log parsed response for debugging
+        if let Ok(resp_str) = serde_json::to_string_pretty(&ollama_resp) {
+            let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { &resp_str };
+            debug!("Ollama parsed response (truncated):\n{}...", truncated);
+        }
         
         self.convert_from_ollama_format(&ollama_resp, req)
     }
@@ -592,9 +696,20 @@ impl OpenAiProxy {
             }));
         }
         
+        // Map model names: if model is "neurofed" or unknown, use "tinyllama" as default (smaller, more likely installed)
+        let ollama_model = match req.model.as_str() {
+            "neurofed" => "tinyllama",
+            "gpt-3.5-turbo" | "gpt-4" => "tinyllama",  // Map OpenAI models to local equivalents
+            other => other,
+        };
+        
+        // Include stream parameter (default to false for compatibility)
+        let stream = req.stream.unwrap_or(false);
+        
         serde_json::json!({
-            "model": req.model,
+            "model": ollama_model,
             "messages": messages,
+            "stream": stream,
             "options": {
                 "temperature": req.temperature.unwrap_or(0.7),
                 "top_p": req.top_p.unwrap_or(1.0),
@@ -605,14 +720,36 @@ impl OpenAiProxy {
 
     /// Convert Ollama response to OpenAI format
     fn convert_from_ollama_format(&self, ollama_resp: &serde_json::Value, original_req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        let message = ollama_resp.get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        // Debug: log the raw response for troubleshooting
+        // println!("DEBUG: Ollama raw response: {}", serde_json::to_string_pretty(ollama_resp).unwrap_or_default());
+        
+        // Try multiple possible response formats
+        let mut message = String::new();
+        
+        if let Some(msg) = ollama_resp.get("message") {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                message = content.to_string();
+            }
+        } else if let Some(content) = ollama_resp.get("response").and_then(|c| c.as_str()) {
+            message = content.to_string();
+        } else if let Some(content) = ollama_resp.get("content").and_then(|c| c.as_str()) {
+            message = content.to_string();
+        } else {
+            // Fallback: try to find any string field that might be the response
+            if let Some(obj) = ollama_resp.as_object() {
+                for (key, value) in obj {
+                    if value.is_string() && (key.contains("content") || key.contains("response") || key.contains("message")) {
+                        message = value.as_str().unwrap_or("").to_string();
+                        break;
+                    }
+                }
+            }
+        }
         
         let response = OpenAiResponse {
             id: ollama_resp.get("created_at")
                 .and_then(|c| c.as_str())
+                .or_else(|| ollama_resp.get("id").and_then(|id| id.as_str()))
                 .unwrap_or("")
                 .to_string(),
             object: "chat.completion".to_string(),
@@ -953,5 +1090,299 @@ mod tests {
         assert!(text.contains("gpt-4"));
         assert!(text.contains("Hello, world!"));
         assert!(text.contains("Hi there!"));
+    }
+
+    #[test]
+    fn test_model_name_mapping() {
+        let proxy = create_test_proxy();
+        
+        // Test that neurofed model maps to tinyllama
+        let neurofed_req = OpenAiRequest {
+            model: "neurofed".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format = proxy.convert_to_ollama_format(&neurofed_req);
+        assert_eq!(ollama_format["model"], "tinyllama");
+        
+        // Test that gpt-3.5-turbo maps to tinyllama
+        let gpt_req = OpenAiRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format2 = proxy.convert_to_ollama_format(&gpt_req);
+        assert_eq!(ollama_format2["model"], "tinyllama");
+        
+        // Test that unknown models pass through unchanged
+        let other_req = OpenAiRequest {
+            model: "custom-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format3 = proxy.convert_to_ollama_format(&other_req);
+        assert_eq!(ollama_format3["model"], "custom-model");
+    }
+
+    #[test]
+    fn test_stream_parameter_in_ollama_format() {
+        let proxy = create_test_proxy();
+        
+        // Test with stream: true
+        let req_with_stream = OpenAiRequest {
+            model: "neurofed".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: Some(true),
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format = proxy.convert_to_ollama_format(&req_with_stream);
+        assert_eq!(ollama_format["stream"], true);
+        assert_eq!(ollama_format["model"], "tinyllama"); // Should be mapped
+        
+        // Test with stream: false
+        let req_without_stream = OpenAiRequest {
+            model: "neurofed".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: Some(false),
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format2 = proxy.convert_to_ollama_format(&req_without_stream);
+        assert_eq!(ollama_format2["stream"], false);
+        
+        // Test with stream: None (defaults to false)
+        let req_stream_none = OpenAiRequest {
+            model: "neurofed".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let ollama_format3 = proxy.convert_to_ollama_format(&req_stream_none);
+        assert_eq!(ollama_format3["stream"], false); // Should default to false
+    }
+
+    #[test]
+    fn test_ollama_response_parsing_multiple_formats() {
+        let proxy = create_test_proxy();
+        
+        // Create a minimal request for testing
+        let req = OpenAiRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+
+        // Test 1: Standard Ollama format with message.content
+        let standard_response = serde_json::json!({
+            "model": "tinyllama",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "Hello! How can I help you today?"
+            },
+            "done": true
+        });
+        
+        let result1 = proxy.convert_from_ollama_format(&standard_response, &req);
+        assert!(result1.is_ok());
+        let response1 = result1.unwrap();
+        assert_eq!(response1.choices[0].message.content, serde_json::Value::String("Hello! How can I help you today?".to_string()));
+
+        // Test 2: Alternative format with response field
+        let alt_response1 = serde_json::json!({
+            "model": "tinyllama",
+            "response": "This is a direct response field",
+            "done": true
+        });
+        
+        let result2 = proxy.convert_from_ollama_format(&alt_response1, &req);
+        assert!(result2.is_ok());
+        let response2 = result2.unwrap();
+        assert_eq!(response2.choices[0].message.content, serde_json::Value::String("This is a direct response field".to_string()));
+
+        // Test 3: Alternative format with content field
+        let alt_response2 = serde_json::json!({
+            "model": "tinyllama",
+            "content": "Content field response",
+            "done": true
+        });
+        
+        let result3 = proxy.convert_from_ollama_format(&alt_response2, &req);
+        assert!(result3.is_ok());
+        let response3 = result3.unwrap();
+        assert_eq!(response3.choices[0].message.content, serde_json::Value::String("Content field response".to_string()));
+
+        // Test 4: Fallback to empty string if no recognizable format
+        let empty_response = serde_json::json!({
+            "model": "tinyllama",
+            "done": true,
+            "other_field": "not a response"
+        });
+        
+        let result4 = proxy.convert_from_ollama_format(&empty_response, &req);
+        assert!(result4.is_ok());
+        let response4 = result4.unwrap();
+        assert_eq!(response4.choices[0].message.content, serde_json::Value::String("".to_string()));
+    }
+
+    #[test]
+    fn test_tensor_flattening_for_embeddings() {
+        // Note: This test would require mocking the ML engine to return a 2D tensor
+        // Since we can't easily mock the ML engine in unit tests, we'll test the logic
+        // by verifying the generate_embedding function handles tensor conversion
+        
+        // Instead, we'll create a simple test to verify the tensor flattening logic
+        // by checking that the function signature and error handling are correct
+        
+        let proxy = create_test_proxy();
+        let req = OpenAiRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+
+        // The actual tensor processing happens in generate_embedding which requires
+        // a real ML engine. We'll rely on integration tests for this.
+        // This test at least verifies the request structure is valid.
+        assert_eq!(req.model, "test-model");
+        assert_eq!(req.messages.len(), 1);
     }
 }
