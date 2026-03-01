@@ -117,6 +117,20 @@ impl PoWVerifier {
 
     /// Compute hash of data + nonce
     fn compute_hash(&self, data: &str, nonce: u64) -> String {
+        Self::compute_hash_static(data, nonce, &self.hash_algorithm)
+    }
+
+    /// Check if hash meets difficulty (number of leading zero bits)
+    fn check_difficulty(&self, hash: &str, difficulty: u32) -> bool {
+        Self::check_difficulty_static(hash, difficulty)
+    }
+
+    /// Static version of compute_hash for use in spawn_blocking
+    fn compute_hash_static(data: &str, nonce: u64, hash_algorithm: &str) -> String {
+        // Currently only supports SHA256
+        if hash_algorithm != "sha256" {
+            // Fallback to SHA256 for simplicity
+        }
         let mut hasher = Sha256::new();
         hasher.update(data.as_bytes());
         hasher.update(nonce.to_le_bytes());
@@ -124,8 +138,8 @@ impl PoWVerifier {
         hex::encode(result)
     }
 
-    /// Check if hash meets difficulty (number of leading zero bits)
-    fn check_difficulty(&self, hash: &str, difficulty: u32) -> bool {
+    /// Static version of check_difficulty for use in spawn_blocking
+    fn check_difficulty_static(hash: &str, difficulty: u32) -> bool {
         // Convert hex hash to bytes
         let bytes = match hex::decode(hash) {
             Ok(b) => b,
@@ -149,31 +163,41 @@ impl PoWVerifier {
     /// Mine a proof-of-work (for testing)
     pub async fn mine_pow(&self, data: &str, difficulty: u32, timeout: Duration) -> Result<PoWProof, PoWVerifierError> {
         info!("Mining PoW for data: {} with difficulty {}", data, difficulty);
-        let start_time = Instant::now();
-        let mut rng = thread_rng();
+        
+        // Clone data for move into spawn_blocking
+        let data = data.to_string();
+        let max_nonce = self.max_nonce;
+        let hash_algorithm = self.hash_algorithm.clone();
+        
+        // Perform CPU-intensive mining in spawn_blocking
+        tokio::task::spawn_blocking(move || {
+            let start_time = Instant::now();
+            let mut rng = thread_rng();
 
-        for _attempt in 0..self.max_nonce {
-            if start_time.elapsed() > timeout {
-                return Err(PoWVerifierError::Timeout("Mining timed out".to_string()));
+            for _attempt in 0..max_nonce {
+                if start_time.elapsed() > timeout {
+                    return Err(PoWVerifierError::Timeout("Mining timed out".to_string()));
+                }
+
+                let nonce = rng.gen_range(0..max_nonce);
+                let hash = Self::compute_hash_static(&data, nonce, &hash_algorithm);
+
+                if Self::check_difficulty_static(&hash, difficulty) {
+                    return Ok(PoWProof {
+                        data: data.clone(),
+                        nonce,
+                        hash,
+                        timestamp: SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    });
+                }
             }
 
-            let nonce = rng.gen_range(0..self.max_nonce);
-            let hash = self.compute_hash(data, nonce);
-
-            if self.check_difficulty(&hash, difficulty) {
-                return Ok(PoWProof {
-                    data: data.to_string(),
-                    nonce,
-                    hash,
-                    timestamp: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                });
-            }
-        }
-
-        Err(PoWVerifierError::Timeout("Max nonce attempts exceeded".to_string()))
+            Err(PoWVerifierError::Timeout("Max nonce attempts exceeded".to_string()))
+        }).await
+        .map_err(|join_err| PoWVerifierError::Timeout(format!("Mining task panicked: {}", join_err)))?
     }
 }
 

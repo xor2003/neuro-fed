@@ -202,23 +202,23 @@ impl OpenAiProxy {
 
     /// Start the OpenAI proxy server
     pub async fn start(self, port: u16) -> Result<(), ProxyError> {
-        // Create a shared state
-        let state = Arc::new(Mutex::new(self));
+        // Create a shared state - NO OUTER MUTEX NEEDED
+        let state = Arc::new(self);
         
         let app = Router::new()
-            .route("/v1/models", routing::get(|State(_state): State<Arc<Mutex<OpenAiProxy>>>| async move {
+            .route("/v1/models", routing::get(|State(_state): State<Arc<OpenAiProxy>>| async move {
                 Ok::<Json<serde_json::Value>, StatusCode>(Json(serde_json::json!({ "data": [] })))
             }))
-            .route("/v1/chat/completions", routing::post(|State(state): State<Arc<Mutex<OpenAiProxy>>>, Json(req): Json<OpenAiRequest>| async move {
+            .route("/v1/chat/completions", routing::post(|State(state): State<Arc<OpenAiProxy>>, Json(req): Json<OpenAiRequest>| async move {
                 OpenAiProxy::handle_chat_completion(State(state), Json(req)).await
             }))
-            .route("/v1/completions", routing::post(|State(state): State<Arc<Mutex<OpenAiProxy>>>, Json(req): Json<OpenAiRequest>| async move {
+            .route("/v1/completions", routing::post(|State(state): State<Arc<OpenAiProxy>>, Json(req): Json<OpenAiRequest>| async move {
                 OpenAiProxy::handle_completion(State(state), Json(req)).await
             }))
-            .route("/v1/embeddings", routing::post(|State(state): State<Arc<Mutex<OpenAiProxy>>>, Json(req): Json<OpenAiRequest>| async move {
+            .route("/v1/embeddings", routing::post(|State(state): State<Arc<OpenAiProxy>>, Json(req): Json<OpenAiRequest>| async move {
                 OpenAiProxy::handle_embeddings(State(state), Json(req)).await
             }))
-            .route("/v1/metrics", routing::get(|State(state): State<Arc<Mutex<OpenAiProxy>>>| async move {
+            .route("/v1/metrics", routing::get(|State(state): State<Arc<OpenAiProxy>>| async move {
                 OpenAiProxy::handle_metrics(State(state)).await
             }))
             .with_state(state);
@@ -232,11 +232,10 @@ impl OpenAiProxy {
 
     /// Handle chat completion requests with enhanced routing logic
     pub async fn handle_chat_completion(
-        State(state): State<Arc<Mutex<OpenAiProxy>>>,
+        State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
     ) -> Result<Json<OpenAiResponse>, StatusCode> {
         let start_time = Instant::now();
-        let proxy = state.lock().await;
         
         // Update metrics
         proxy.metrics.lock().await.total_requests += 1;
@@ -383,13 +382,20 @@ impl OpenAiProxy {
         
         let mut cache = self.semantic_cache.lock().await;
         
-        // Implement LRU-like eviction if cache exceeds max size
+        // Implement LRU eviction if cache exceeds max size
         if cache.len() >= self.backend_config.max_cache_size {
-            // Remove oldest entry (simplified implementation)
-            let oldest_key = cache.keys().next().cloned();
+            // Find the entry with the smallest timestamp (oldest)
+            let mut oldest_key = None;
+            let mut oldest_timestamp = i64::MAX;
+            for (key, entry) in cache.iter() {
+                if entry.timestamp < oldest_timestamp {
+                    oldest_timestamp = entry.timestamp;
+                    oldest_key = Some(key.clone());
+                }
+            }
             if let Some(key) = oldest_key {
                 cache.remove(&key);
-                debug!("Evicted oldest cache entry due to size limit");
+                debug!("Evicted oldest cache entry (timestamp: {}) due to size limit", oldest_timestamp);
             }
         }
         
@@ -424,16 +430,26 @@ impl OpenAiProxy {
         let embedding_array = Array2::from_shape_vec((1, embedding_clone.len()), embedding_clone)
             .expect("Failed to create embedding array");
         
-        let mut pc = self.pc_hierarchy.lock().await;
-        match pc.infer(&embedding_array, 10) {
-            Ok(stats) => {
+        // Clone the PC hierarchy for spawn_blocking
+        let pc_hierarchy = self.pc_hierarchy.clone();
+        
+        // Perform heavy CPU inference in spawn_blocking
+        match tokio::task::spawn_blocking(move || {
+            let mut pc = pc_hierarchy.blocking_lock();
+            pc.infer(&embedding_array, 10)
+        }).await {
+            Ok(Ok(stats)) => {
                 debug!("PC inference completed with surprise: {}", stats.total_surprise);
                 // For now, return None to let backend handle it
                 // In a more advanced implementation, we could generate response from PC beliefs
                 None
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("PC inference failed: {}", e);
+                None
+            }
+            Err(join_err) => {
+                error!("PC inference task panicked: {}", join_err);
                 None
             }
         }
@@ -460,9 +476,16 @@ impl OpenAiProxy {
         let combined_array = Array2::from_shape_vec((1, combined.len()), combined)
             .map_err(|e| ProxyError::PCError(format!("Failed to create learning array: {}", e)))?;
         
-        let mut pc = self.pc_hierarchy.lock().await;
-        pc.learn_legacy(&combined_array)
-            .map_err(|e| ProxyError::PCError(format!("PC learning failed: {}", e)))?;
+        // Clone the PC hierarchy for spawn_blocking
+        let pc_hierarchy = self.pc_hierarchy.clone();
+        
+        // Perform heavy CPU learning in spawn_blocking
+        tokio::task::spawn_blocking(move || {
+            let mut pc = pc_hierarchy.blocking_lock();
+            pc.learn_legacy(&combined_array)
+        }).await
+        .map_err(|join_err| ProxyError::PCError(format!("PC learning task panicked: {}", join_err)))?
+        .map_err(|e| ProxyError::PCError(format!("PC learning failed: {}", e)))?;
         
         debug!("PC learning completed successfully");
         Ok(())
@@ -659,36 +682,33 @@ impl OpenAiProxy {
 
     /// Handle metrics endpoint
     pub async fn handle_metrics(
-        State(state): State<Arc<Mutex<OpenAiProxy>>>,
+        State(proxy): State<Arc<OpenAiProxy>>,
     ) -> Result<Json<ProxyMetrics>, StatusCode> {
-        let proxy = state.lock().await;
         let metrics = proxy.metrics.lock().await.clone();
         Ok(Json(metrics))
     }
 
     /// List models endpoint
     pub async fn list_models(
-        State(_state): State<Arc<Mutex<OpenAiProxy>>>,
+        State(_proxy): State<Arc<OpenAiProxy>>,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
         Ok(Json(serde_json::json!({ "data": [] })))
     }
 
     /// Handle completion requests (legacy)
     pub async fn handle_completion(
-        State(state): State<Arc<Mutex<OpenAiProxy>>>,
+        State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
     ) -> Result<Json<OpenAiResponse>, StatusCode> {
         // Convert completion request to chat completion format
-        Self::handle_chat_completion(State(state), Json(req)).await
+        Self::handle_chat_completion(State(proxy), Json(req)).await
     }
 
     /// Handle embeddings requests
     pub async fn handle_embeddings(
-        State(state): State<Arc<Mutex<OpenAiProxy>>>,
+        State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
     ) -> Result<Json<OpenAiResponse>, StatusCode> {
-        let proxy = state.lock().await;
-        
         // Generate embedding using ML engine
         let text = proxy.request_to_text(&req);
         let engine = proxy.local_engine.lock().await;

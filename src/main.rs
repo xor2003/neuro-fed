@@ -14,9 +14,53 @@ use neuro_fed_node::privacy_networks::PrivacyNetworkManager;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{info, warn, Level};
 use tracing_subscriber;
+
+/// Simple metrics for the dashboard
+#[derive(Default)]
+struct SimpleMetrics {
+    inference_count: u64,
+    learning_count: u64,
+    free_energy: f32,
+}
+
+/// Spawn a background task that periodically prints a runtime metrics dashboard
+fn spawn_metrics_dashboard(
+    pc_hierarchy: Arc<tokio::sync::Mutex<PredictiveCoding>>,
+    metrics: Arc<tokio::sync::Mutex<SimpleMetrics>>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(TokioDuration::from_secs(5)); // Update every 5 seconds
+        
+        loop {
+            ticker.tick().await;
+            
+            let pc = pc_hierarchy.lock().await;
+            let metrics = metrics.lock().await;
+            
+            // Clear screen (optional, gives it a top/htop feel)
+            print!("\x1B[2J\x1B[1;1H");
+
+            println!("=========================================================");
+            println!("🧠 NEUROFED NODE STATUS                 🟢 ONLINE");
+            println!("=========================================================\n");
+            
+            println!("[ COGNITION & PC HIERARCHY ]");
+            println!("  Current Free Energy (Surprise): {:.4}", pc.free_energy);
+            println!("  Hierarchy Depth:                {} levels", pc.levels.len());
+            println!("  Total Inference Cycles:         {}", metrics.inference_count);
+            println!("  Total Learning Cycles:          {}", metrics.learning_count);
+            println!("  Free Energy (Latest):           {:.4}\n", metrics.free_energy);
+            
+            println!("[ FEDERATION & NETWORK ]");
+            println!("  Privacy Network:                {:?}", "Not implemented in dashboard");
+            println!("  Federation Strategy:            {:?}", "Not implemented in dashboard");
+            println!("=========================================================");
+        }
+    });
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -128,7 +172,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(e) => warn!("Failed to initialize privacy network manager: {}", e),
     }
 
-    // Simple demo loop
+    // Create shared state for metrics dashboard
+    let pc_hierarchy_arc = Arc::new(tokio::sync::Mutex::new(pc_hierarchy));
+    
+    // Create a simple metrics struct (in a real implementation, you'd use ProxyMetrics from openai_proxy)
+    // For now, we'll just track some basic stats
+    let metrics_arc = Arc::new(tokio::sync::Mutex::new(SimpleMetrics::default()));
+    
+    // Spawn the metrics dashboard
+    spawn_metrics_dashboard(pc_hierarchy_arc.clone(), metrics_arc.clone());
+    
+    // Simple demo loop with dashboard integration
     let mut counter = 0;
     let mut interval = interval(Duration::from_millis(1000));
 
@@ -139,7 +193,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if counter % 5 == 0 {
             info!("Running inference...");
             let input = ndarray::Array2::ones((1, 2048));
-            let _result = pc_hierarchy.infer(&input, 10);
+            
+            // Update metrics
+            {
+                let mut metrics = metrics_arc.lock().await;
+                metrics.inference_count += 1;
+            }
+            
+            // Run inference (blocking, but that's okay for demo)
+            let mut pc = pc_hierarchy_arc.lock().await;
+            let result = pc.infer(&input, 10);
+            if let Ok(stats) = result {
+                let mut metrics = metrics_arc.lock().await;
+                metrics.free_energy = *stats.free_energy_history.last().unwrap_or(&0.0);
+            }
         }
 
         if counter == 10 {
@@ -147,7 +214,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let _bootstrap_result = bootstrap.run();
         }
 
-        if counter >= 20 {
+        if counter >= 30 {
             info!("Demo complete, shutting down...");
             break;
         }
