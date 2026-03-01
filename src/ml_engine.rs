@@ -166,7 +166,7 @@ impl MLEngine {
         // This maintains backward compatibility with existing tests expecting shape [10]
         if self.model_info.is_none() {
             warn!("No model loaded, returning dummy tensor for compatibility");
-            // Create dummy tensor with size 512 to match PC hierarchy input dimension
+            // Create dummy tensor with size 512 to match PC hierarchy top level dimension
             // Must be 2D tensor with shape (512, 1) for PC hierarchy compatibility
             let data: Vec<f32> = vec![0.0; 512];
             return Ok(Tensor::from_slice(&data, (512, 1), &self.device)
@@ -303,6 +303,7 @@ mod tests {
     #[tokio::test]
     async fn test_dummy_tensor_shape() {
         // Test that dummy tensor has correct shape (512, 1) for PC hierarchy compatibility
+        // (Matches PC config dim_per_level top level = 512)
         let device_type = DeviceType {
             name: "CPU".to_string(),
             description: "".to_string(),

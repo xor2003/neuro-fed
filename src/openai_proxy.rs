@@ -75,6 +75,8 @@ pub struct OpenAiResponse {
     pub model: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
+    #[serde(rename = "_neurofed_source", skip_serializing_if = "Option::is_none")]
+    pub neurofed_source: Option<String>,
 }
 
 /// Choice structure for OpenAI API
@@ -473,25 +475,45 @@ impl OpenAiProxy {
 
     /// Learn from API response using PC hierarchy
     async fn learn_from_response(&self, req: &OpenAiRequest, response: &OpenAiResponse) -> Result<(), ProxyError> {
-        // Generate embedding for request
-        let req_embedding = self.generate_embedding(req).await?;
-        
         // Generate embedding for response (simplified - use response text)
         let response_text = self.response_to_text(response);
         let engine = self.local_engine.lock().await;
         let resp_tensor = engine.process_text(&response_text).await
             .map_err(|e| ProxyError::EmbeddingError(format!("Failed to process response text: {}", e)))?;
-        let resp_data = resp_tensor.to_vec1::<f32>()
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert response tensor: {}", e)))?;
         
-        // Create combined embedding for learning
-        let mut combined = req_embedding;
-        combined.extend(resp_data);
+        debug!("Response tensor shape: {:?}, rank: {}", resp_tensor.shape(), resp_tensor.rank());
         
-        // Ensure dimensions match PC hierarchy input
-        let combined_len = combined.len();
-        let combined_tensor = Tensor::from_vec(combined, (1, combined_len), &candle_core::Device::Cpu)
+        // Flatten tensor if needed (handles [512, 1] shape from dummy embeddings)
+        let resp_data = if resp_tensor.rank() > 1 {
+            resp_tensor.flatten_all()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten response tensor: {}", e)))?
+                .to_vec1::<f32>()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert flattened tensor: {}", e)))?
+        } else {
+            resp_tensor.to_vec1::<f32>()
+                .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert response tensor: {}", e)))?
+        };
+        
+        debug!("Response data length: {}", resp_data.len());
+        
+        // Trim to 512 dimensions (match PC hierarchy input dimension)
+        let pc_input_dim = 512;
+        let trimmed_data: Vec<f32> = if resp_data.len() >= pc_input_dim {
+            resp_data[..pc_input_dim].to_vec()
+        } else {
+            // Pad with zeros if shorter (should not happen)
+            let mut padded = resp_data;
+            padded.resize(pc_input_dim, 0.0);
+            padded
+        };
+        
+        debug!("Trimmed data length: {}, pc_input_dim: {}", trimmed_data.len(), pc_input_dim);
+        
+        // Create tensor with shape (pc_input_dim, 1) for PC hierarchy compatibility
+        let learning_tensor = Tensor::from_vec(trimmed_data, (pc_input_dim, 1), &candle_core::Device::Cpu)
             .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))?;
+        
+        debug!("Learning tensor shape: {:?}", learning_tensor.shape());
         
         // Clone the PC hierarchy for spawn_blocking
         let pc_hierarchy = self.pc_hierarchy.clone();
@@ -499,7 +521,8 @@ impl OpenAiProxy {
         // Perform heavy CPU learning in spawn_blocking
         tokio::task::spawn_blocking(move || {
             let mut pc = pc_hierarchy.blocking_lock();
-            pc.learn_legacy(&combined_tensor)
+            debug!("PC hierarchy config dim_per_level[0]: {:?}", pc.config.dim_per_level.get(0));
+            pc.learn_legacy(&learning_tensor)
         }).await
         .map_err(|join_err| ProxyError::PCError(format!("PC learning task panicked: {}", join_err)))?
         .map_err(|e| ProxyError::PCError(format!("PC learning failed: {}", e)))?;
@@ -558,9 +581,12 @@ impl OpenAiProxy {
             return Err(ProxyError::BackendError(format!("OpenAI API error {}: {}", status, body)));
         }
         
-        let response_json: OpenAiResponse = response.json()
+        let mut response_json: OpenAiResponse = response.json()
             .await
             .map_err(|e| ProxyError::SerializationError(format!("Failed to parse OpenAI response: {}", e)))?;
+        
+        // Add source metadata
+        response_json.neurofed_source = Some("remote".to_string());
         
         Ok(response_json)
     }
@@ -770,6 +796,7 @@ impl OpenAiProxy {
                 completion_tokens: 0,
                 total_tokens: 0,
             },
+            neurofed_source: Some("local".to_string()),
         };
         
         Ok(response)
@@ -862,8 +889,18 @@ impl OpenAiProxy {
             }
         };
         
-        // Convert to response format
-        let _data = tensor.to_vec1::<f32>().unwrap_or_default();
+        // Convert to response format (flatten tensor if rank > 1, ignore errors)
+        let _data = if tensor.rank() > 1 {
+            match tensor.flatten_all() {
+                Ok(flat) => flat.to_vec1::<f32>().unwrap_or_default(),
+                Err(e) => {
+                    error!("Failed to flatten embedding tensor: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            tensor.to_vec1::<f32>().unwrap_or_default()
+        };
         let response = OpenAiResponse {
             id: "embed-".to_string() + &Utc::now().timestamp().to_string(),
             object: "list".to_string(),
@@ -875,6 +912,7 @@ impl OpenAiProxy {
                 completion_tokens: 0,
                 total_tokens: 0,
             },
+            neurofed_source: Some("embedding".to_string()),
         };
         
         Ok(Json(response))
@@ -1384,5 +1422,133 @@ mod tests {
         // This test at least verifies the request structure is valid.
         assert_eq!(req.model, "test-model");
         assert_eq!(req.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_openai_response_source_tracking() {
+        // Test that OpenAiResponse properly stores and serializes neurofed_source
+        let response = OpenAiResponse {
+            id: "test-id".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1234567890,
+            model: "neurofed".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("test response".to_string()),
+                    name: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            neurofed_source: Some("local".to_string()),
+        };
+
+        // Test serialization - neurofed_source should be serialized as _neurofed_source
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"_neurofed_source\":\"local\""));
+        
+        // Test deserialization
+        let deserialized: OpenAiResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.neurofed_source, Some("local".to_string()));
+        
+        // Test with different source values
+        let remote_response = OpenAiResponse {
+            neurofed_source: Some("remote".to_string()),
+            ..response.clone()
+        };
+        let remote_json = serde_json::to_string(&remote_response).unwrap();
+        assert!(remote_json.contains("\"_neurofed_source\":\"remote\""));
+        
+        let pc_response = OpenAiResponse {
+            neurofed_source: Some("pc".to_string()),
+            ..response.clone()
+        };
+        let pc_json = serde_json::to_string(&pc_response).unwrap();
+        assert!(pc_json.contains("\"_neurofed_source\":\"pc\""));
+    }
+
+    #[test]
+    fn test_tensor_rank_handling_in_learn_from_response() {
+        use candle_core::{Tensor, Device, DType};
+        
+        // Test that tensor flattening logic handles different ranks properly
+        let device = Device::Cpu;
+        
+        // Create a 1D tensor (should not need flattening)
+        let tensor_1d = Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![3], &device).unwrap();
+        assert_eq!(tensor_1d.rank(), 1);
+        
+        // Create a 2D tensor [512, 1] (should need flattening)
+        let data_2d: Vec<f32> = (0..512).map(|x| x as f32).collect();
+        let tensor_2d = Tensor::from_vec(data_2d.clone(), vec![512, 1], &device).unwrap();
+        assert_eq!(tensor_2d.rank(), 2);
+        
+        // Verify flatten_all works
+        let flattened = tensor_2d.flatten_all().unwrap();
+        assert_eq!(flattened.rank(), 1);
+        assert_eq!(flattened.shape().dims(), &[512]);
+        
+        // Create a 3D tensor (edge case)
+        let tensor_3d = Tensor::zeros((2, 256, 1), DType::F32, &device).unwrap();
+        assert_eq!(tensor_3d.rank(), 3);
+        let flattened_3d = tensor_3d.flatten_all().unwrap();
+        assert_eq!(flattened_3d.rank(), 1);
+        assert_eq!(flattened_3d.shape().dims(), &[512]);
+    }
+
+    #[test]
+    fn test_convert_from_ollama_format_sets_local_source() {
+        use serde_json::json;
+        
+        let proxy = create_test_proxy();
+        
+        // Create a mock Ollama response
+        let ollama_resp = json!({
+            "model": "llama2",
+            "created_at": "2023-01-01T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": "test response from ollama"
+            },
+            "done": true,
+            "total_duration": 1000
+        });
+        
+        let original_req = OpenAiRequest {
+            model: "neurofed".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("test".to_string()),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: None,
+            n: None,
+            echo: None,
+            logit_bias: None,
+            function_call: None,
+            tools: None,
+            tool_calls: None,
+            usage: None,
+        };
+        
+        let result = proxy.convert_from_ollama_format(&ollama_resp, &original_req);
+        assert!(result.is_ok());
+        
+        let response = result.unwrap();
+        assert_eq!(response.neurofed_source, Some("local".to_string()));
+        assert_eq!(response.model, "neurofed"); // Should preserve original model name
     }
 }

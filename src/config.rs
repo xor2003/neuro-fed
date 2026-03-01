@@ -236,6 +236,35 @@ impl std::fmt::Display for NodeError {
 
 impl std::error::Error for NodeError {}
 
+impl From<config::ConfigError> for NodeError {
+    fn from(err: config::ConfigError) -> Self {
+        NodeError::ConfigParseError(err.to_string())
+    }
+}
+
+impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
+    fn from(config: crate::config::PCConfig) -> Self {
+        crate::pc_hierarchy::PCConfig {
+            n_levels: config.n_levels,
+            dim_per_level: config.dim_per_level,
+            learning_rate: config.learning_rate,
+            inference_steps: 20, // default value
+            surprise_threshold: 1.0, // default value
+            selective_update: true, // default value
+            mu_pc_scaling: config.mu_pc_scaling,
+            enable_precision_weighting: config.enable_precision_weighting,
+            free_energy_drop_threshold: config.free_energy_drop_threshold,
+            default_precision: config.default_precision,
+            min_precision: config.min_precision,
+            max_precision: config.max_precision,
+            free_energy_history_size: config.free_energy_history_size,
+            enable_code_verification: config.enable_code_verification,
+            enable_nostr_zap_tracking: config.enable_nostr_zap_tracking,
+            min_zaps_for_consensus: config.min_zaps_for_consensus,
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load_from_file(path: &str) -> Result<Self, NodeError> {
         let path = Path::new(path);
@@ -246,16 +275,15 @@ impl NodeConfig {
         // Use config crate which supports multiple formats (TOML, JSON, YAML, etc.)
         let config_builder = config::Config::builder()
             .add_source(config::File::from(path))
-            .build()
-            .map_err(|e| NodeError::ConfigParseError(e.to_string()))?;
+            .build()?;
         
         config_builder
             .try_deserialize()
-            .map_err(|e| NodeError::ConfigParseError(e.to_string()))
             .map(|config: Self| {
                 info!("Loaded config from {} (format detected automatically)", path.display());
                 config
             })
+            .map_err(|e| NodeError::ConfigParseError(e.to_string()))
     }
     
     /// Load configuration from "config.toml" if it exists, otherwise return default configuration.

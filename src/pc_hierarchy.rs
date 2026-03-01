@@ -256,10 +256,14 @@ impl PredictiveCoding {
     pub fn infer(&mut self, input: &Tensor, steps: usize) -> Result<SurpriseStats, PCError> {
         let (input_dim, _) = input.shape().dims2()?;
         if input_dim != self.config.dim_per_level[0] {
-            return Err(PCError(format!("Input dimension {} does not match level 0 dimension {}", 
+            tracing::debug!("PC infer: input_dim={}, config.dim_per_level[0]={}, config.dim_per_level={:?}",
+                input_dim, self.config.dim_per_level[0], self.config.dim_per_level);
+            return Err(PCError(format!("Input dimension {} does not match level 0 dimension {}",
                 input_dim, self.config.dim_per_level[0])));
         }
 
+        tracing::debug!("PC infer: input shape {:?}, steps {}", input.shape(), steps);
+        
         // Initialize bottom level with input
         self.levels[0].beliefs = input.clone();
         

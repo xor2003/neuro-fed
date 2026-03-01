@@ -3,8 +3,8 @@
 
 use clap::{Parser, Subcommand};
 use neuro_fed_node::bootstrap::{Bootstrap, LlamaContext};
-use neuro_fed_node::config::{NodeConfig, BootstrapConfig};
-use neuro_fed_node::pc_hierarchy::PCConfig;
+use neuro_fed_node::config::NodeConfig;
+use neuro_fed_node::pc_hierarchy;
 use neuro_fed_node::PredictiveCoding;
 use neuro_fed_node::nostr_federation::NostrFederation;
 use neuro_fed_node::brain_manager::BrainManager;
@@ -140,7 +140,7 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
     ));
     
     // Create Predictive Coding hierarchy
-    let pc_config = PCConfig::new(3, vec![512, 256, 128]);
+    let pc_config = pc_hierarchy::PCConfig::new(3, vec![512, 256, 128]);
     let pc_hierarchy = Arc::new(tokio::sync::Mutex::new(
         PredictiveCoding::new(pc_config)?
     ));
@@ -301,18 +301,32 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
                             .and_then(|m| m.as_str())
                             .unwrap_or("unknown");
                         
+                        // Get neurofed source if available
+                        let neurofed_source = response_json.get("_neurofed_source")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        
                         // ANSI color codes
                         let green = "\x1b[32m";
                         let yellow = "\x1b[33m";
                         let red = "\x1b[31m";
                         let reset = "\x1b[0m";
                         
-                        let (color, source) = if model.contains("neurofed") || model.contains("pc") {
-                            (green, "PC Model")
-                        } else if model.contains("gpt-3.5") || model.contains("gpt-4") {
-                            (yellow, "OpenAI Remote")
-                        } else {
-                            (red, "Local Model")
+                        let (color, source) = match neurofed_source {
+                            "pc" => (green, "PC Model"),
+                            "remote" => (yellow, "OpenAI Remote"),
+                            "local" => (red, "Local Model"),
+                            "embedding" => (red, "Embedding"),
+                            _ => {
+                                // Fallback to model-based detection
+                                if model.contains("neurofed") || model.contains("pc") {
+                                    (green, "PC Model")
+                                } else if model.contains("gpt-3.5") || model.contains("gpt-4") {
+                                    (yellow, "OpenAI Remote")
+                                } else {
+                                    (red, "Local Model")
+                                }
+                            }
                         };
                         
                         // Print colored response
@@ -357,7 +371,9 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
     // Create components using the single GGUF model path
     let model_path = config.model_path.clone();
     let _llama_ctx = LlamaContext::new(&model_path, config.context_size);
-    let pc_hierarchy = PredictiveCoding::new(PCConfig::new(3, vec![2048, 1024, 512]))?;
+    // Convert config::PCConfig to pc_hierarchy::PCConfig
+    let pc_config: crate::pc_hierarchy::PCConfig = config.pc_config.clone().into();
+    let pc_hierarchy = PredictiveCoding::new(pc_config)?;
     
     // Create bootstrap config with the shared model path
     let bootstrap_config = config.bootstrap_config.clone();
