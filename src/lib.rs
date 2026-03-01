@@ -25,7 +25,7 @@ pub mod tor_client;
 pub mod i2p_client;
 
 pub use bootstrap::Bootstrap;
-pub use bootstrap::BootstrapConfig;
+pub use config::BootstrapConfig;
 pub use pc_hierarchy::PredictiveCoding;
 pub use pc_hierarchy::PCConfig;
 pub use llama_ffi::LlamaModel;

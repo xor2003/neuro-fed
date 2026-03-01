@@ -2,10 +2,10 @@
 // Main application entry point with CLI
 
 use clap::{Parser, Subcommand};
-use neuro_fed_node::bootstrap::{Bootstrap, BootstrapConfig, LlamaContext};
+use neuro_fed_node::bootstrap::{Bootstrap, LlamaContext};
+use neuro_fed_node::config::{NodeConfig, BootstrapConfig};
 use neuro_fed_node::pc_hierarchy::PCConfig;
 use neuro_fed_node::PredictiveCoding;
-use neuro_fed_node::config::NodeConfig;
 use neuro_fed_node::nostr_federation::NostrFederation;
 use neuro_fed_node::brain_manager::BrainManager;
 use neuro_fed_node::federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy};
@@ -136,7 +136,7 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
         supported: true,
     };
     let local_engine = Arc::new(tokio::sync::Mutex::new(
-        neuro_fed_node::ml_engine::MLEngine::new("models/gguf_model.gguf", device_type)?
+        neuro_fed_node::ml_engine::MLEngine::new(&config.model_path, device_type)?
     ));
     
     // Create Predictive Coding hierarchy
@@ -351,20 +351,21 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
 async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn Error>> {
     setup_logging();
 
-    // Create components
-    let _llama_ctx = LlamaContext::new("models/gguf_model.gguf", 2048);
-    let pc_hierarchy = PredictiveCoding::new(PCConfig::new(3, vec![2048, 1024, 512]))?;
-    let _bootstrap = Bootstrap::new(BootstrapConfig::new(
-        "models/gguf_model.gguf".to_string(),
-        2048,
-        vec!["./data".to_string()],
-    ))
-    .expect("Failed to create Bootstrap instance");
-
-    info!("NeuroPC Node initialized successfully");
-
     // Brain sharing integration
     let config = NodeConfig::load_or_default();
+    
+    // Create components using the single GGUF model path
+    let model_path = config.model_path.clone();
+    let _llama_ctx = LlamaContext::new(&model_path, config.context_size);
+    let pc_hierarchy = PredictiveCoding::new(PCConfig::new(3, vec![2048, 1024, 512]))?;
+    
+    // Create bootstrap config with the shared model path
+    let bootstrap_config = config.bootstrap_config.clone();
+    // Note: bootstrap_config no longer has model_path field
+    let _bootstrap = Bootstrap::new(bootstrap_config)
+        .expect("Failed to create Bootstrap instance");
+
+    info!("NeuroPC Node initialized successfully");
     if brain_sharing && config.brain_sharing_config.enabled {
         info!("Brain sharing enabled, initializing brain manager...");
         let nostr_federation = NostrFederation::new(config.nostr_config.clone());

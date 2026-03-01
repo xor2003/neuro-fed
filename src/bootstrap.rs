@@ -5,8 +5,8 @@ use std::error::Error;
 use std::fmt;
 use chrono::{DateTime, Utc};
 use ndarray::{Array2, Array3, s};
-use serde::{Serialize, Deserialize};
 use crate::pc_hierarchy::PredictiveCoding;
+use crate::config::BootstrapConfig;
 
 #[derive(Debug)]
 pub struct BootstrapError(String);
@@ -18,31 +18,6 @@ impl fmt::Display for BootstrapError {
 }
 
 impl Error for BootstrapError {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapConfig {
-    pub model_path: String,
-    pub max_tokens: usize,
-    pub data_paths: Vec<String>,
-    pub n_levels: usize,
-    pub dim_per_level: Vec<usize>,
-    pub surprise_threshold: f32,
-    pub learning_rate: f32,
-}
-
-impl BootstrapConfig {
-    pub fn new(model_path: String, max_tokens: usize, data_paths: Vec<String>) -> Self {
-        Self {
-            model_path,
-            max_tokens,
-            data_paths,
-            n_levels: 3,
-            dim_per_level: vec![512, 256, 128],
-            surprise_threshold: 0.1,
-            learning_rate: 0.01,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapProgress {
@@ -86,7 +61,7 @@ impl BootstrapMetadata {
         Self {
             timestamp: Utc::now(),
             model_info: ModelInfo::default(),
-            config: BootstrapConfig::new("".to_string(), 0, vec![]),
+            config: BootstrapConfig::new(1024, 32, 10, 0.001, vec![]),
         }
     }
 }
@@ -243,7 +218,7 @@ impl BootstrapResult {
 }
 
 pub fn example_usage() {
-    let config = BootstrapConfig::new("models/gguf_model.gguf".to_string(), 2048, vec!["./data".to_string()]);
+    let config = BootstrapConfig::new(1024, 32, 10, 0.001, vec!["./data".to_string()]);
     let mut bootstrap = Bootstrap::new(config).expect("Failed to create Bootstrap instance");
     let result = bootstrap.run().expect("Bootstrap failed");
     println!("Bootstrap completed successfully: {:?}", result);
@@ -254,14 +229,14 @@ mod tests {
 
     #[test]
     fn test_bootstrap_creation() {
-        let config = BootstrapConfig::new("test_model.gguf".to_string(), 100, vec!["./test_data".to_string()]);
+        let config = BootstrapConfig::new(1024, 32, 10, 0.001, vec!["./test_data".to_string()]);
         let bootstrap = Bootstrap::new(config).expect("Failed to create Bootstrap instance");
         assert!(bootstrap.pc_hierarchy.is_none());
     }
 
     #[test]
     fn test_bootstrap_run() {
-        let config = BootstrapConfig::new("test_model.gguf".to_string(), 100, vec!["./test_data".to_string()]);
+        let config = BootstrapConfig::new(1024, 32, 10, 0.001, vec!["./test_data".to_string()]);
         let mut bootstrap = Bootstrap::new(config).expect("Failed to create Bootstrap instance");
         let result = bootstrap.run().expect("Bootstrap failed");
         assert_eq!(result.beliefs.len(), 0);
@@ -270,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_document_loading() {
-        let bootstrap = Bootstrap::new(BootstrapConfig::new("test_model.gguf".to_string(), 100, vec!["./test_data".to_string()]))
+        let bootstrap = Bootstrap::new(BootstrapConfig::new(1024, 32, 10, 0.001, vec!["./test_data".to_string()]))
             .expect("Failed to create Bootstrap instance");
         let documents = bootstrap.load_documents().expect("Failed to load documents");
         assert_eq!(documents.len(), 0);
@@ -278,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_embedding_extraction() {
-        let bootstrap = Bootstrap::new(BootstrapConfig::new("test_model.gguf".to_string(), 100, vec!["./test_data".to_string()]))
+        let bootstrap = Bootstrap::new(BootstrapConfig::new(1024, 32, 10, 0.001, vec!["./test_data".to_string()]))
             .expect("Failed to create Bootstrap instance");
         let documents = bootstrap.load_documents().expect("Failed to load documents");
         let embeddings = bootstrap.extract_embeddings(&documents).expect("Failed to extract embeddings");

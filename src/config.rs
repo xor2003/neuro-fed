@@ -31,7 +31,6 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MLConfig {
-    pub model_path: String,
     pub device_type: String,
     pub max_batch_size: usize,
     pub embedding_dim: usize,
@@ -197,12 +196,23 @@ pub struct PCConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BootstrapConfig {
-    pub model_path: String,
     pub embedding_dim: usize,
     pub batch_size: usize,
     pub max_epochs: usize,
     pub learning_rate: f32,
     pub document_paths: Vec<String>,
+}
+
+impl BootstrapConfig {
+    pub fn new(embedding_dim: usize, batch_size: usize, max_epochs: usize, learning_rate: f32, document_paths: Vec<String>) -> Self {
+        Self {
+            embedding_dim,
+            batch_size,
+            max_epochs,
+            learning_rate,
+            document_paths,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -332,7 +342,6 @@ impl Default for NodeConfig {
 impl Default for MLConfig {
     fn default() -> Self {
         Self {
-            model_path: "models/bert-base-uncased".to_string(),
             device_type: "cpu".to_string(),
             max_batch_size: 32,
             embedding_dim: 768,
@@ -394,7 +403,6 @@ impl Default for BackendConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            model_path: "models/gguf_model.gguf".to_string(),
             embedding_dim: 1024,
             batch_size: 32,
             max_epochs: 10,
