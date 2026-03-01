@@ -30,10 +30,10 @@ tokio = { version = "1.37.0", features = ["full"] }
 nostr-sdk = "0.44.1"
 
 # Federation dependencies
-secp256k1 = "0.32.0-beta.2"
+secp256k1 = "0.31.1"
 bitcoin = { version = "0.32.0", features = ["std"], optional = true }
 lightning = { version = "0.2.0", optional = true }
-rand = "0.8.5"
+rand = "0.10.0"
 
 # Configuration and persistence
 
@@ -44,7 +44,7 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chron
 
 chrono = "0.4.38"
 uuid = { version = "1.8.0", features = ["v4"] }
-log = "0.4.21"
+log = "0.4.29"
 simplelog = "0.12.2"
 async-trait = "0.1.80"
 
@@ -56,7 +56,7 @@ thiserror = "2.0.18"
 sha2 = "0.10.8"
 
 # Brain sharing (safetensors for model weights)
-safetensors = "0.4.3"
+safetensors = "0.7.0"
 hex = "0.4.3"
 
 # Model Manager dependencies
@@ -67,7 +67,7 @@ yggdrasil = { version = "0.1.0", optional = true }
 tor = { version = "0.1.0", optional = true }
 i2p = { version = "0.0.1", optional = true }
 url = "2.5.0"
-base64 = "0.22.0"
+base64 = "0.22.1"
 
 
 

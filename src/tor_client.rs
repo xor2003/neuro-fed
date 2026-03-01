@@ -219,8 +219,9 @@ impl PrivacyNetworkClient for TorClient {
 
 /// Generate a random onion address (for simulation purposes)
 fn generate_onion_address() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use ndarray_rand::rand::Rng;
+    use ndarray_rand::rand::thread_rng;
+    let mut rng = thread_rng();
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz234567".chars().collect();
     let mut result = String::new();
     for _ in 0..16 {

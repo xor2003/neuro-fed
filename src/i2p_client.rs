@@ -204,9 +204,10 @@ impl PrivacyNetworkClient for I2PClient {
 
 /// Generate a random I2P destination (for simulation purposes)
 fn generate_i2p_destination() -> String {
-    use rand::Rng;
+    use ndarray_rand::rand::Rng;
+    use ndarray_rand::rand::thread_rng;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     let mut bytes = vec![0u8; 32];
     rng.fill(&mut bytes[..]);
     STANDARD.encode(&bytes)

@@ -3,7 +3,8 @@
 
 use std::time::{Duration, SystemTime, Instant};
 use sha2::{Sha256, Digest};
-use rand::Rng;
+use ndarray_rand::rand::Rng;
+use ndarray_rand::rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -149,7 +150,7 @@ impl PoWVerifier {
     pub async fn mine_pow(&self, data: &str, difficulty: u32, timeout: Duration) -> Result<PoWProof, PoWVerifierError> {
         info!("Mining PoW for data: {} with difficulty {}", data, difficulty);
         let start_time = Instant::now();
-        let mut rng = rand::thread_rng();
+        let mut rng = thread_rng();
 
         for _attempt in 0..self.max_nonce {
             if start_time.elapsed() > timeout {
