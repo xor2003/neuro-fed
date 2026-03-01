@@ -8,6 +8,9 @@ use tracing::{info, warn};
 
 use crate::privacy_networks::PrivacyNetworkConfig;
 
+// Re-export config crate for convenience
+pub use config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeConfig {
     pub model_path: String,
@@ -230,24 +233,53 @@ impl NodeConfig {
             return Err(NodeError::FileNotFoundError(path.display().to_string()));
         }
         
-        let config_str = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(e) => return Err(NodeError::ConfigParseError(e.to_string())),
-        };
+        // Use config crate which supports multiple formats (TOML, JSON, YAML, etc.)
+        let config_builder = config::Config::builder()
+            .add_source(config::File::from(path))
+            .build()
+            .map_err(|e| NodeError::ConfigParseError(e.to_string()))?;
         
-        match serde_json::from_str(&config_str) {
+        config_builder
+            .try_deserialize()
+            .map_err(|e| NodeError::ConfigParseError(e.to_string()))
+            .map(|config: Self| {
+                info!("Loaded config from {} (format detected automatically)", path.display());
+                config
+            })
+    }
+    
+    /// Load configuration from "config.toml" if it exists, otherwise return default configuration.
+    /// This is the recommended way to get configuration for the application.
+    pub fn load_or_default() -> Self {
+        const CONFIG_FILE: &str = "config.toml";
+        match Self::load_from_file(CONFIG_FILE) {
             Ok(config) => {
-                info!("Loaded config from {}", path.display());
-                Ok(config)
+                info!("Configuration loaded from {}", CONFIG_FILE);
+                config
             }
-            Err(e) => Err(NodeError::ConfigParseError(e.to_string())),
+            Err(e) => {
+                warn!("Failed to load configuration from {}: {}. Using default configuration.", CONFIG_FILE, e);
+                Self::default()
+            }
         }
     }
     
     pub fn save_to_file(&self, path: &str) -> Result<(), NodeError> {
-        let config_str = match serde_json::to_string_pretty(self) {
-            Ok(json) => json,
-            Err(e) => return Err(NodeError::SerializationError(e.to_string())),
+        let path_obj = Path::new(path);
+        let config_str = if let Some(ext) = path_obj.extension() {
+            if ext == "toml" {
+                // Save as TOML
+                toml::to_string_pretty(self)
+                    .map_err(|e| NodeError::SerializationError(e.to_string()))?
+            } else {
+                // Default to JSON for .json or any other extension
+                serde_json::to_string_pretty(self)
+                    .map_err(|e| NodeError::SerializationError(e.to_string()))?
+            }
+        } else {
+            // No extension, default to JSON
+            serde_json::to_string_pretty(self)
+                .map_err(|e| NodeError::SerializationError(e.to_string()))?
         };
         
         match fs::write(path, config_str) {
@@ -304,7 +336,7 @@ impl Default for MLConfig {
             device_type: "cpu".to_string(),
             max_batch_size: 32,
             embedding_dim: 768,
-            use_gpu: false,
+            use_gpu: true,
         }
     }
 }

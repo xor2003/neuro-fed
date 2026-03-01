@@ -126,7 +126,7 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
     info!("Starting NeuroFed daemon on {}:{}", host, port);
     
     // Create components for OpenAI proxy
-    let config = NodeConfig::default();
+    let config = NodeConfig::load_or_default();
     let proxy_config = config.proxy_config.clone();
     
     // Create ML Engine
@@ -364,7 +364,7 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
     info!("NeuroPC Node initialized successfully");
 
     // Brain sharing integration
-    let config = NodeConfig::default();
+    let config = NodeConfig::load_or_default();
     if brain_sharing && config.brain_sharing_config.enabled {
         info!("Brain sharing enabled, initializing brain manager...");
         let nostr_federation = NostrFederation::new(config.nostr_config.clone());
