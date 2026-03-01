@@ -1,6 +1,7 @@
 // src/main.rs
-// Main application entry point
+// Main application entry point with CLI
 
+use clap::{Parser, Subcommand};
 use neuro_fed_node::bootstrap::{Bootstrap, BootstrapConfig, LlamaContext};
 use neuro_fed_node::pc_hierarchy::PCConfig;
 use neuro_fed_node::PredictiveCoding;
@@ -11,13 +12,57 @@ use neuro_fed_node::federation_manager::{FederationManager, FederationManagerCon
 use neuro_fed_node::payment_verifier::PaymentVerifier;
 use neuro_fed_node::pow_verifier::PoWVerifier;
 use neuro_fed_node::privacy_networks::PrivacyNetworkManager;
+use neuro_fed_node::openai_proxy::OpenAiProxy;
 use candle_core::{Tensor, Device};
+use reqwest;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{info, warn, Level};
 use tracing_subscriber;
+
+/// CLI arguments
+#[derive(Parser)]
+#[command(name = "neurofed")]
+#[command(about = "NeuroFed Node - Decentralized Federated AGI System")]
+#[command(version = "0.1.0")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the NeuroFed daemon (OpenAI proxy server)
+    Daemon {
+        /// Port to listen on
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+        
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    
+    /// Start interactive chat with the NeuroFed brain
+    Chat {
+        /// URL of the NeuroFed daemon
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+    },
+    
+    /// Run the full NeuroFed node with all components (default)
+    Run {
+        /// Enable brain sharing
+        #[arg(long)]
+        brain_sharing: bool,
+        
+        /// Enable privacy networks
+        #[arg(long)]
+        privacy: bool,
+    },
+}
 
 /// Simple metrics for the dashboard
 #[derive(Default)]
@@ -63,14 +108,196 @@ fn spawn_metrics_dashboard(
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// Start the OpenAI proxy server (daemon mode)
+async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
+    setup_logging();
+    
+    info!("Starting NeuroFed daemon on {}:{}", host, port);
+    
+    // Create components for OpenAI proxy
+    let config = NodeConfig::default();
+    let proxy_config = config.proxy_config.clone();
+    
+    // Create ML Engine
+    let device_type = neuro_fed_node::types::DeviceType {
+        name: "CPU".to_string(),
+        description: "CPU device".to_string(),
+        supported: true,
+    };
+    let local_engine = Arc::new(tokio::sync::Mutex::new(
+        neuro_fed_node::ml_engine::MLEngine::new("models/gguf_model.gguf", device_type)?
+    ));
+    
+    // Create Predictive Coding hierarchy
+    let pc_config = PCConfig::new(3, vec![512, 256, 128]);
+    let pc_hierarchy = Arc::new(tokio::sync::Mutex::new(
+        PredictiveCoding::new(pc_config)?
+    ));
+    
+    info!("NeuroPC Node initialized successfully");
+
+    // Create OpenAI proxy
+    let proxy: OpenAiProxy = OpenAiProxy::new(
+        config,
+        proxy_config,
+        local_engine,
+        pc_hierarchy,
+    );
+
+    info!("Starting OpenAI proxy server on {}:{}", host, port);
+    proxy.start(port).await?;
+    
+    Ok(())
+}
+
+/// Start interactive chat mode
+async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
+    println!("🧠 NeuroFed Chat Client");
+    println!("Connecting to daemon at {}...", url);
+    println!("Type your messages (type 'quit' or 'exit' to quit):");
+    
+    let client = reqwest::Client::new();
+    let chat_url = format!("{}/v1/chat/completions", url);
+    
+    // Simple chat loop
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(_) => {
+            eprintln!("Warning: Could not initialize readline, using simple input mode");
+            // Create a simple editor without history
+            rustyline::Editor::<(), rustyline::history::FileHistory>::new().unwrap()
+        }
+    };
+    
+    let mut message_history: Vec<serde_json::Value> = Vec::new();
+    
+    loop {
+        let readline = rl.readline("> ");
+        match readline {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                
+                if line.eq_ignore_ascii_case("quit") || line.eq_ignore_ascii_case("exit") {
+                    println!("Goodbye!");
+                    break;
+                }
+                
+                if line.eq_ignore_ascii_case("clear") {
+                    message_history.clear();
+                    println!("Conversation cleared.");
+                    continue;
+                }
+                
+                if line.eq_ignore_ascii_case("history") {
+                    println!("Message history ({} messages):", message_history.len());
+                    for (i, msg) in message_history.iter().enumerate() {
+                        println!("  {}. {}", i + 1, msg["content"].as_str().unwrap_or("[no content]"));
+                    }
+                    continue;
+                }
+                
+                // Add user message to history
+                let user_message = serde_json::json!({
+                    "role": "user",
+                    "content": line
+                });
+                message_history.push(user_message.clone());
+                
+                // Prepare request
+                let request = serde_json::json!({
+                    "model": "neurofed",
+                    "messages": message_history,
+                    "stream": false,
+                    "max_tokens": 1000
+                });
+                
+                println!("🤔 Thinking...");
+                
+                // Send request to daemon
+                let start_time = std::time::Instant::now();
+                let response = match client.post(&chat_url)
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        eprintln!("Error connecting to daemon: {}", e);
+                        println!("Make sure the daemon is running with 'neurofed daemon'");
+                        continue;
+                    }
+                };
+                
+                let elapsed = start_time.elapsed();
+                
+                if response.status().is_success() {
+                    let response_json: serde_json::Value = match response.json().await {
+                        Ok(json) => json,
+                        Err(e) => {
+                            eprintln!("Error parsing response: {}", e);
+                            continue;
+                        }
+                    };
+                    
+                    // Extract assistant message
+                    let choices = response_json["choices"].as_array();
+                    let assistant_message = choices.and_then(|c| c.first())
+                        .and_then(|c| c["message"].as_object())
+                        .cloned();
+                    
+                    if let Some(msg) = assistant_message {
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("assistant");
+                        
+                        // Add assistant message to history
+                        message_history.push(serde_json::json!({
+                            "role": role,
+                            "content": content
+                        }));
+                        
+                        // Print response with single-line statistics
+                        println!("🧠 {}", content);
+                        println!("📊 Response time: {:.2}s, History: {} messages", elapsed.as_secs_f32(), message_history.len());
+                    } else {
+                        println!("⚠️  No valid response from daemon");
+                        println!("📊 Response time: {:.2}s", elapsed.as_secs_f32());
+                    }
+                } else {
+                    let status = response.status();
+                    let error_text = response.text().await.unwrap_or_else(|_| "No error details".to_string());
+                    eprintln!("Error from daemon ({}): {}", status, error_text);
+                    println!("📊 Response time: {:.2}s", elapsed.as_secs_f32());
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("Interrupted (Ctrl+C)");
+                break;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("EOF (Ctrl+D)");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading line: {}", err);
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Run full NeuroFed node (original behavior)
+async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn Error>> {
     setup_logging();
 
     // Create components
     let _llama_ctx = LlamaContext::new("models/gguf_model.gguf", 2048);
-    let mut pc_hierarchy = PredictiveCoding::new(PCConfig::new(3, vec![2048, 1024, 512]))?;
-    let mut bootstrap = Bootstrap::new(BootstrapConfig::new(
+    let pc_hierarchy = PredictiveCoding::new(PCConfig::new(3, vec![2048, 1024, 512]))?;
+    let _bootstrap = Bootstrap::new(BootstrapConfig::new(
         "models/gguf_model.gguf".to_string(),
         2048,
         vec!["./data".to_string()],
@@ -81,7 +308,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Brain sharing integration
     let config = NodeConfig::default();
-    if config.brain_sharing_config.enabled {
+    if brain_sharing && config.brain_sharing_config.enabled {
         info!("Brain sharing enabled, initializing brain manager...");
         let nostr_federation = NostrFederation::new(config.nostr_config.clone());
         let nostr_federation_arc = Arc::new(nostr_federation);
@@ -160,17 +387,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Federation manager initialized with strategy: {:?}", federation_manager.strategy());
 
     // Privacy network integration
-    info!("Initializing privacy network manager...");
-    let mut privacy_manager = PrivacyNetworkManager::new(config.privacy_config.clone());
-    match privacy_manager.initialize().await {
-        Ok(_) => {
-            info!("Privacy network manager initialized successfully");
-            match privacy_manager.connect().await {
-                Ok(_) => info!("Connected to privacy network: {:?}", privacy_manager.current_network()),
-                Err(e) => warn!("Failed to connect to privacy network: {}", e),
+    if privacy {
+        info!("Initializing privacy network manager...");
+        let mut privacy_manager = PrivacyNetworkManager::new(config.privacy_config.clone());
+        match privacy_manager.initialize().await {
+            Ok(_) => {
+                info!("Privacy network manager initialized successfully");
+                match privacy_manager.connect().await {
+                    Ok(_) => info!("Connected to privacy network: {:?}", privacy_manager.current_network()),
+                    Err(e) => warn!("Failed to connect to privacy network: {}", e),
+                }
             }
+            Err(e) => warn!("Failed to initialize privacy network manager: {}", e),
         }
-        Err(e) => warn!("Failed to initialize privacy network manager: {}", e),
     }
 
     // Create shared state for metrics dashboard
@@ -197,37 +426,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .expect("Failed to create input tensor");
             
             // Update metrics
-            {
-                let mut metrics = metrics_arc.lock().await;
-                metrics.inference_count += 1;
-            }
+            let mut metrics = metrics_arc.lock().await;
+            metrics.inference_count += 1;
             
-            // Run inference (blocking, but that's okay for demo)
+            // Run inference
             let mut pc = pc_hierarchy_arc.lock().await;
-            let result = pc.infer(&input, 10);
-            if let Ok(stats) = result {
-                let mut metrics = metrics_arc.lock().await;
-                metrics.free_energy = *stats.free_energy_history.last().unwrap_or(&0.0);
+            match pc.infer(&input, 10) {
+                Ok(stats) => {
+                    metrics.free_energy = stats.total_surprise;
+                    info!("Inference completed, free energy: {:.4}", stats.total_surprise);
+                }
+                Err(e) => warn!("Inference failed: {}", e),
             }
-        }
-
-        if counter == 10 {
-            info!("Starting bootstrap...");
-            let _bootstrap_result = bootstrap.run();
-        }
-
-        if counter >= 30 {
-            info!("Demo complete, shutting down...");
-            break;
         }
     }
-
-    Ok(())
 }
 
 fn setup_logging() {
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        .with_target(false)
         .init();
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Daemon { port, host } => {
+            start_daemon(port, host).await
+        }
+        Commands::Chat { url } => {
+            start_chat(url).await
+        }
+        Commands::Run { brain_sharing, privacy } => {
+            run_full_node(brain_sharing, privacy).await
+        }
+    }
 }
