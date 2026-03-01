@@ -283,6 +283,70 @@ pub struct Config {
     pub pc: PCConfig,
 }
 
+/// Federation request for wallet/no-wallet modes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationRequest {
+    pub id: String,
+    pub request_type: String,
+    pub payment_proof: String,
+    pub pow_proof: String,
+    pub timestamp: SystemTime,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Federation response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationResponse {
+    pub id: String,
+    pub success: bool,
+    pub message: String,
+    pub timestamp: SystemTime,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Payment verification result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentVerification {
+    pub verified: bool,
+    pub amount_sats: u64,
+    pub reason: Option<String>,
+}
+
+/// Proof-of-work verification result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoWVerification {
+    pub verified: bool,
+    pub nonce: u64,
+    pub hash: String,
+    pub reason: Option<String>,
+}
+
+/// Federation error types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FederationError {
+    PaymentVerificationFailed(String),
+    PoWVerificationFailed(String),
+    Timeout(String),
+    InvalidRequest(String),
+    NostrError(String),
+    ConfigError(String),
+}
+
+impl std::fmt::Display for FederationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            FederationError::PaymentVerificationFailed(msg) => write!(f, "Payment verification failed: {}", msg),
+            FederationError::PoWVerificationFailed(msg) => write!(f, "PoW verification failed: {}", msg),
+            FederationError::Timeout(msg) => write!(f, "Timeout: {}", msg),
+            FederationError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
+            FederationError::NostrError(msg) => write!(f, "Nostr error: {}", msg),
+            FederationError::ConfigError(msg) => write!(f, "Config error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for FederationError {}
+
 // Added MLError type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MLError {
@@ -292,3 +356,53 @@ pub enum MLError {
     InvalidResponse(String),
     ConfigurationError(String),
 }
+
+impl std::fmt::Display for MLError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            MLError::ModelLoadError(msg) => write!(f, "ModelLoadError: {}", msg),
+            MLError::RequestError(msg) => write!(f, "RequestError: {}", msg),
+            MLError::SerializationError(msg) => write!(f, "SerializationError: {}", msg),
+            MLError::InvalidResponse(msg) => write!(f, "InvalidResponse: {}", msg),
+            MLError::ConfigurationError(msg) => write!(f, "ConfigurationError: {}", msg),
+        }
+    }
+}
+
+/// Privacy network connection information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConnection {
+    /// Network type (Yggdrasil, Tor, I2P, Direct)
+    pub network_type: String,
+    /// Connection status
+    pub status: String,
+    /// Latency in milliseconds
+    pub latency_ms: u64,
+    /// Bandwidth in bytes per second
+    pub bandwidth_bps: u64,
+    /// Whether the connection is encrypted
+    pub encrypted: bool,
+    /// Connection start time
+    pub connected_since: SystemTime,
+    /// Number of peers connected
+    pub peer_count: usize,
+}
+
+/// Privacy network events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PrivacyNetworkEvent {
+    /// Network connected successfully
+    Connected { network: String, address: String },
+    /// Network disconnected
+    Disconnected { network: String, reason: String },
+    /// Network switched
+    Switched { from: String, to: String },
+    /// Network error occurred
+    Error { network: String, error: String },
+    /// Network latency update
+    LatencyUpdate { network: String, latency_ms: u64 },
+    /// Bandwidth update
+    BandwidthUpdate { network: String, bandwidth_bps: u64 },
+}
+
+impl std::error::Error for MLError {}

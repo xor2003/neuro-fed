@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{info, error, debug, warn};
 
-use crate::types::{UserInput, NodeCommand, FileEvent, NodeResponse, NodeError, NostrEvent};
+use crate::types::{UserInput, FileEvent, NodeError, NostrEvent};
 
 pub struct NodeLoop {
     rx_user_input: mpsc::Receiver<UserInput>,
@@ -71,13 +70,13 @@ impl NodeLoop {
     }
 
     /// Process user input
-    async fn process_user_input(&self, input: UserInput) -> Result<(), NodeError> {
+    async fn process_user_input(&self, _input: UserInput) -> Result<(), NodeError> {
         // Implementation here
         Ok(())
     }
 
     /// Process file event
-    async fn process_file_event(&self, event: FileEvent) -> Result<(), NodeError> {
+    async fn process_file_event(&self, _event: FileEvent) -> Result<(), NodeError> {
         // Implementation here
         Ok(())
     }
@@ -96,7 +95,11 @@ impl NodeLoop {
 
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
+    use tokio::time;
 
     #[tokio::test]
     async fn test_node_loop_creation() {
@@ -127,10 +130,10 @@ mod tests {
         drop(tx_file_events);
         drop(tx_nostr_events);
         
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        time::sleep(Duration::from_millis(100)).await;
         stop_signal.store(true, Ordering::Relaxed);
         
         // Add timeout to prevent hanging
-        tokio::time::timeout(Duration::from_millis(500), handle).await.unwrap().unwrap();
+        time::timeout(Duration::from_millis(500), handle).await.unwrap().unwrap();
     }
 }

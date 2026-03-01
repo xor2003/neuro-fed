@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::path::Path;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 

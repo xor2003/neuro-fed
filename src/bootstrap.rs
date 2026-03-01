@@ -3,14 +3,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
-use std::time::Instant;
 use chrono::{DateTime, Utc};
-use ndarray::{Array, Array2, Array3, Axis, s};
-use ndarray_linalg::Norm;
-use ndarray_rand::RandomExt;
+use ndarray::{Array2, Array3, s};
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
 use crate::pc_hierarchy::PredictiveCoding;
 
 #[derive(Debug)]
@@ -109,7 +104,7 @@ impl LlamaContext {
         }
     }
 
-    pub fn tokenize(&self, text: &str) -> Result<Vec<usize>, BootstrapError> {
+    pub fn tokenize(&self, _text: &str) -> Result<Vec<usize>, BootstrapError> {
         // Tokenization logic would go here
         Ok(vec![])
     }
@@ -186,7 +181,7 @@ impl Bootstrap {
         Ok(vec![])
     }
 
-    pub fn extract_embeddings(&self, documents: &[Document]) -> Result<Vec<Array2<f32>>, BootstrapError> {
+    pub fn extract_embeddings(&self, _documents: &[Document]) -> Result<Vec<Array2<f32>>, BootstrapError> {
         // Implementation would go here
         Ok(vec![])
     }
@@ -220,7 +215,7 @@ impl BootstrapResult {
         Self {
             beliefs: beliefs.iter().map(|arr| {
                 // Convert Array2<f32> back to Vec<Vec<f32>>
-                let (rows, cols) = arr.dim();
+                let (rows, _cols) = arr.dim();
                 let mut result = Vec::with_capacity(rows);
                 for i in 0..rows {
                     let row: Vec<f32> = arr.row(i).iter().copied().collect();
@@ -230,7 +225,7 @@ impl BootstrapResult {
             }).collect(),
             weights: weights.iter().map(|arr| {
                 // Convert Array3<f32> back to Vec<Vec<Vec<f32>>>
-                let (depth, rows, cols) = arr.dim();
+                let (depth, rows, _cols) = arr.dim();
                 let mut result = Vec::with_capacity(depth);
                 for d in 0..depth {
                     let mut layer = Vec::with_capacity(rows);

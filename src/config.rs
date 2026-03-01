@@ -3,9 +3,10 @@
 
 use std::fs;
 use std::path::Path;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{info, error, debug, warn};
+use tracing::{info, warn};
+
+use crate::privacy_networks::PrivacyNetworkConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeConfig {
@@ -18,7 +19,11 @@ pub struct NodeConfig {
     pub web_ui_enabled: bool,
     pub log_level: String,
     pub ml_config: MLConfig,
+    pub proxy_config: BackendConfig,
     pub wallet_address: Option<String>,
+    pub brain_sharing_config: BrainSharingConfig,
+    pub federation_config: FederationConfig,
+    pub privacy_config: PrivacyNetworkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,6 +36,20 @@ pub struct MLConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendConfig {
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: String,
+    pub ollama_base_url: String,
+    pub local_fallback_enabled: bool,
+    pub tool_bypass_enabled: bool,
+    pub semantic_cache_enabled: bool,
+    pub semantic_similarity_threshold: f32,
+    pub pc_inference_enabled: bool,
+    pub pc_learning_enabled: bool,
+    pub max_cache_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NostrConfig {
     pub relay_urls: Vec<String>,
     pub public_key: String,
@@ -40,11 +59,137 @@ pub struct NostrConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrainSharingConfig {
+    /// Whether brain sharing is enabled.
+    pub enabled: bool,
+    /// Relay URLs for brain sharing (overrides NostrConfig if non‑empty).
+    pub relay_urls: Vec<String>,
+    /// Directory where brains are stored locally.
+    pub brain_storage_dir: std::path::PathBuf,
+    /// Directory for caching downloaded brains.
+    pub cache_dir: std::path::PathBuf,
+    /// Base model ID of this node (for compatibility checking).
+    pub base_model_id: String,
+    /// Allow downloading brains from unknown authors.
+    pub allow_untrusted_authors: bool,
+    /// Maximum brain size in bytes.
+    pub max_brain_size: u64,
+}
+
+/// Federation configuration for wallet vs. no-wallet modes
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FederationConfig {
+    /// Federation strategy: "wallet" or "no_wallet"
+    pub strategy: String,
+    /// Wallet configuration (for wallet mode)
+    pub wallet: WalletConfig,
+    /// Proof-of-work configuration (for no-wallet mode)
+    pub pow: PoWConfig,
+    /// Enable fallback between modes
+    pub enable_fallback: bool,
+    /// Maximum retries for federation requests
+    pub max_retries: u32,
+    /// Request timeout in seconds
+    pub request_timeout_seconds: u64,
+}
+
+/// Wallet configuration for Nostr payments (zaps)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WalletConfig {
+    /// Nostr private key (hex)
+    pub private_key: String,
+    /// Relay URLs for payment verification
+    pub payment_relays: Vec<String>,
+    /// Minimum satoshis required per request
+    pub min_sats: u64,
+    /// Required confirmations
+    pub required_confirmations: u32,
+    /// Enable automatic zap requests
+    pub enable_auto_zap: bool,
+}
+
+/// Proof-of-work configuration for no-wallet mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PoWConfig {
+    /// Difficulty target (number of leading zero bits)
+    pub difficulty: u32,
+    /// Timeout for PoW generation in seconds
+    pub timeout_seconds: u64,
+    /// Hash algorithm (e.g., "sha256")
+    pub hash_algorithm: String,
+    /// Enable dynamic difficulty adjustment
+    pub enable_dynamic_difficulty: bool,
+    /// Maximum nonce value
+    pub max_nonce: u64,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            private_key: "".to_string(),
+            payment_relays: vec!["wss://relay.damus.io".to_string()],
+            min_sats: 1000,
+            required_confirmations: 1,
+            enable_auto_zap: false,
+        }
+    }
+}
+
+impl Default for PoWConfig {
+    fn default() -> Self {
+        Self {
+            difficulty: 5,
+            timeout_seconds: 30,
+            hash_algorithm: "sha256".to_string(),
+            enable_dynamic_difficulty: true,
+            max_nonce: 1_000_000,
+        }
+    }
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "wallet".to_string(),
+            wallet: WalletConfig::default(),
+            pow: PoWConfig::default(),
+            enable_fallback: true,
+            max_retries: 3,
+            request_timeout_seconds: 30,
+        }
+    }
+}
+
+impl Default for BrainSharingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relay_urls: vec!["wss://relay.damus.io".to_string()],
+            brain_storage_dir: std::path::PathBuf::from("./brains"),
+            cache_dir: std::path::PathBuf::from("./cache/brains"),
+            base_model_id: "unknown".to_string(),
+            allow_untrusted_authors: false,
+            max_brain_size: 2 * 1024 * 1024 * 1024, // 2 GB
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PCConfig {
     pub n_levels: usize,
     pub dim_per_level: Vec<usize>,
     pub learning_rate: f32,
-    pub muPC_scaling: bool,
+    pub mu_pc_scaling: bool,
+    // Precision weighting configuration
+    pub enable_precision_weighting: bool,
+    pub free_energy_drop_threshold: f32,
+    pub default_precision: f32,
+    pub min_precision: f32,
+    pub max_precision: f32,
+    pub free_energy_history_size: usize,
+    pub enable_code_verification: bool,
+    pub enable_nostr_zap_tracking: bool,
+    pub min_zaps_for_consensus: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,7 +288,11 @@ impl Default for NodeConfig {
             web_ui_enabled: false,
             log_level: "INFO".to_string(),
             ml_config: MLConfig::default(),
+            proxy_config: BackendConfig::default(),
             wallet_address: None,
+            brain_sharing_config: BrainSharingConfig::default(),
+            federation_config: FederationConfig::default(),
+            privacy_config: PrivacyNetworkConfig::default(),
         }
     }
 }
@@ -178,7 +327,34 @@ impl Default for PCConfig {
             n_levels: 3,
             dim_per_level: vec![2048, 1024, 512],
             learning_rate: 0.01,
-            muPC_scaling: false,
+            mu_pc_scaling: false,
+            // Precision weighting defaults
+            enable_precision_weighting: false,
+            free_energy_drop_threshold: 0.5,
+            default_precision: 0.3,
+            min_precision: 0.1,
+            max_precision: 1.0,
+            free_energy_history_size: 10,
+            enable_code_verification: false,
+            enable_nostr_zap_tracking: false,
+            min_zaps_for_consensus: 3,
+        }
+    }
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            openai_api_key: None,
+            openai_base_url: "https://api.openai.com/v1".to_string(),
+            ollama_base_url: "http://localhost:11434".to_string(),
+            local_fallback_enabled: true,
+            tool_bypass_enabled: true,
+            semantic_cache_enabled: true,
+            semantic_similarity_threshold: 0.8,
+            pc_inference_enabled: true,
+            pc_learning_enabled: true,
+            max_cache_size: 100,
         }
     }
 }

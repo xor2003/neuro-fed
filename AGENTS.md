@@ -203,6 +203,7 @@ cargo doc --no-deps
 - Use `clippy` for linting
 - Add documentation comments (`///`) for public APIs
 - Add inline comments (`//`) for complex logic
+- Keep files below 300 lines, to easy maintain them
 
 ### Error Handling
 - Use `thiserror` for custom error types

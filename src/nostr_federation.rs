@@ -4,18 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{info, error, debug, warn};
+use tracing::{info, debug};
 
-#[derive(Debug, Clone)]
-pub struct NostrConfig {
-    pub relay_urls: Vec<String>,
-    pub public_key: String,
-    pub private_key: String,
-    pub max_batch_size: usize,
-    pub publish_interval: Duration,
-}
+use crate::federation_manager::FederationStrategy;
+
+// Re-export NostrConfig for backwards compatibility
+pub use crate::config::NostrConfig;
 
 #[derive(Debug, Clone)]
 pub struct NostrEvent {
@@ -32,6 +26,7 @@ pub enum EventKind {
     NodeStatus,
     BootstrapResult,
     SystemMessage,
+    BrainShare,
 }
 
 #[derive(Debug)]
@@ -41,6 +36,10 @@ pub enum NostrError {
     AuthenticationError(String),
     InvalidEvent(String),
     ConnectionError(String),
+    BrainShareError(String),
+    PaymentVerificationError(String),
+    PoWVerificationError(String),
+    FederationStrategyError(String),
 }
 
 impl std::fmt::Display for NostrError {
@@ -51,6 +50,10 @@ impl std::fmt::Display for NostrError {
             NostrError::AuthenticationError(msg) => write!(f, "Authentication error: {}", msg),
             NostrError::InvalidEvent(msg) => write!(f, "Invalid event: {}", msg),
             NostrError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
+            NostrError::BrainShareError(msg) => write!(f, "Brain share error: {}", msg),
+            NostrError::PaymentVerificationError(msg) => write!(f, "Payment verification error: {}", msg),
+            NostrError::PoWVerificationError(msg) => write!(f, "PoW verification error: {}", msg),
+            NostrError::FederationStrategyError(msg) => write!(f, "Federation strategy error: {}", msg),
         }
     }
 }
@@ -63,6 +66,7 @@ pub struct NostrFederation {
     relays: Vec<String>,
     event_cache: HashMap<String, NostrEvent>,
     shutdown_signal: Arc<AtomicBool>,
+    federation_strategy: Option<FederationStrategy>,
 }
 
 impl NostrFederation {
@@ -73,6 +77,18 @@ impl NostrFederation {
             relays,
             event_cache: HashMap::new(),
             shutdown_signal: Arc::new(AtomicBool::new(false)),
+            federation_strategy: None,
+        }
+    }
+    
+    pub fn new_with_strategy(config: NostrConfig, strategy: FederationStrategy) -> Self {
+        let relays = config.relay_urls.clone();
+        Self {
+            config,
+            relays,
+            event_cache: HashMap::new(),
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
+            federation_strategy: Some(strategy),
         }
     }
     
@@ -94,20 +110,41 @@ impl NostrFederation {
         Ok(())
     }
     
+    /// Publish a NIP‑94 brain share event.
+    pub async fn publish_brain_event(
+        &self,
+        brain_id: &str,
+        _metadata_json: &str,
+        _file_url: &str,
+    ) -> Result<String, NostrError> {
+        info!("Publishing brain share event for brain {}", brain_id);
+        // TODO: Implement actual NIP-94 event creation and publishing.
+        // For now, return a dummy event ID.
+        Ok(format!("nip94_{}", brain_id))
+    }
+    
+    /// Subscribe to NIP‑94 brain share events.
+    pub async fn subscribe_to_brain_events(&self) -> Result<(), NostrError> {
+        info!("Subscribing to brain share events (NIP-94)");
+        // TODO: Implement subscription filter for kind 1064 (NIP-94).
+        Ok(())
+    }
+    
+    /// Process an incoming brain share event (NIP-94).
+    pub async fn process_brain_event(&self, event: NostrEvent) -> Result<(), NostrError> {
+        debug!("Processing brain share event: {}", event.id);
+        if event.kind != EventKind::BrainShare {
+            return Err(NostrError::InvalidEvent(
+                "Event kind is not BrainShare".to_string(),
+            ));
+        }
+        // TODO: Extract metadata and file URL from event content/tags.
+        // Then trigger download via BlossomClient.
+        Ok(())
+    }
+    
     pub fn shutdown(&self) {
         self.shutdown_signal.store(true, Ordering::SeqCst);
-    }
-}
-
-impl Default for NostrConfig {
-    fn default() -> Self {
-        Self {
-            relay_urls: vec!["wss://relay.damus.io".to_string()],
-            public_key: "default-pub-key".to_string(),
-            private_key: "default-priv-key".to_string(),
-            max_batch_size: 100,
-            publish_interval: Duration::from_secs(60),
-        }
     }
 }
 
@@ -122,7 +159,7 @@ mod tests {
             public_key: "test-pub-key".to_string(),
             private_key: "test-priv-key".to_string(),
             max_batch_size: 100,
-            publish_interval: Duration::from_secs(60),
+            publish_interval: 60,
         };
         
         let federation = NostrFederation::new(config);

@@ -1,14 +1,13 @@
 // src/pc_hierarchy.rs
 // Pure Predictive Coding (PC) implementation based on Rao-Ballard/Friston free-energy minimization
 
-#![recursion_limit = "4096"]
-
-use ndarray::{Array, Array2, Array3, Axis};
+use ndarray::Array2;
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::Uniform;
-use ndarray_linalg::Norm;
 use std::error::Error;
 use std::fmt;
+
+use crate::knowledge_filter::{PrecisionCalculator, PrecisionConfig, PrecisionContext};
 
 #[derive(Debug)]
 pub struct PCError(String);
@@ -30,7 +29,17 @@ pub struct PCConfig {
     pub inference_steps: usize,
     pub surprise_threshold: f32,
     pub selective_update: bool,
-    pub muPC_scaling: bool,
+    pub mu_pc_scaling: bool,
+    // Precision weighting configuration
+    pub enable_precision_weighting: bool,
+    pub free_energy_drop_threshold: f32,
+    pub default_precision: f32,
+    pub min_precision: f32,
+    pub max_precision: f32,
+    pub free_energy_history_size: usize,
+    pub enable_code_verification: bool,
+    pub enable_nostr_zap_tracking: bool,
+    pub min_zaps_for_consensus: usize,
 }
 
 impl PCConfig {
@@ -42,12 +51,22 @@ impl PCConfig {
             inference_steps: 20,
             surprise_threshold: 1.0,
             selective_update: true,
-            muPC_scaling: false,
+            mu_pc_scaling: false,
+            // Precision weighting defaults
+            enable_precision_weighting: false,
+            free_energy_drop_threshold: 0.5,
+            default_precision: 0.3,
+            min_precision: 0.1,
+            max_precision: 1.0,
+            free_energy_history_size: 10,
+            enable_code_verification: false,
+            enable_nostr_zap_tracking: false,
+            min_zaps_for_consensus: 3,
         }
     }
 
-    pub fn with_muPC_scaling(mut self, enabled: bool) -> Self {
-        self.muPC_scaling = enabled;
+    pub fn with_mu_pc_scaling(mut self, enabled: bool) -> Self {
+        self.mu_pc_scaling = enabled;
         self
     }
 
@@ -105,10 +124,23 @@ impl PCLevel {
         Array2::zeros((self.weights.shape()[1], self.beliefs.shape()[1]))
     }
 
-    pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Array2<f32>) {
-        // Delta U_l = eta * epsilon_l * r_{l+1}^T
-        let delta_weights = eta * &self.errors.dot(&next_level_beliefs.t());
+    pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Array2<f32>, precision: Option<&Array2<f32>>) {
+        // Delta U_l = eta * epsilon_l * r_{l+1}^T * π
+        // If precision is provided, apply element-wise multiplication
+        let mut delta_weights = eta * &self.errors.dot(&next_level_beliefs.t());
+        
+        if let Some(precision_matrix) = precision {
+            // Apply precision weighting element-wise
+            // Note: precision_matrix should have shape (input_dim, 1) for broadcasting
+            delta_weights = &delta_weights * precision_matrix;
+        }
+        
         self.weights = &self.weights + &delta_weights;
+    }
+    
+    /// Legacy method for backward compatibility
+    pub fn update_weights_legacy(&mut self, eta: f32, next_level_beliefs: &Array2<f32>) {
+        self.update_weights(eta, next_level_beliefs, None);
     }
 }
 
@@ -135,6 +167,7 @@ pub struct PredictiveCoding {
     pub config: PCConfig,
     pub surprise_threshold: f32,
     pub free_energy: f32,
+    pub precision_calculator: Option<PrecisionCalculator>,
 }
 
 impl PredictiveCoding {
@@ -174,11 +207,30 @@ impl PredictiveCoding {
             levels.push(level);
         }
 
+        // Create precision calculator if precision weighting is enabled
+        let precision_calculator = if config.enable_precision_weighting {
+            let precision_config = PrecisionConfig {
+                free_energy_drop_threshold: config.free_energy_drop_threshold,
+                default_precision: config.default_precision,
+                min_precision: config.min_precision,
+                max_precision: config.max_precision,
+                free_energy_history_size: config.free_energy_history_size,
+                enable_code_verification: config.enable_code_verification,
+                enable_nostr_zap_tracking: config.enable_nostr_zap_tracking,
+                min_zaps_for_consensus: config.min_zaps_for_consensus,
+                trusted_node_keys: Vec::new(), // Will be populated from config if needed
+            };
+            Some(PrecisionCalculator::new(precision_config))
+        } else {
+            None
+        };
+
         Ok(PredictiveCoding {
             levels,
             config: config.clone(),
             surprise_threshold: config.surprise_threshold,
             free_energy: 0.0,
+            precision_calculator,
         })
     }
 
@@ -228,29 +280,66 @@ impl PredictiveCoding {
         Ok(stats)
     }
 
-    pub fn learn(&mut self, input: &Array2<f32>) -> Result<SurpriseStats, PCError> {
+    pub fn learn(&mut self, input: &Array2<f32>, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
         // Perform inference to compute errors
         let stats = self.infer(input, self.config.inference_steps)?;
         
+        // Record free energy for tracking
+        if let Some(ref mut calculator) = self.precision_calculator {
+            let current_free_energy = stats.free_energy_history.last().unwrap_or(&0.0);
+            calculator.record_free_energy(*current_free_energy);
+        }
+        
         // Clone beliefs for all levels to avoid borrow issues
         let next_level_beliefs: Vec<Array2<f32>> = self.levels.iter().map(|level| level.beliefs.clone()).collect();
+        
+        // Calculate precision if enabled
+        let precision_matrix = if let Some(ref calculator) = self.precision_calculator {
+            if let Some(context) = context {
+                let precision_result = calculator.calculate_precision(&context);
+                // Create a precision matrix from the scalar precision value
+                // For now, we'll create a matrix with the same precision for all units
+                // In the future, this could be per-unit precision
+                let input_dim = self.levels[0].beliefs.shape()[0];
+                Some(Array2::ones((input_dim, 1)) * precision_result.precision)
+            } else {
+                // Default precision matrix (all ones) if no context provided
+                let input_dim = self.levels[0].beliefs.shape()[0];
+                Some(Array2::ones((input_dim, 1)) * self.config.default_precision)
+            }
+        } else {
+            None
+        };
         
         // Update weights only for high-surprise components
         if self.config.selective_update {
             for l in 0..self.levels.len() - 1 {
                 if stats.high_surprise_indices.is_empty() {
-                    self.levels[l].update_weights(self.config.learning_rate, &next_level_beliefs[l + 1]);
+                    self.levels[l].update_weights(
+                        self.config.learning_rate,
+                        &next_level_beliefs[l + 1],
+                        precision_matrix.as_ref()
+                    );
                 }
             }
         } else {
             // Update all weights
             for l in 0..self.levels.len() - 1 {
-                self.levels[l].update_weights(self.config.learning_rate, &next_level_beliefs[l + 1]);
+                self.levels[l].update_weights(
+                    self.config.learning_rate,
+                    &next_level_beliefs[l + 1],
+                    precision_matrix.as_ref()
+                );
             }
         }
         
         self.free_energy = stats.free_energy_history.last().unwrap_or(&0.0).clone();
         Ok(stats)
+    }
+    
+    /// Legacy method for backward compatibility
+    pub fn learn_legacy(&mut self, input: &Array2<f32>) -> Result<SurpriseStats, PCError> {
+        self.learn(input, None)
     }
 
     fn compute_free_energy(&self) -> f32 {
@@ -328,7 +417,7 @@ mod tests {
         
         let input = Array2::random((512, 1), ndarray_rand::rand_distr::Uniform::new(-1.0, 1.0).unwrap());
         
-        let stats = pc.learn(&input).unwrap();
+        let stats = pc.learn_legacy(&input).unwrap();
         assert!(stats.free_energy_history.len() > 0);
     }
 
@@ -368,14 +457,14 @@ mod tests {
         let _ = pc.infer(&input, 1).unwrap();
         
         // Get beliefs before and after
-        let beliefs_level0_before = pc.levels[0].beliefs.clone();
+        let _beliefs_level0_before = pc.levels[0].beliefs.clone();
         let beliefs_level1_before = pc.levels[1].beliefs.clone();
         
         // Manually compute expected error propagation
         let weight_transpose = pc.levels[0].weights.t();
         let errors_level0 = &pc.levels[0].errors;
         let expected_update = 0.1 * weight_transpose.dot(errors_level0);
-        let expected_beliefs_level1 = &beliefs_level1_before + &expected_update;
+        let _expected_beliefs_level1 = &beliefs_level1_before + &expected_update;
         
         // Run another inference step to see if beliefs updated correctly
         let _ = pc.infer(&input, 1).unwrap();
@@ -407,7 +496,7 @@ mod tests {
         
         // Create input and run learning
         let input = Array2::random((6, 1), Uniform::new(-1.0, 1.0).unwrap());
-        let stats = pc.learn(&input).unwrap();
+        let stats = pc.learn_legacy(&input).unwrap();
         
         // Debug: print surprise indices
         println!("High surprise indices: {:?}", stats.high_surprise_indices);
@@ -458,7 +547,7 @@ mod tests {
         
         // Learn multiple times
         for i in 0..5 {
-            let _ = pc.learn(&input).unwrap();
+            let _ = pc.learn_legacy(&input).unwrap();
             let current_surprise = pc.surprise(&input).unwrap();
             
             // Free energy should generally decrease, but allow small fluctuations
@@ -524,7 +613,7 @@ mod tests {
         let input = Array2::random((8, 1), Uniform::new(-1.0, 1.0).unwrap());
         
         let stats1 = pc.infer(&input, 5).unwrap();
-        let _ = pc.learn(&input).unwrap();
+        let _ = pc.learn_legacy(&input).unwrap();
         let stats2 = pc.infer(&input, 5).unwrap();
         
         // With tiny learning rate, free energy should change very little
@@ -598,7 +687,7 @@ pub fn example_usage() {
     println!("Total surprise: {}", stats.total_surprise);
     
     // Learn from input
-    let learning_stats = pc.learn(&input).unwrap();
+    let learning_stats = pc.learn_legacy(&input).unwrap();
     println!("Learning surprise: {}", learning_stats.total_surprise);
     
     // Get beliefs from level 1
