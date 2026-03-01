@@ -184,6 +184,14 @@ impl OpenAiProxy {
         local_engine: Arc<Mutex<MLEngine>>,
         pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
     ) -> Self {
+        info!("OpenAI Proxy: Initializing with PC learning enabled: {}", backend_config.pc_learning_enabled);
+        info!("OpenAI Proxy: PC inference enabled: {}", backend_config.pc_inference_enabled);
+        if backend_config.pc_learning_enabled {
+            info!("OpenAI Proxy: PC will learn from every response");
+        } else {
+            warn!("OpenAI Proxy: PC learning is disabled - responses won't be learned");
+        }
+        
         Self {
             config,
             backend_config,
@@ -296,9 +304,12 @@ impl OpenAiProxy {
         
         // 5. Learn from response if PC learning enabled
         if proxy.backend_config.pc_learning_enabled {
+            info!("PC learning: Triggering learning from response (pc_learning_enabled: true)");
             proxy.metrics.lock().await.pc_learning_calls += 1;
             if let Err(e) = proxy.learn_from_response(&req, &response).await {
                 warn!("PC learning failed: {}", e);
+            } else {
+                info!("PC learning: Successfully scheduled learning task");
             }
         }
         
@@ -475,13 +486,21 @@ impl OpenAiProxy {
 
     /// Learn from API response using PC hierarchy
     async fn learn_from_response(&self, req: &OpenAiRequest, response: &OpenAiResponse) -> Result<(), ProxyError> {
+        info!("PC learning: Starting to learn from response (model: {}, choices: {})",
+              response.model, response.choices.len());
+        
         // Generate embedding for response (simplified - use response text)
         let response_text = self.response_to_text(response);
+        info!("PC learning: Response text length: {} chars", response_text.len());
+        
         let engine = self.local_engine.lock().await;
         let resp_tensor = engine.process_text(&response_text).await
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to process response text: {}", e)))?;
+            .map_err(|e| {
+                error!("PC learning: Failed to process response text: {}", e);
+                ProxyError::EmbeddingError(format!("Failed to process response text: {}", e))
+            })?;
         
-        debug!("Response tensor shape: {:?}, rank: {}", resp_tensor.shape(), resp_tensor.rank());
+        debug!("PC learning: Response tensor shape: {:?}, rank: {}", resp_tensor.shape(), resp_tensor.rank());
         
         // Flatten tensor if needed (handles [512, 1] shape from dummy embeddings)
         let resp_data = if resp_tensor.rank() > 1 {
@@ -494,11 +513,14 @@ impl OpenAiProxy {
                 .map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert response tensor: {}", e)))?
         };
         
-        debug!("Response data length: {}", resp_data.len());
+        let resp_data_len = resp_data.len();
+        let first_five_values: Vec<f32> = resp_data.get(0..5).unwrap_or(&[]).to_vec();
+        debug!("PC learning: Response data length: {}", resp_data_len);
+        info!("PC learning: First 5 values of response data: {:?}", first_five_values);
         
         // Trim to 512 dimensions (match PC hierarchy input dimension)
         let pc_input_dim = 512;
-        let trimmed_data: Vec<f32> = if resp_data.len() >= pc_input_dim {
+        let trimmed_data: Vec<f32> = if resp_data_len >= pc_input_dim {
             resp_data[..pc_input_dim].to_vec()
         } else {
             // Pad with zeros if shorter (should not happen)
@@ -507,27 +529,44 @@ impl OpenAiProxy {
             padded
         };
         
-        debug!("Trimmed data length: {}, pc_input_dim: {}", trimmed_data.len(), pc_input_dim);
+        info!("PC learning: Trimmed data length: {}, pc_input_dim: {} (original: {})",
+              trimmed_data.len(), pc_input_dim, resp_data_len);
         
         // Create tensor with shape (pc_input_dim, 1) for PC hierarchy compatibility
         let learning_tensor = Tensor::from_vec(trimmed_data, (pc_input_dim, 1), &candle_core::Device::Cpu)
-            .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))?;
+            .map_err(|e| {
+                error!("PC learning: Failed to create learning tensor: {}", e);
+                ProxyError::PCError(format!("Failed to create learning tensor: {}", e))
+            })?;
         
-        debug!("Learning tensor shape: {:?}", learning_tensor.shape());
+        info!("PC learning: Learning tensor shape: {:?}", learning_tensor.shape());
         
         // Clone the PC hierarchy for spawn_blocking
         let pc_hierarchy = self.pc_hierarchy.clone();
         
         // Perform heavy CPU learning in spawn_blocking
-        tokio::task::spawn_blocking(move || {
+        info!("PC learning: Starting PC hierarchy learning (spawn_blocking)...");
+        let result = tokio::task::spawn_blocking(move || {
             let mut pc = pc_hierarchy.blocking_lock();
-            debug!("PC hierarchy config dim_per_level[0]: {:?}", pc.config.dim_per_level.get(0));
-            pc.learn_legacy(&learning_tensor)
+            info!("PC learning: PC hierarchy config dim_per_level[0]: {:?}", pc.config.dim_per_level.get(0));
+            info!("PC learning: PC hierarchy n_levels: {}", pc.config.n_levels);
+            let learn_result = pc.learn_legacy(&learning_tensor);
+            match &learn_result {
+                Ok(stats) => info!("PC learning: learn_legacy succeeded with surprise: {:.6}", stats.total_surprise),
+                Err(e) => error!("PC learning: learn_legacy failed: {}", e),
+            }
+            learn_result
         }).await
-        .map_err(|join_err| ProxyError::PCError(format!("PC learning task panicked: {}", join_err)))?
-        .map_err(|e| ProxyError::PCError(format!("PC learning failed: {}", e)))?;
+        .map_err(|join_err| {
+            error!("PC learning: PC learning task panicked: {}", join_err);
+            ProxyError::PCError(format!("PC learning task panicked: {}", join_err))
+        })?
+        .map_err(|e| {
+            error!("PC learning: PC learning failed: {}", e);
+            ProxyError::PCError(format!("PC learning failed: {}", e))
+        })?;
         
-        debug!("PC learning completed successfully");
+        info!("PC learning: Learning completed successfully! Surprise: {:.6}", result.total_surprise);
         Ok(())
     }
 
