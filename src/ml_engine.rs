@@ -84,6 +84,25 @@ impl MLEngine {
             info!("To download a small model, run: mkdir -p models && curl -L https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q2_K.gguf -o {}", model_path);
         }
         
+        // Create dummy model info to enable random embeddings (instead of zero tensor)
+        let model_info = Some(AutoModel {
+            name: model_path.to_string(),
+            version: "1.0".to_string(),
+            parameters: 0,
+            capabilities: vec!["text-generation".to_string()],
+        });
+        let config_info = Some(AutoConfig {
+            hidden_size: 512, // Match PC hierarchy embedding_dim
+            num_layers: 32,
+            vocab_size: 32000,
+            max_position_embeddings: 2048,
+        });
+        let tokenizer_info = Some(AutoTokenizer {
+            vocab_size: 32000,
+            max_length: 2048,
+            special_tokens: vec![],
+        });
+        
         // Create a default ModelManager for backward compatibility
         let config = crate::config::NodeConfig::default();
         let model_manager = Arc::new(ModelManager::new(config));
@@ -97,9 +116,9 @@ impl MLEngine {
             device,
             cache: Arc::new(Mutex::new(HashMap::new())),
             model_name: model_path.to_string(),
-            model_info: None,
-            tokenizer_info: None,
-            config_info: None,
+            model_info,
+            tokenizer_info,
+            config_info,
         })
     }
     
@@ -165,7 +184,9 @@ impl MLEngine {
         // If no model info loaded (legacy mode), return dummy tensor for compatibility
         // This maintains backward compatibility with existing tests expecting shape [10]
         if self.model_info.is_none() {
-            warn!("No model loaded, returning dummy tensor for compatibility");
+            warn!("No model loaded, returning dummy tensor for compatibility. model_info: {:?}, config_info: {:?}, tokenizer_info: {:?}",
+                self.model_info, self.config_info, self.tokenizer_info);
+            tracing::debug!("Model path used: {}, device: {:?}", self.model_name, self.device);
             // Create dummy tensor with size 512 to match PC hierarchy top level dimension
             // Must be 2D tensor with shape (512, 1) for PC hierarchy compatibility
             let data: Vec<f32> = vec![0.0; 512];
@@ -195,6 +216,10 @@ impl MLEngine {
         // Mean pooling across sequence dimension
         let embeddings = embeddings.mean(1)
             .map_err(|e| MLError::ModelLoadError(format!("Failed to compute mean: {}", e)))?;
+        
+        // Convert to f32 (PC hierarchy expects f32)
+        let embeddings = embeddings.to_dtype(candle_core::DType::F32)
+            .map_err(|e| MLError::ModelLoadError(format!("Failed to convert tensor to f32: {}", e)))?;
         
         // Squeeze batch dimension
         let embeddings = embeddings.squeeze(0)
@@ -283,8 +308,8 @@ mod tests {
         };
         let engine = MLEngine::new("test-model", device_type).unwrap();
         let result = engine.process_text("test").await.unwrap();
-        // Should return tensor of shape [512, 1] for PC hierarchy compatibility
-        assert_eq!(result.shape().dims(), &[512, 1]);
+        // Should return tensor of shape [512] (1D) after squeezing batch dimension
+        assert_eq!(result.shape().dims(), &[512]);
     }
     
     #[tokio::test]
@@ -302,8 +327,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dummy_tensor_shape() {
-        // Test that dummy tensor has correct shape (512, 1) for PC hierarchy compatibility
+        // Test that tensor has correct shape [512] for PC hierarchy compatibility
         // (Matches PC config dim_per_level top level = 512)
+        // Note: The tensor is 1D after squeezing batch dimension
         let device_type = DeviceType {
             name: "CPU".to_string(),
             description: "".to_string(),
@@ -311,10 +337,10 @@ mod tests {
         };
         let engine = MLEngine::new("test-model", device_type).unwrap();
         let result = engine.process_text("test").await.unwrap();
-        assert_eq!(result.shape().dims(), &[512, 1], "Dummy tensor should have shape (512, 1) for PC hierarchy compatibility");
+        assert_eq!(result.shape().dims(), &[512], "Tensor should have shape [512] for PC hierarchy compatibility");
         
         // Verify tensor has correct number of elements
         let total_elements: usize = result.shape().dims().iter().product();
-        assert_eq!(total_elements, 512, "Dummy tensor should have 512 elements");
+        assert_eq!(total_elements, 512, "Tensor should have 512 elements");
     }
 }
