@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openai_api_key: Some("your-openai-api-key-here".to_string()), // Replace with actual key
         openai_base_url: "https://api.openai.com".to_string(),
         ollama_base_url: "http://localhost:11434".to_string(),
+        ollama_model: "tinyllama".to_string(),
         local_fallback_enabled: true,
         tool_bypass_enabled: true,
         semantic_cache_enabled: true,
@@ -172,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools: None,
         tool_calls: None,
         usage: None,
+        api_key: None,
     };
     
     println!("   Created request with function call (tool)");

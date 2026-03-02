@@ -1,0 +1,1 @@
+FROM /home/xor/neurofed/models/gguf_model.gguf

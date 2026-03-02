@@ -496,8 +496,6 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
 
         if counter % 5 == 0 {
             info!("Running inference...");
-            let input = Tensor::ones((2048,), candle_core::DType::F32, &Device::Cpu)
-                .expect("Failed to create input tensor");
             
             // Update metrics
             let mut metrics = metrics_arc.lock().await;
@@ -505,6 +503,11 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
             
             // Run inference
             let mut pc = pc_hierarchy_arc.lock().await;
+            // Get input dimension from PC hierarchy config (first level dimension)
+            let input_dim = pc.config.dim_per_level[0];
+            let input = Tensor::ones((input_dim,), candle_core::DType::F32, &Device::Cpu)
+                .expect("Failed to create input tensor");
+            
             match pc.infer(&input, 10) {
                 Ok(stats) => {
                     metrics.free_energy = stats.total_surprise;

@@ -64,6 +64,8 @@ pub struct OpenAiRequest {
     pub tools: Option<Vec<Tool>>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 /// Response structure for OpenAI API
@@ -230,6 +232,10 @@ impl OpenAiProxy {
             }))
             .route("/v1/metrics", routing::get(|State(state): State<Arc<OpenAiProxy>>| async move {
                 OpenAiProxy::handle_metrics(State(state)).await
+            }))
+            // Catch-all route for any other OpenAI API endpoints
+            .route("/{*path}", routing::any(|State(state): State<Arc<OpenAiProxy>>, req: axum::http::Request<axum::body::Body>| async move {
+                OpenAiProxy::handle_generic_endpoint(State(state), req).await
             }))
             .with_state(state);
 
@@ -518,8 +524,16 @@ impl OpenAiProxy {
         debug!("PC learning: Response data length: {}", resp_data_len);
         info!("PC learning: First 5 values of response data: {:?}", first_five_values);
         
-        // Trim to 512 dimensions (match PC hierarchy input dimension)
-        let pc_input_dim = 512;
+        // Get PC hierarchy input dimension dynamically
+        let pc_hierarchy = self.pc_hierarchy.clone();
+        let pc_input_dim = {
+            let pc = pc_hierarchy.lock().await;
+            pc.config.dim_per_level[0]
+        };
+        
+        info!("PC learning: PC hierarchy input dimension: {}", pc_input_dim);
+        
+        // Trim to PC hierarchy input dimensions
         let trimmed_data: Vec<f32> = if resp_data_len >= pc_input_dim {
             resp_data[..pc_input_dim].to_vec()
         } else {
@@ -540,9 +554,6 @@ impl OpenAiProxy {
             })?;
         
         info!("PC learning: Learning tensor shape: {:?}", learning_tensor.shape());
-        
-        // Clone the PC hierarchy for spawn_blocking
-        let pc_hierarchy = self.pc_hierarchy.clone();
         
         // Perform heavy CPU learning in spawn_blocking
         info!("PC learning: Starting PC hierarchy learning (spawn_blocking)...");
@@ -600,11 +611,15 @@ impl OpenAiProxy {
 
     /// Forward request to OpenAI API
     async fn forward_to_openai(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        let api_key = self.backend_config.openai_api_key.as_ref()
+        // Use client-provided API key if available, otherwise fall back to configured key
+        let api_key = req.api_key.as_ref()
+            .or_else(|| self.backend_config.openai_api_key.as_ref())
             .ok_or_else(|| ProxyError::ConfigError("OpenAI API key not configured".to_string()))?;
         
         let client = &self.client;
-        let url = format!("{}/v1/chat/completions", self.backend_config.openai_base_url);
+        // Strip trailing slash if the user accidentally added one, then append the endpoint
+        let base = self.backend_config.openai_base_url.trim_end_matches('/');
+        let url = format!("{}/chat/completions", base);
         
         let response = client.post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -761,10 +776,10 @@ impl OpenAiProxy {
             }));
         }
         
-        // Map model names: if model is "neurofed" or unknown, use "tinyllama" as default (smaller, more likely installed)
+        // Map model names: if model is "neurofed" or unknown, use configurable model
         let ollama_model = match req.model.as_str() {
-            "neurofed" => "tinyllama",
-            "gpt-3.5-turbo" | "gpt-4" => "tinyllama",  // Map OpenAI models to local equivalents
+            "neurofed" => self.backend_config.ollama_model.as_str(),
+            "gpt-3.5-turbo" | "gpt-4" => self.backend_config.ollama_model.as_str(),  // Map OpenAI models to local equivalents
             other => other,
         };
         
@@ -957,6 +972,111 @@ impl OpenAiProxy {
         Ok(Json(response))
     }
 
+    /// Handle generic endpoint requests (catch-all for unhandled OpenAI API endpoints)
+    pub async fn handle_generic_endpoint(
+        State(proxy): State<Arc<OpenAiProxy>>,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> Result<axum::response::Response, StatusCode> {
+        use axum::body::Body;
+        use axum::response::Response;
+        
+        let start_time = Instant::now();
+        
+        // Update metrics
+        proxy.metrics.lock().await.total_requests += 1;
+        proxy.metrics.lock().await.last_updated = SystemTime::now();
+        
+        // Extract path and method
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
+        
+        debug!("Generic endpoint request: {} {}", method, path);
+        
+        // Forward the request to OpenAI API
+        let client = &proxy.client;
+        let path = req.uri().path().to_string();
+        let base = proxy.backend_config.openai_base_url.trim_end_matches('/');
+        
+        // If base ends with /v1 and path starts with /v1, don't duplicate it
+        let url = if base.ends_with("/v1") && path.starts_with("/v1/") {
+            // Strip the "/v1" from the incoming path
+            let clean_path = path.strip_prefix("/v1").unwrap();
+            format!("{}{}", base, clean_path)
+        } else {
+            format!("{}{}", base, path)
+        };
+        
+        debug!("Forwarding generic endpoint to: {}", url);
+        
+        // Extract API key from request headers or use configured key
+        let api_key = req.headers()
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|auth| auth.strip_prefix("Bearer "))
+            .map(|key| key.to_string())
+            .or_else(|| proxy.backend_config.openai_api_key.clone())
+            .ok_or_else(|| {
+                error!("No API key available for generic endpoint request");
+                StatusCode::UNAUTHORIZED
+            })?;
+        
+        // Rebuild the request for forwarding
+        let (parts, body) = req.into_parts();
+        
+        // Convert body to bytes
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await
+            .map_err(|e| {
+                error!("Failed to read request body: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+        
+        // Forward the request
+        let response = client.request(method, &url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", parts.headers.get("Content-Type").cloned().unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json")))
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to forward request to OpenAI: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+        
+        // Convert response
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.map_err(|e| {
+            error!("Failed to read response body: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        
+        // Build response
+        let mut response_builder = Response::builder()
+            .status(status)
+            .header("Content-Type", headers.get("Content-Type").cloned().unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json")));
+        
+        // Copy other headers
+        for (key, value) in headers.iter() {
+            if key != "content-type" && key != "content-length" {
+                response_builder = response_builder.header(key, value);
+            }
+        }
+        
+        let response = response_builder.body(Body::from(body))
+            .map_err(|e| {
+                error!("Failed to build response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        
+        // Update metrics
+        let elapsed = start_time.elapsed();
+        let mut metrics = proxy.metrics.lock().await;
+        metrics.average_response_time_ms = (metrics.average_response_time_ms * (metrics.total_requests as f64 - 1.0) + elapsed.as_millis() as f64) / metrics.total_requests as f64;
+        metrics.last_updated = SystemTime::now();
+        
+        Ok(response)
+    }
+
     /// Get current metrics
     pub async fn get_metrics(&self) -> ProxyMetrics {
         self.metrics.lock().await.clone()
@@ -997,6 +1117,7 @@ mod tests {
             openai_api_key: Some("test-key".to_string()),
             openai_base_url: "https://api.openai.com".to_string(),
             ollama_base_url: "http://localhost:11434".to_string(),
+            ollama_model: "tinyllama".to_string(),
             local_fallback_enabled: true,
             tool_bypass_enabled: true,
             semantic_cache_enabled: true,
@@ -1043,6 +1164,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         assert!(proxy.has_tool_calls(&req_with_tools));
@@ -1064,6 +1186,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         assert!(!proxy.has_tool_calls(&req_without_tools));
@@ -1110,6 +1233,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let hash = proxy.hash_request(&req);
@@ -1161,6 +1285,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let text = proxy.request_to_text(&req);
@@ -1195,6 +1320,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format = proxy.convert_to_ollama_format(&neurofed_req);
@@ -1222,6 +1348,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format2 = proxy.convert_to_ollama_format(&gpt_req);
@@ -1249,6 +1376,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format3 = proxy.convert_to_ollama_format(&other_req);
@@ -1281,6 +1409,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format = proxy.convert_to_ollama_format(&req_with_stream);
@@ -1309,6 +1438,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format2 = proxy.convert_to_ollama_format(&req_without_stream);
@@ -1336,6 +1466,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let ollama_format3 = proxy.convert_to_ollama_format(&req_stream_none);
@@ -1368,6 +1499,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
 
         // Test 1: Standard Ollama format with message.content
@@ -1454,6 +1586,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
 
         // The actual tensor processing happens in generate_embedding which requires
@@ -1581,6 +1714,7 @@ mod tests {
             tools: None,
             tool_calls: None,
             usage: None,
+            api_key: None,
         };
         
         let result = proxy.convert_from_ollama_format(&ollama_resp, &original_req);

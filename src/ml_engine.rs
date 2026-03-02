@@ -187,10 +187,13 @@ impl MLEngine {
             warn!("No model loaded, returning dummy tensor for compatibility. model_info: {:?}, config_info: {:?}, tokenizer_info: {:?}",
                 self.model_info, self.config_info, self.tokenizer_info);
             tracing::debug!("Model path used: {}, device: {:?}", self.model_name, self.device);
-            // Create dummy tensor with size 512 to match PC hierarchy top level dimension
-            // Must be 2D tensor with shape (512, 1) for PC hierarchy compatibility
-            let data: Vec<f32> = vec![0.0; 512];
-            return Ok(Tensor::from_slice(&data, (512, 1), &self.device)
+            // Create dummy tensor with config dimension to match PC hierarchy top level dimension
+            // Must be 2D tensor with shape (hidden_size, 1) for PC hierarchy compatibility
+            let hidden_size = self.config_info.as_ref()
+                .map(|c| c.hidden_size)
+                .unwrap_or(512); // Default to 512 for backward compatibility
+            let data: Vec<f32> = vec![0.0; hidden_size];
+            return Ok(Tensor::from_slice(&data, (hidden_size, 1), &self.device)
                 .map_err(|e| MLError::ModelLoadError(format!("Failed to create dummy tensor: {}", e)))?);
         }
         
