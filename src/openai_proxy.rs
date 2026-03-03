@@ -621,13 +621,18 @@ impl OpenAiProxy {
         let base = self.backend_config.openai_base_url.trim_end_matches('/');
         let url = format!("{}/chat/completions", base);
         
-        let response = client.post(&url)
+        let response = match client.post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(req)
             .send()
-            .await
-            .map_err(|e| ProxyError::BackendError(format!("OpenAI request failed: {}", e)))?;
+            .await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("FATAL: OpenAI direct request failed: {}. URL: {}", e, url);
+                    return Err(ProxyError::BackendError(format!("OpenAI request failed: {}", e)));
+                }
+            };
         
         if !response.status().is_success() {
             let status = response.status();
@@ -997,13 +1002,24 @@ impl OpenAiProxy {
         let path = req.uri().path().to_string();
         let base = proxy.backend_config.openai_base_url.trim_end_matches('/');
         
+        // Log configuration details
+        debug!("Generic endpoint configuration - Base URL: {}, Path: {}, Method: {}",
+               base, path, method);
+        debug!("Backend config - OpenAI Base URL: {}, OpenAI API Key present: {}",
+               proxy.backend_config.openai_base_url,
+               proxy.backend_config.openai_api_key.is_some());
+        
         // If base ends with /v1 and path starts with /v1, don't duplicate it
         let url = if base.ends_with("/v1") && path.starts_with("/v1/") {
             // Strip the "/v1" from the incoming path
             let clean_path = path.strip_prefix("/v1").unwrap();
-            format!("{}{}", base, clean_path)
+            let final_url = format!("{}{}", base, clean_path);
+            debug!("URL construction (duplicate v1 removed): {} + {} = {}", base, clean_path, final_url);
+            final_url
         } else {
-            format!("{}{}", base, path)
+            let final_url = format!("{}{}", base, path);
+            debug!("URL construction (standard): {} + {} = {}", base, path, final_url);
+            final_url
         };
         
         debug!("Forwarding generic endpoint to: {}", url);
@@ -1031,16 +1047,22 @@ impl OpenAiProxy {
             })?;
         
         // Forward the request
-        let response = client.request(method, &url)
+        let response = match client.request(method.clone(), &url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", parts.headers.get("Content-Type").cloned().unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json")))
             .body(body_bytes)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to forward request to OpenAI: {}", e);
-                StatusCode::BAD_GATEWAY
-            })?;
+            .await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("FATAL: Failed to forward request to OpenAI: {}. URL: {}, Method: {}", e, url, method);
+                    if e.is_builder() { error!("Error is from builder"); }
+                    if e.is_request() { error!("Error is from request"); }
+                    if e.is_connect() { error!("Error is from connection"); }
+                    if e.is_timeout() { error!("Error is from timeout"); }
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+            };
         
         // Convert response
         let status = response.status();

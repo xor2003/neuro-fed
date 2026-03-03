@@ -274,7 +274,10 @@ impl NodeConfig {
         }
         
         // Use config crate which supports multiple formats (TOML, JSON, YAML, etc.)
+        // Create a default configuration and merge with file
+        let default_config = Self::default();
         let config_builder = config::Config::builder()
+            .add_source(config::Config::try_from(&default_config)?)
             .add_source(config::File::from(path))
             .build()?;
         

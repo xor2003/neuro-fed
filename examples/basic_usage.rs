@@ -399,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Connect to default network
     match privacy_manager.connect().await {
-        Ok(_) => println!("   Connected to privacy network: {:?}", privacy_manager.current_network()),
+        Ok(_) => println!("   Connected to privacy network: {:?}", privacy_manager.current_network),
         Err(e) => println!("   Connection failed: {}", e),
     }
     

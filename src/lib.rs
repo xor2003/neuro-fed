@@ -20,9 +20,6 @@ pub mod types;
 pub mod payment_verifier;
 pub mod pow_verifier;
 pub mod privacy_networks;
-pub mod yggdrasil_client;
-pub mod tor_client;
-pub mod i2p_client;
 
 pub use bootstrap::Bootstrap;
 pub use config::BootstrapConfig;

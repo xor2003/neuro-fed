@@ -468,7 +468,7 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
             Ok(_) => {
                 info!("Privacy network manager initialized successfully");
                 match privacy_manager.connect().await {
-                    Ok(_) => info!("Connected to privacy network: {:?}", privacy_manager.current_network()),
+                    Ok(_) => info!("Connected to privacy network: {:?}", privacy_manager.current_network),
                     Err(e) => warn!("Failed to connect to privacy network: {}", e),
                 }
             }
