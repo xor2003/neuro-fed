@@ -150,14 +150,13 @@ pub struct FunctionCall {
 pub struct Tool {
     pub name: String,
     pub description: String,
-    pub function: String,
+    pub function: FunctionCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub function: String,
-    pub arguments: HashMap<String, String>,
+    pub function: FunctionCall,
     pub timestamp: SystemTime,
 }
 

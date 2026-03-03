@@ -121,8 +121,6 @@ fn spawn_metrics_dashboard(
 
 /// Start the OpenAI proxy server (daemon mode)
 async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
-    setup_logging();
-    
     info!("Starting NeuroFed daemon on {}:{}", host, port);
     
     // Create components for OpenAI proxy
@@ -363,8 +361,6 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
 
 /// Run full NeuroFed node (original behavior)
 async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn Error>> {
-    setup_logging();
-
     // Brain sharing integration
     let config = NodeConfig::load_or_default();
     
@@ -520,13 +516,18 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
 }
 
 fn setup_logging() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .init();
+    // Use try_init instead of init to avoid panic if already initialized
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .try_init();
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    setup_logging();
     let cli = Cli::parse();
 
     match cli.command {

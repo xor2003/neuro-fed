@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
+use std::error::Error as StdError;
 use chrono::Utc;
 
 use axum::{routing, Router, Json, http::StatusCode};
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use tracing::{info, error, debug, warn};
 use candle_core::Tensor;
+use url::Url;
 
 use crate::ml_engine::MLEngine;
 use crate::config::{NodeConfig, BackendConfig};
@@ -178,6 +180,33 @@ pub struct OpenAiProxy {
     stats: Arc<tokio::sync::Mutex<ProxyStats>>,
 }
 
+/// Helper function to extract all string values from ANY JSON object
+/// Recursively concatenates all string values, skipping certain keys like image_url or base64.
+fn extract_all_text(value: &serde_json::Value) -> String {
+    let mut text = String::new();
+    match value {
+        serde_json::Value::String(s) => {
+            text.push_str(s);
+            text.push_str("\n");
+        },
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                text.push_str(&extract_all_text(item));
+            }
+        },
+        serde_json::Value::Object(obj) => {
+            for (key, val) in obj {
+                // Skip base64 image data or irrelevant meta-keys
+                if key != "image_url" && key != "base64" {
+                    text.push_str(&extract_all_text(val));
+                }
+            }
+        },
+        _ => {} // Ignore numbers, booleans, nulls
+    }
+    text
+}
+
 impl OpenAiProxy {
     /// Create a new OpenAI proxy with enhanced features
     pub fn new(
@@ -199,7 +228,15 @@ impl OpenAiProxy {
             backend_config,
             local_engine,
             pc_hierarchy,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(60))
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent("NeuroFed-Node/1.0")
+                .build()
+                .unwrap_or_else(|e| {
+                    error!("Failed to build HTTP client: {}. Using default client.", e);
+                    Client::new()
+                }),
             semantic_cache: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(ProxyMetrics::default())),
             stats: Arc::new(Mutex::new(ProxyStats {
@@ -594,10 +631,11 @@ impl OpenAiProxy {
     /// Forward request to appropriate backend (OpenAI, Ollama, or local fallback)
     async fn forward_to_backend(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
         // Determine which backend to use based on configuration and request
-        let use_openai = self.backend_config.openai_api_key.is_some();
-        let use_ollama = !use_openai || req.model.contains("ollama") || req.model.contains("local");
+        // Check if we have an API key (either configured or provided in request)
+        let has_api_key = self.backend_config.openai_api_key.is_some() || req.api_key.is_some();
+        let use_ollama = !has_api_key || req.model.contains("ollama") || req.model.contains("local");
         
-        if use_openai && !use_ollama {
+        if has_api_key && !use_ollama {
             self.metrics.lock().await.openai_backend_calls += 1;
             self.forward_to_openai(req).await
         } else if self.backend_config.local_fallback_enabled {
@@ -616,20 +654,87 @@ impl OpenAiProxy {
             .or_else(|| self.backend_config.openai_api_key.as_ref())
             .ok_or_else(|| ProxyError::ConfigError("OpenAI API key not configured".to_string()))?;
         
+        // Log API key source
+        let key_source = if req.api_key.is_some() {
+            "client-provided"
+        } else {
+            "configured"
+        };
+        debug!("Using {} API key for OpenAI request (model: {})", key_source, req.model);
+        
         let client = &self.client;
         // Strip trailing slash if the user accidentally added one, then append the endpoint
         let base = self.backend_config.openai_base_url.trim_end_matches('/');
         let url = format!("{}/chat/completions", base);
         
+        debug!("Forwarding chat completion to OpenAI: {} (model: {})", url, req.model);
+        
+        // Extract host from URL for Host header
+        let host_header = match Url::parse(&url) {
+            Ok(parsed_url) => {
+                let host = parsed_url.host_str().unwrap_or("openrouter.ai");
+                let port = parsed_url.port_or_known_default();
+                match port {
+                    Some(port) if port != 443 && port != 80 => format!("{}:{}", host, port),
+                    _ => host.to_string()
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse URL {}: {}", url, e);
+                "openrouter.ai".to_string()
+            }
+        };
+        
+        debug!("Setting Host header to: {}", host_header);
+        
+        // Log outgoing headers for debugging
+        debug!("Forwarding to OpenAI with headers:");
+        debug!("  Host: {}", host_header);
+        debug!("  Authorization: Bearer {}", api_key);
+        debug!("  Content-Type: application/json");
+        debug!("  User-Agent: NeuroFed-Node/1.0");
+        debug!("  Accept-Encoding: gzip, deflate, br");
+        
+        // Log request payload for debugging
+        if let Ok(req_json) = serde_json::to_string_pretty(req) {
+            let truncated_req = if req_json.len() > 500 { &req_json[..500] } else { &req_json };
+            debug!("OpenAI request payload (truncated):\n{}...", truncated_req);
+        }
+        
+        // Log full request for debugging
+        if let Ok(req_json) = serde_json::to_string(req) {
+            debug!("Full OpenAI request payload ({} bytes):\n{}", req_json.len(), req_json);
+        }
+        
         let response = match client.post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
+            .header("User-Agent", "NeuroFed-Node/1.0")
+            .header("Host", host_header.clone())
+            .header("Accept-Encoding", "gzip, deflate, br")
             .json(req)
             .send()
             .await {
-                Ok(resp) => resp,
+                Ok(resp) => {
+                    debug!("Received response from OpenAI: {} for {}", resp.status(), url);
+                    resp
+                },
                 Err(e) => {
-                    error!("FATAL: OpenAI direct request failed: {}. URL: {}", e, url);
+                    error!("FATAL: OpenAI direct request failed: {}", e);
+                    error!("URL: {}", url);
+                    error!("Error is_connect: {}, is_timeout: {}, is_request: {}",
+                           e.is_connect(), e.is_timeout(), e.is_request());
+                    
+                    // Check for specific TLS/SSL issues
+                    if e.is_connect() {
+                        error!("Connection failed. Possible causes:");
+                        error!("  - DNS resolution failure for {}", url);
+                        error!("  - Network connectivity issues");
+                        error!("  - Firewall blocking connection");
+                        error!("  - TLS/SSL certificate problems");
+                        error!("  - Proxy configuration issues");
+                    }
+                    
                     return Err(ProxyError::BackendError(format!("OpenAI request failed: {}", e)));
                 }
             };
@@ -637,12 +742,24 @@ impl OpenAiProxy {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            error!("OpenAI API returned error status: {}. Body: {}", status, body);
             return Err(ProxyError::BackendError(format!("OpenAI API error {}: {}", status, body)));
         }
         
-        let mut response_json: OpenAiResponse = response.json()
-            .await
-            .map_err(|e| ProxyError::SerializationError(format!("Failed to parse OpenAI response: {}", e)))?;
+        let response_text = response.text().await.map_err(|e| {
+            error!("Failed to read OpenAI response text: {}", e);
+            ProxyError::BackendError(format!("Failed to read response: {}", e))
+        })?;
+        
+        // Log response payload for debugging
+        let truncated_resp = if response_text.len() > 500 { &response_text[..500] } else { &response_text };
+        debug!("OpenAI response payload (truncated):\n{}...", truncated_resp);
+        
+        let mut response_json: OpenAiResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                error!("Failed to parse OpenAI response JSON: {}", e);
+                ProxyError::SerializationError(format!("Failed to parse OpenAI response: {}", e))
+            })?;
         
         // Add source metadata
         response_json.neurofed_source = Some("remote".to_string());
@@ -674,7 +791,13 @@ impl OpenAiProxy {
             .json(&ollama_req)
             .send()
             .await
-            .map_err(|e| ProxyError::BackendError(format!("Ollama request failed for model '{}': {}", model_name, e)))?;
+            .map_err(|e| {
+                error!("Ollama request failed: {}. URL: {}", e, url);
+                if e.is_connect() {
+                    error!("Connection error to Ollama. Is Ollama running at {}?", url);
+                }
+                ProxyError::BackendError(format!("Ollama request failed for model '{}': {}", model_name, e))
+            })?;
         
         if !response.status().is_success() {
             let status = response.status();
@@ -1036,6 +1159,14 @@ impl OpenAiProxy {
                 StatusCode::UNAUTHORIZED
             })?;
         
+        // Log API key source
+        let key_source = if req.headers().get("Authorization").is_some() {
+            "client-provided"
+        } else {
+            "configured"
+        };
+        debug!("Using {} API key for generic endpoint {} {}", key_source, method, path);
+        
         // Rebuild the request for forwarding
         let (parts, body) = req.into_parts();
         
@@ -1046,23 +1177,127 @@ impl OpenAiProxy {
                 StatusCode::BAD_REQUEST
             })?;
         
-        // Forward the request
-        let response = match client.request(method.clone(), &url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", parts.headers.get("Content-Type").cloned().unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json")))
-            .body(body_bytes)
-            .send()
-            .await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("FATAL: Failed to forward request to OpenAI: {}. URL: {}, Method: {}", e, url, method);
-                    if e.is_builder() { error!("Error is from builder"); }
-                    if e.is_request() { error!("Error is from request"); }
-                    if e.is_connect() { error!("Error is from connection"); }
-                    if e.is_timeout() { error!("Error is from timeout"); }
-                    return Err(StatusCode::BAD_GATEWAY);
+        // Clone for learning before moving into request
+        let body_bytes_clone = body_bytes.clone();
+        
+        // Log request body for debugging
+        let request_body_str = String::from_utf8_lossy(&body_bytes_clone);
+        let truncated_req = if request_body_str.len() > 500 { &request_body_str[..500] } else { &request_body_str };
+        debug!("Generic endpoint request body (truncated):\n{}...", truncated_req);
+        
+        // Extract host from URL for Host header
+        let host_header = match Url::parse(&url) {
+            Ok(parsed_url) => {
+                let host = parsed_url.host_str().unwrap_or("openrouter.ai");
+                let port = parsed_url.port_or_known_default();
+                match port {
+                    Some(port) if port != 443 && port != 80 => format!("{}:{}", host, port),
+                    _ => host.to_string()
                 }
-            };
+            }
+            Err(e) => {
+                error!("Failed to parse URL {}: {}", url, e);
+                "openrouter.ai".to_string()
+            }
+        };
+        
+        debug!("Setting Host header to: {}", host_header);
+        
+        // Forward the request - copy all headers from original request
+        let mut request_builder = client.request(method.clone(), &url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Host", host_header.clone())
+            .header("Accept-Encoding", "gzip, deflate, br");
+        
+        // Copy all headers from original request except hop-by-hop headers
+        for (header_name, header_value) in &parts.headers {
+            let header_name_str = header_name.as_str();
+            // Skip Authorization header as we already set it with Bearer prefix
+            if header_name_str.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            // Skip Content-Length as reqwest will set it automatically
+            if header_name_str.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            // Skip Host header - we set it explicitly from the URL
+            if header_name_str.eq_ignore_ascii_case("host") {
+                continue;
+            }
+            // Skip other hop-by-hop headers that shouldn't be forwarded
+            if header_name_str.eq_ignore_ascii_case("connection") ||
+               header_name_str.eq_ignore_ascii_case("keep-alive") ||
+               header_name_str.eq_ignore_ascii_case("proxy-authenticate") ||
+               header_name_str.eq_ignore_ascii_case("proxy-authorization") ||
+               header_name_str.eq_ignore_ascii_case("te") ||
+               header_name_str.eq_ignore_ascii_case("trailer") ||
+               header_name_str.eq_ignore_ascii_case("transfer-encoding") ||
+               header_name_str.eq_ignore_ascii_case("upgrade") {
+                continue;
+            }
+            request_builder = request_builder.header(header_name, header_value);
+        }
+        
+        // Ensure Content-Type is set if not present
+        if !parts.headers.contains_key("Content-Type") {
+            request_builder = request_builder.header("Content-Type", "application/json");
+        }
+        
+        // Log all headers for debugging (show what we're actually sending)
+        debug!("Forwarding request to {} with headers:", url);
+        debug!("  Host: {}", host_header);
+        debug!("  Authorization: Bearer {}", api_key);
+        debug!("  User-Agent: NeuroFed-Node/1.0");
+        debug!("  Accept-Encoding: gzip, deflate, br");
+        for (header_name, header_value) in &parts.headers {
+            let header_name_str = header_name.as_str();
+            // Skip headers we're overriding or not forwarding
+            if header_name_str.eq_ignore_ascii_case("host") ||
+               header_name_str.eq_ignore_ascii_case("authorization") ||
+               header_name_str.eq_ignore_ascii_case("user-agent") ||
+               header_name_str.eq_ignore_ascii_case("accept-encoding") ||
+               header_name_str.eq_ignore_ascii_case("connection") ||
+               header_name_str.eq_ignore_ascii_case("keep-alive") ||
+               header_name_str.eq_ignore_ascii_case("proxy-authenticate") ||
+               header_name_str.eq_ignore_ascii_case("proxy-authorization") ||
+               header_name_str.eq_ignore_ascii_case("te") ||
+               header_name_str.eq_ignore_ascii_case("trailer") ||
+               header_name_str.eq_ignore_ascii_case("transfer-encoding") ||
+               header_name_str.eq_ignore_ascii_case("upgrade") {
+                continue;
+            }
+            if let Ok(value_str) = header_value.to_str() {
+                debug!("  {}: {}", header_name, value_str);
+            }
+        }
+        
+        // Log full request body for debugging
+        debug!("Full request body ({} bytes):\n{}", body_bytes.len(), request_body_str);
+        
+        let response = match request_builder.body(body_bytes).send().await {
+            Ok(resp) => {
+                debug!("Generic interceptor: Received response {} for {} {}", resp.status(), method, url);
+                resp
+            },
+            Err(e) => {
+                error!("FATAL: Failed to forward request to OpenAI: {}", e);
+                error!("URL: {}, Method: {}", url, method);
+                error!("Error is_connect: {}, is_timeout: {}, is_request: {}",
+                       e.is_connect(), e.is_timeout(), e.is_request());
+                
+                // Check for specific TLS/SSL issues
+                if e.is_connect() {
+                    error!("Connection failed. Possible causes:");
+                    error!("  - DNS resolution failure for {}", url);
+                    error!("  - Network connectivity issues");
+                    error!("  - Firewall blocking connection");
+                    error!("  - TLS/SSL certificate problems");
+                    error!("  - Proxy configuration issues");
+                }
+                
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        };
         
         // Convert response
         let status = response.status();
@@ -1071,6 +1306,89 @@ impl OpenAiProxy {
             error!("Failed to read response body: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        
+        // Log response body for debugging
+        let response_body_str = String::from_utf8_lossy(&body);
+        let truncated_resp = if response_body_str.len() > 500 { &response_body_str[..500] } else { &response_body_str };
+        debug!("Generic endpoint response body (truncated):\n{}...", truncated_resp);
+        
+        // If PC learning is enabled, spawn a background task to learn from this generic endpoint
+        if proxy.backend_config.pc_learning_enabled {
+            let proxy_clone = proxy.clone();
+            let req_bytes_clone = body_bytes_clone.clone();
+            let resp_bytes_clone = body.clone();
+            let path_clone = path.clone();
+            
+            tokio::spawn(async move {
+                // Try to parse both as generic JSON
+                if let (Ok(req_json), Ok(resp_json)) = (
+                    serde_json::from_slice::<serde_json::Value>(&req_bytes_clone),
+                    serde_json::from_slice::<serde_json::Value>(&resp_bytes_clone)
+                ) {
+                    // Extract text heuristically
+                    let req_text = extract_all_text(&req_json);
+                    let resp_text = extract_all_text(&resp_json);
+                    
+                    // Only learn if there is substantial text (ignore tiny status pings)
+                    if req_text.len() > 20 && resp_text.len() > 10 {
+                        info!("Generic Interceptor: Learning from endpoint {}", path_clone);
+                        
+                        // Generate embeddings
+                        let engine = proxy_clone.local_engine.lock().await;
+                        if let (Ok(req_tensor), Ok(resp_tensor)) = (
+                            engine.process_text(&req_text).await,
+                            engine.process_text(&resp_text).await
+                        ) {
+                            // Flatten tensors and trim to PC input dimension
+                            let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
+                            let pc_input_dim = {
+                                let pc = pc_hierarchy.lock().await;
+                                pc.config.dim_per_level[0]
+                            };
+                            
+                            let flatten_and_trim = |tensor: Tensor| -> Result<Tensor, ProxyError> {
+                                let flat = if tensor.rank() > 1 {
+                                    tensor.flatten_all().map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten tensor: {}", e)))?
+                                } else {
+                                    tensor
+                                };
+                                let data = flat.to_vec1::<f32>().map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert tensor: {}", e)))?;
+                                let trimmed: Vec<f32> = if data.len() >= pc_input_dim {
+                                    data[..pc_input_dim].to_vec()
+                                } else {
+                                    let mut padded = data;
+                                    padded.resize(pc_input_dim, 0.0);
+                                    padded
+                                };
+                                Tensor::from_vec(trimmed, (pc_input_dim, 1), &candle_core::Device::Cpu)
+                                    .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))
+                            };
+                            
+                            match (flatten_and_trim(req_tensor), flatten_and_trim(resp_tensor)) {
+                                (Ok(req_learning), Ok(resp_learning)) => {
+                                    // Perform PC learning (use learn_legacy with response as target)
+                                    let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let mut pc = pc_hierarchy.blocking_lock();
+                                        let _ = pc.learn_legacy(&resp_learning);
+                                    }).await;
+                                    info!("Generic Interceptor: PC learning completed for endpoint {}", path_clone);
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    warn!("Generic Interceptor: Failed to prepare tensors for learning: {}", e);
+                                }
+                            }
+                        } else {
+                            debug!("Generic Interceptor: Failed to generate embeddings for endpoint {}", path_clone);
+                        }
+                    } else {
+                        debug!("Generic Interceptor: Insufficient text for learning (req: {} chars, resp: {} chars)", req_text.len(), resp_text.len());
+                    }
+                } else {
+                    debug!("Generic Interceptor: Request or response is not valid JSON, skipping learning");
+                }
+            });
+        }
         
         // Build response
         let mut response_builder = Response::builder()
