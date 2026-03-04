@@ -268,22 +268,15 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
     let client = reqwest::Client::new();
     let chat_url = format!("{}/v1/chat/completions", url);
     
-    // Simple chat loop
-    let mut rl = match rustyline::DefaultEditor::new() {
-        Ok(editor) => editor,
-        Err(_) => {
-            eprintln!("Warning: Could not initialize readline, using simple input mode");
-            // Create a simple editor without history
-            rustyline::Editor::<(), rustyline::history::FileHistory>::new().unwrap()
-        }
-    };
+    // Async readline for non-blocking input
+    let (mut rl, _writer) = rustyline_async::Readline::new("> ".to_string())
+        .map_err(|e| format!("Failed to initialize async readline: {}", e))?;
     
     let mut message_history: Vec<serde_json::Value> = Vec::new();
     
     loop {
-        let readline = rl.readline("> ");
-        match readline {
-            Ok(line) => {
+        match rl.readline().await {
+            Ok(rustyline_async::ReadlineEvent::Line(line)) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -414,12 +407,12 @@ async fn start_chat(url: String) -> Result<(), Box<dyn Error>> {
                     println!("📊 Response time: {:.2}s", elapsed.as_secs_f32());
                 }
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                println!("Interrupted (Ctrl+C)");
+            Ok(rustyline_async::ReadlineEvent::Eof) => {
+                println!("EOF (Ctrl+D)");
                 break;
             }
-            Err(rustyline::error::ReadlineError::Eof) => {
-                println!("EOF (Ctrl+D)");
+            Ok(rustyline_async::ReadlineEvent::Interrupted) => {
+                println!("Interrupted (Ctrl+C)");
                 break;
             }
             Err(err) => {
