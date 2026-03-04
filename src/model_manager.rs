@@ -432,6 +432,19 @@ impl ModelManager {
     fn get_default_models() -> HashMap<String, ModelInfo> {
         let mut models = HashMap::new();
 
+        // TinyLlama 1.1B Chat (GGUF, Q2_K)
+        models.insert("tinyllama-1.1b-chat".to_string(), ModelInfo {
+            name: "tinyllama-1.1b-chat".to_string(),
+            version: "1.0".to_string(),
+            size_mb: 550, // Approximate size for Q2_K
+            min_memory_mb: 1024,
+            max_memory_mb: 2048,
+            quantization: "Q2_K".to_string(),
+            download_url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
+            local_path: "models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
+        });
+
+        /*
         // Llama 3 8B Instruct (GGUF, Q4_K_M)
         models.insert("llama-3-8b-instruct".to_string(), ModelInfo {
             name: "llama-3-8b-instruct".to_string(),
@@ -455,6 +468,7 @@ impl ModelManager {
             download_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
             local_path: "models/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
         });
+        */
 
         // Add more models as needed
         models
@@ -483,9 +497,8 @@ mod tests {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
         
-        assert_eq!(manager.models.len(), 2);
-        assert!(manager.models.contains_key("llama-3-8b-instruct"));
-        assert!(manager.models.contains_key("qwen2.5-1.5b-instruct"));
+        assert_eq!(manager.models.len(), 1);
+        assert!(manager.models.contains_key("tinyllama-1.1b-chat"));
     }
 
     #[tokio::test]
@@ -507,7 +520,7 @@ mod tests {
         assert!(recommended.is_ok());
         let model = recommended.unwrap();
         
-        assert!(model.name == "qwen2.5-1.5b-instruct" || model.name == "llama-3-8b-instruct");
+        assert!(model.name == "qwen2.5-1.5b-instruct" || model.name == "tinyllama-1.1b-chat");
     }
 
     #[tokio::test]
