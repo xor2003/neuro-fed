@@ -197,44 +197,68 @@ impl MLEngine {
                 .map_err(|e| MLError::ModelLoadError(format!("Failed to create dummy tensor: {}", e)))?);
         }
         
-        // Simple tokenization (placeholder)
-        let tokens: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+        // 1. Tokenization placeholder - using simple byte-to-int conversion for now
+        // In production, replace with HuggingFace tokenizers crate
+        let tokens: Vec<u32> = text.bytes().take(512).map(|b| b as u32).collect();
+        
         if tokens.is_empty() {
             return Err(MLError::InvalidResponse("Empty tokenization".to_string()));
         }
         
-        // Convert to tensor
-        let _input_tensor = Tensor::from_slice(&tokens, (1, tokens.len()), &self.device)
-            .map_err(|e| MLError::ModelLoadError(format!("Failed to create input tensor: {}", e)))?;
-        
-        // Simulate model inference by creating random embeddings
-        // In a real implementation, this would run the actual model
+        // 2. CHUNKING: Prevent OOM on massive prompts
+        let max_len = 512; // Match your PC layer 0
         let hidden_size = self.config_info.as_ref()
             .map(|c| c.hidden_size)
             .unwrap_or(768);
         
-        let embeddings = Tensor::randn(0.0, 1.0, (1, tokens.len(), hidden_size), &self.device)
-            .map_err(|e| MLError::ModelLoadError(format!("Failed to create random tensor: {}", e)))?;
+        // Log that we're using placeholder tokenization
+        tracing::debug!("Using placeholder tokenization ({} tokens). Install tokenizers crate for proper tokenization.", tokens.len());
         
-        // Mean pooling across sequence dimension
-        let embeddings = embeddings.mean(1)
-            .map_err(|e| MLError::ModelLoadError(format!("Failed to compute mean: {}", e)))?;
+        let mut all_embeddings = Vec::new();
+        
+        for chunk in tokens.chunks(max_len) {
+            // Convert chunk to tensor
+            let input_tensor = Tensor::from_slice(chunk, (1, chunk.len()), &self.device)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to create input tensor: {}", e)))?;
+            
+            // Simulate model inference by creating random embeddings
+            // In a real implementation, this would run the actual model
+            let chunk_embeddings = Tensor::randn(0.0, 1.0, (1, chunk.len(), hidden_size), &self.device)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to create random tensor: {}", e)))?;
+            
+            // Mean pooling across sequence dimension
+            let pooled = chunk_embeddings.mean(1)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to compute mean: {}", e)))?;
+            
+            // Squeeze batch dimension
+            let pooled = pooled.squeeze(0)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to squeeze tensor: {}", e)))?;
+            
+            all_embeddings.push(pooled);
+        }
+        
+        // 3. Average all chunks together to get the final semantic vector
+        let final_embedding = if all_embeddings.len() == 1 {
+            all_embeddings[0].clone()
+        } else {
+            // Stack and average
+            let stacked = Tensor::stack(&all_embeddings, 0)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to stack tensors: {}", e)))?;
+            stacked.mean(0)
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to compute mean across chunks: {}", e)))?
+        };
         
         // Convert to f32 (PC hierarchy expects f32)
-        let embeddings = embeddings.to_dtype(candle_core::DType::F32)
+        let final_embedding = final_embedding.to_dtype(candle_core::DType::F32)
             .map_err(|e| MLError::ModelLoadError(format!("Failed to convert tensor to f32: {}", e)))?;
-        
-        // Squeeze batch dimension
-        let embeddings = embeddings.squeeze(0)
-            .map_err(|e| MLError::ModelLoadError(format!("Failed to squeeze tensor: {}", e)))?;
         
         // Cache result
         {
             let mut cache = self.cache.lock().unwrap();
-            cache.insert(cache_key, embeddings.clone());
+            cache.insert(cache_key, final_embedding.clone());
         }
         
-        Ok(embeddings)
+        Ok(final_embedding)
     }
     
     /// Get model information

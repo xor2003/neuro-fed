@@ -354,6 +354,7 @@ pub enum MLError {
     SerializationError(String),
     InvalidResponse(String),
     ConfigurationError(String),
+    TokenizationError(String),
 }
 
 impl std::fmt::Display for MLError {
@@ -364,6 +365,7 @@ impl std::fmt::Display for MLError {
             MLError::SerializationError(msg) => write!(f, "SerializationError: {}", msg),
             MLError::InvalidResponse(msg) => write!(f, "InvalidResponse: {}", msg),
             MLError::ConfigurationError(msg) => write!(f, "ConfigurationError: {}", msg),
+            MLError::TokenizationError(msg) => write!(f, "TokenizationError: {}", msg),
         }
     }
 }

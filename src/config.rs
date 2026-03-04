@@ -193,6 +193,10 @@ pub struct PCConfig {
     pub enable_code_verification: bool,
     pub enable_nostr_zap_tracking: bool,
     pub min_zaps_for_consensus: usize,
+    /// Path to SQLite database for persisting PC weights (optional)
+    pub persistence_db_path: Option<String>,
+    /// Convergence threshold for early exiting during inference
+    pub convergence_threshold: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -251,6 +255,7 @@ impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
             learning_rate: config.learning_rate,
             inference_steps: 20, // default value
             surprise_threshold: 1.0, // default value
+            convergence_threshold: config.convergence_threshold,
             selective_update: true, // default value
             mu_pc_scaling: config.mu_pc_scaling,
             enable_precision_weighting: config.enable_precision_weighting,
@@ -262,6 +267,7 @@ impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
             enable_code_verification: config.enable_code_verification,
             enable_nostr_zap_tracking: config.enable_nostr_zap_tracking,
             min_zaps_for_consensus: config.min_zaps_for_consensus,
+            persistence_db_path: config.persistence_db_path,
         }
     }
 }
@@ -411,6 +417,8 @@ impl Default for PCConfig {
             enable_code_verification: false,
             enable_nostr_zap_tracking: false,
             min_zaps_for_consensus: 3,
+            persistence_db_path: Some("./neurofed.db".to_string()),
+            convergence_threshold: 0.01,
         }
     }
 }
@@ -440,7 +448,7 @@ impl Default for BootstrapConfig {
             batch_size: 32,
             max_epochs: 10,
             learning_rate: 0.001,
-            document_paths: vec!["docs/".to_string()],
+            document_paths: vec!["human-eval/".to_string()],
         }
     }
 }

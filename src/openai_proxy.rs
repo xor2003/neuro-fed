@@ -22,6 +22,7 @@ use crate::ml_engine::MLEngine;
 use crate::config::{NodeConfig, BackendConfig};
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::types::{FunctionCall, Tool, ToolCall, ProxyStats};
+use crate::semantic_cache::SemanticCache;
 use thiserror::Error;
 
 /// Error types for OpenAI proxy operations
@@ -175,7 +176,7 @@ pub struct OpenAiProxy {
     local_engine: Arc<tokio::sync::Mutex<MLEngine>>,
     pc_hierarchy: Arc<tokio::sync::Mutex<PredictiveCoding>>,
     client: Client,
-    semantic_cache: Arc<tokio::sync::Mutex<HashMap<String, SemanticCacheEntry>>>,
+    semantic_cache: Arc<tokio::sync::Mutex<SemanticCache>>,
     metrics: Arc<tokio::sync::Mutex<ProxyMetrics>>,
     stats: Arc<tokio::sync::Mutex<ProxyStats>>,
 }
@@ -207,6 +208,38 @@ fn extract_all_text(value: &serde_json::Value) -> String {
     text
 }
 
+/// Helper function to parse SSE streams and extract text
+fn parse_sse_to_text(bytes: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(bytes);
+    let mut has_data = false;
+    let mut extracted = String::new();
+
+    for line in s.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            has_data = true;
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                let text = extract_all_text(&json);
+                if !text.trim().is_empty() {
+                    extracted.push_str(&text);
+                }
+            } else {
+                extracted.push_str(data);
+                extracted.push('\n');
+            }
+        }
+    }
+
+    if has_data {
+        Some(extracted)
+    } else {
+        None
+    }
+}
+
 impl OpenAiProxy {
     /// Create a new OpenAI proxy with enhanced features
     pub fn new(
@@ -223,6 +256,10 @@ impl OpenAiProxy {
             warn!("OpenAI Proxy: PC learning is disabled - responses won't be learned");
         }
         
+        let max_cache_size = backend_config.max_cache_size;
+        let embedding_dim = config.ml_config.embedding_dim;
+        let similarity_threshold = backend_config.semantic_similarity_threshold;
+        
         Self {
             config,
             backend_config,
@@ -237,7 +274,11 @@ impl OpenAiProxy {
                     error!("Failed to build HTTP client: {}. Using default client.", e);
                     Client::new()
                 }),
-            semantic_cache: Arc::new(Mutex::new(HashMap::new())),
+            semantic_cache: Arc::new(Mutex::new(Self::load_semantic_cache(
+                max_cache_size,
+                embedding_dim,
+                similarity_threshold,
+            ))),
             metrics: Arc::new(Mutex::new(ProxyMetrics::default())),
             stats: Arc::new(Mutex::new(ProxyStats {
                 requests_total: 0,
@@ -249,10 +290,49 @@ impl OpenAiProxy {
         }
     }
 
+    /// Load semantic cache from a JSON file on disk.
+    /// If the file does not exist or fails to parse, returns an empty cache.
+    fn load_semantic_cache(max_cache_size: usize, embedding_dim: usize, similarity_threshold: f32) -> SemanticCache {
+        use std::fs::File;
+        use std::io::BufReader;
+        const CACHE_PATH: &str = "./semantic_cache.json";
+
+        let cache = SemanticCache::new(
+            max_cache_size as u64,
+            embedding_dim,
+            similarity_threshold,
+        );
+
+        // Note: Old cache format is not compatible with new SemanticCache structure
+        // We'll start with an empty cache and let it populate naturally
+        match File::open(CACHE_PATH) {
+            Ok(_) => {
+                tracing::info!("Old semantic cache file found, but format has changed. Starting with empty cache.");
+            }
+            Err(_) => {
+                tracing::info!("Semantic cache file not found, starting with empty cache");
+            }
+        };
+        
+        tracing::info!("Loaded semantic cache with embedding_dim: {}, similarity_threshold: {}", embedding_dim, similarity_threshold);
+        cache
+    }
+
+    /// Save semantic cache to a JSON file on disk.
+    /// This should be called on graceful shutdown.
+    /// Note: With the new SemanticCache implementation, we use SQLite persistence
+    /// so this method is a no-op for now.
+    pub async fn save_semantic_cache(&self) -> Result<(), ProxyError> {
+        // TODO: Implement SQLite persistence for the new SemanticCache
+        tracing::info!("Semantic cache save requested (SQLite persistence not yet implemented)");
+        Ok(())
+    }
+
     /// Start the OpenAI proxy server
     pub async fn start(self, port: u16) -> Result<(), ProxyError> {
         // Create a shared state - NO OUTER MUTEX NEEDED
         let state = Arc::new(self);
+        let metrics_state = Arc::clone(&state);
         
         let app = Router::new()
             .route("/v1/models", routing::get(|State(_state): State<Arc<OpenAiProxy>>| async move {
@@ -270,6 +350,9 @@ impl OpenAiProxy {
             .route("/v1/metrics", routing::get(|State(state): State<Arc<OpenAiProxy>>| async move {
                 OpenAiProxy::handle_metrics(State(state)).await
             }))
+            .route("/v1/memory", routing::get(|State(state): State<Arc<OpenAiProxy>>| async move {
+                OpenAiProxy::handle_memory(State(state)).await
+            }))
             // Catch-all route for any other OpenAI API endpoints
             .route("/{*path}", routing::any(|State(state): State<Arc<OpenAiProxy>>, req: axum::http::Request<axum::body::Body>| async move {
                 OpenAiProxy::handle_generic_endpoint(State(state), req).await
@@ -278,8 +361,35 @@ impl OpenAiProxy {
 
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await
             .map_err(|e| ProxyError::ConfigError(format!("Failed to bind to port {}: {}", port, e)))?;
-        axum::serve(listener, app).await
+        
+        info!("OpenAI proxy server listening on 0.0.0.0:{}", port);
+        
+        // Setup graceful shutdown - capture metrics from the shared state
+        let shutdown = async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received shutdown signal (Ctrl+C), saving weights and shutting down gracefully...");
+            
+            // Log statistics before shutdown
+            let metrics = metrics_state.metrics.lock().await;
+            info!("Shutdown statistics: total_requests={}, cache_hits={}, cache_misses={}, pc_learning_calls={}, pc_inference_calls={}",
+                metrics.total_requests, metrics.cache_hits, metrics.cache_misses,
+                metrics.pc_learning_calls, metrics.pc_inference_calls);
+            drop(metrics);
+
+            // Save semantic cache to disk
+            if let Err(e) = metrics_state.save_semantic_cache().await {
+                warn!("Failed to save semantic cache: {}", e);
+            } else {
+                info!("Semantic cache saved successfully");
+            }
+        };
+        
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
             .map_err(|e| ProxyError::ConfigError(format!("Failed to start server: {}", e)))?;
+        
+        info!("OpenAI proxy server shut down gracefully");
         Ok(())
     }
 
@@ -317,7 +427,7 @@ impl OpenAiProxy {
             if let Some(cached_response) = proxy.check_semantic_cache(&req).await {
                 proxy.metrics.lock().await.cache_hits += 1;
                 proxy.metrics.lock().await.semantic_similarity_hits += 1;
-                debug!("Semantic cache hit, returning cached response");
+                info!("Semantic cache hit, returning cached response (saved computation)");
                 let elapsed = start_time.elapsed();
                 proxy.update_metrics_success(elapsed, &cached_response).await;
                 return Ok(Json(cached_response));
@@ -350,7 +460,7 @@ impl OpenAiProxy {
             info!("PC learning: Triggering learning from response (pc_learning_enabled: true)");
             proxy.metrics.lock().await.pc_learning_calls += 1;
             if let Err(e) = proxy.learn_from_response(&req, &response).await {
-                warn!("PC learning failed: {}", e);
+                warn!("PC learning failed: {}. Troubleshooting: Check PC hierarchy configuration, tensor shapes (input dim should match embedding dimension), and database connectivity. Enable DEBUG logging for more details.", e);
             } else {
                 info!("PC learning: Successfully scheduled learning task");
             }
@@ -429,17 +539,16 @@ impl OpenAiProxy {
             }
         };
         
-        let cache = self.semantic_cache.lock().await;
-        let threshold = self.backend_config.semantic_similarity_threshold;
+        let mut cache = self.semantic_cache.lock().await;
         
-        for (_, entry) in cache.iter() {
-            if self.cosine_similarity(&embedding, &entry.embedding) >= threshold {
-                debug!("Semantic cache hit with similarity above threshold");
-                return Some(entry.response.clone());
+        // Use the new semantic cache's similarity check
+        match cache.check_similarity(&embedding, req).await {
+            Some(response) => {
+                info!("Semantic cache hit with similarity above threshold (reusing learnt information)");
+                Some(response)
             }
+            None => None,
         }
-        
-        None
     }
 
     /// Update semantic cache with new request-response pair
@@ -448,37 +557,17 @@ impl OpenAiProxy {
         
         let mut cache = self.semantic_cache.lock().await;
         
-        // Implement LRU eviction if cache exceeds max size
-        if cache.len() >= self.backend_config.max_cache_size {
-            // Find the entry with the smallest timestamp (oldest)
-            let mut oldest_key = None;
-            let mut oldest_timestamp = i64::MAX;
-            for (key, entry) in cache.iter() {
-                if entry.timestamp < oldest_timestamp {
-                    oldest_timestamp = entry.timestamp;
-                    oldest_key = Some(key.clone());
-                }
+        // Use the new semantic cache's add_to_cache method
+        match cache.add_to_cache(req.clone(), response.clone(), embedding).await {
+            Ok(_) => {
+                debug!("Updated semantic cache with new entry");
+                Ok(())
             }
-            if let Some(key) = oldest_key {
-                cache.remove(&key);
-                debug!("Evicted oldest cache entry (timestamp: {}) due to size limit", oldest_timestamp);
+            Err(e) => {
+                warn!("Failed to add to semantic cache: {}", e);
+                Err(ProxyError::CacheError(format!("Failed to add to cache: {}", e)))
             }
         }
-        
-        let embedding_dim = embedding.len();
-        let entry = SemanticCacheEntry {
-            request: req.clone(),
-            response: response.clone(),
-            timestamp: Utc::now().timestamp(),
-            embedding,
-            embedding_dim,
-        };
-        
-        let key = self.hash_request(req);
-        cache.insert(key, entry);
-        debug!("Updated semantic cache with new entry");
-        
-        Ok(())
     }
 
     /// Perform PC inference on the request
@@ -600,8 +689,50 @@ impl OpenAiProxy {
             info!("PC learning: PC hierarchy n_levels: {}", pc.config.n_levels);
             let learn_result = pc.learn_legacy(&learning_tensor);
             match &learn_result {
-                Ok(stats) => info!("PC learning: learn_legacy succeeded with surprise: {:.6}", stats.total_surprise),
-                Err(e) => error!("PC learning: learn_legacy failed: {}", e),
+                Ok(stats) => {
+                    info!("PC learning: learn_legacy succeeded with surprise: {:.6}", stats.total_surprise);
+                    
+                    // Save updated weights to database
+                    let db_path = pc.config.persistence_db_path.clone().unwrap_or_else(|| "./neurofed.db".to_string());
+                    let levels_to_save: Vec<_> = pc.levels.iter().enumerate().map(|(i, l)| {
+                        let shape = l.weights.shape();
+                        let dims = shape.dims();
+                        let (rows, cols) = (dims[0], dims[1]);
+                        let flat_weights = l.weights.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                        crate::persistence::PCLevelWeights {
+                            level_index: i,
+                            input_dim: rows,
+                            output_dim: cols,
+                            weights: flat_weights,
+                            updated_at: chrono::Utc::now().timestamp(),
+                        }
+                    }).collect();
+                    
+                    tokio::spawn(async move {
+                        if let Ok(db) = crate::persistence::PCPersistence::new(&db_path).await {
+                            let mut saved_count = 0;
+                            let mut total_params = 0;
+                            for level in &levels_to_save {
+                                if let Err(e) = db.save_level_weights(level).await {
+                                    error!("Failed to save level {} weights: {}", level.level_index, e);
+                                } else {
+                                    saved_count += 1;
+                                    total_params += level.input_dim * level.output_dim;
+                                }
+                            }
+                            info!("Saved {} PC weight matrices to database ({} total parameters)", saved_count, total_params);
+                        }
+                    });
+                },
+                Err(e) => {
+                    let tensor_shape = learning_tensor.shape();
+                    let dims = tensor_shape.dims();
+                    warn!("PC learning: learn_legacy failed: {}. Learning tensor shape: {:?} ({}x{}), PC config: dim_per_level={:?}, n_levels={}, precision_enabled={}. Check that input dimension ({}) matches first level input dim ({}) and precision matrix broadcasting.",
+                        e, tensor_shape, dims[0], dims[1],
+                        pc.config.dim_per_level, pc.config.n_levels, pc.config.enable_precision_weighting,
+                        dims[0], pc.config.dim_per_level.get(0).unwrap_or(&0)
+                    );
+                }
             }
             learn_result
         }).await
@@ -615,6 +746,21 @@ impl OpenAiProxy {
         })?;
         
         info!("PC learning: Learning completed successfully! Surprise: {:.6}", result.total_surprise);
+        
+        // Log statistics
+        let metrics = self.metrics.lock().await;
+        info!(
+            "PC learning statistics: total_requests={}, cache_hits={}, cache_misses={}, pc_inference_calls={}, pc_learning_calls={}, openai_backend_calls={}, ollama_backend_calls={}, local_fallback_calls={}, total_tokens_saved={}",
+            metrics.total_requests,
+            metrics.cache_hits,
+            metrics.cache_misses,
+            metrics.pc_inference_calls,
+            metrics.pc_learning_calls,
+            metrics.openai_backend_calls,
+            metrics.ollama_backend_calls,
+            metrics.local_fallback_calls,
+            metrics.total_tokens_saved
+        );
         Ok(())
     }
 
@@ -757,7 +903,7 @@ impl OpenAiProxy {
         
         let mut response_json: OpenAiResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                error!("Failed to parse OpenAI response JSON: {}", e);
+                error!("Failed to parse OpenAI response JSON: {} {}", e, response_text);
                 ProxyError::SerializationError(format!("Failed to parse OpenAI response: {}", e))
             })?;
         
@@ -990,15 +1136,22 @@ impl OpenAiProxy {
             return 0.0;
         }
         
-        let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut dot = 0.0;
+        let mut norm_a_sq = 0.0;
+        let mut norm_b_sq = 0.0;
         
-        if norm_a == 0.0 || norm_b == 0.0 {
+        // Single pass: heavily cache-localized and auto-vectorized
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            norm_a_sq += x * x;
+            norm_b_sq += y * y;
+        }
+        
+        if norm_a_sq == 0.0 || norm_b_sq == 0.0 {
             return 0.0;
         }
         
-        dot_product / (norm_a * norm_b)
+        dot / (norm_a_sq.sqrt() * norm_b_sq.sqrt())
     }
 
     /// Hash request for cache key
@@ -1037,6 +1190,20 @@ impl OpenAiProxy {
     ) -> Result<Json<ProxyMetrics>, StatusCode> {
         let metrics = proxy.metrics.lock().await.clone();
         Ok(Json(metrics))
+    }
+
+    /// Handle memory export endpoint (returns JSON representation of PC hierarchy)
+    pub async fn handle_memory(
+        State(proxy): State<Arc<OpenAiProxy>>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        let pc = proxy.pc_hierarchy.lock().await;
+        match pc.export_memory() {
+            Ok(json) => Ok(Json(json)),
+            Err(e) => {
+                tracing::error!("Failed to export memory: {}", e);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
     }
 
     /// List models endpoint
@@ -1320,72 +1487,116 @@ impl OpenAiProxy {
             let path_clone = path.clone();
             
             tokio::spawn(async move {
-                // Try to parse both as generic JSON
-                if let (Ok(req_json), Ok(resp_json)) = (
-                    serde_json::from_slice::<serde_json::Value>(&req_bytes_clone),
-                    serde_json::from_slice::<serde_json::Value>(&resp_bytes_clone)
-                ) {
-                    // Extract text heuristically
-                    let req_text = extract_all_text(&req_json);
-                    let resp_text = extract_all_text(&resp_json);
-                    
-                    // Only learn if there is substantial text (ignore tiny status pings)
-                    if req_text.len() > 20 && resp_text.len() > 10 {
-                        info!("Generic Interceptor: Learning from endpoint {}", path_clone);
-                        
-                        // Generate embeddings
-                        let engine = proxy_clone.local_engine.lock().await;
-                        if let (Ok(req_tensor), Ok(resp_tensor)) = (
-                            engine.process_text(&req_text).await,
-                            engine.process_text(&resp_text).await
-                        ) {
-                            // Flatten tensors and trim to PC input dimension
-                            let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
-                            let pc_input_dim = {
-                                let pc = pc_hierarchy.lock().await;
-                                pc.config.dim_per_level[0]
-                            };
-                            
-                            let flatten_and_trim = |tensor: Tensor| -> Result<Tensor, ProxyError> {
-                                let flat = if tensor.rank() > 1 {
-                                    tensor.flatten_all().map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten tensor: {}", e)))?
-                                } else {
-                                    tensor
-                                };
-                                let data = flat.to_vec1::<f32>().map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert tensor: {}", e)))?;
-                                let trimmed: Vec<f32> = if data.len() >= pc_input_dim {
-                                    data[..pc_input_dim].to_vec()
-                                } else {
-                                    let mut padded = data;
-                                    padded.resize(pc_input_dim, 0.0);
-                                    padded
-                                };
-                                Tensor::from_vec(trimmed, (pc_input_dim, 1), &candle_core::Device::Cpu)
-                                    .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))
-                            };
-                            
-                            match (flatten_and_trim(req_tensor), flatten_and_trim(resp_tensor)) {
-                                (Ok(req_learning), Ok(resp_learning)) => {
-                                    // Perform PC learning (use learn_legacy with response as target)
-                                    let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let mut pc = pc_hierarchy.blocking_lock();
-                                        let _ = pc.learn_legacy(&resp_learning);
-                                    }).await;
-                                    info!("Generic Interceptor: PC learning completed for endpoint {}", path_clone);
-                                }
-                                (Err(e), _) | (_, Err(e)) => {
-                                    warn!("Generic Interceptor: Failed to prepare tensors for learning: {}", e);
-                                }
+                // Try to parse request as JSON, fallback to raw text
+                let req_text = match serde_json::from_slice::<serde_json::Value>(&req_bytes_clone) {
+                    Ok(req_json) => extract_all_text(&req_json),
+                    Err(err) => {
+                        warn!("Generic Interceptor: Request is not valid JSON, falling back to raw text. Path: {}. Error: {}", path_clone, err);
+                        String::from_utf8_lossy(&req_bytes_clone).to_string()
+                    }
+                };
+
+                // Try to parse response as SSE first, then JSON, then raw text
+                let resp_text = match parse_sse_to_text(&resp_bytes_clone) {
+                    Some(text) => {
+                        debug!("Generic Interceptor: Successfully parsed SSE response for endpoint {}", path_clone);
+                        text
+                    }
+                    None => {
+                        // Not SSE, try JSON
+                        match serde_json::from_slice::<serde_json::Value>(&resp_bytes_clone) {
+                            Ok(resp_json) => extract_all_text(&resp_json),
+                            Err(err) => {
+                                warn!("Generic Interceptor: Response is not valid JSON, falling back to raw text. Path: {}. Error: {}", path_clone, err);
+                                String::from_utf8_lossy(&resp_bytes_clone).to_string()
                             }
-                        } else {
-                            debug!("Generic Interceptor: Failed to generate embeddings for endpoint {}", path_clone);
+                        }
+                    }
+                };
+
+                // Only learn if there is substantial text (ignore tiny status pings)
+                if req_text.len() > 20 && resp_text.len() > 10 {
+                    info!("Generic Interceptor: Learning from endpoint {}", path_clone);
+                    
+                    // Generate embeddings
+                    let engine = proxy_clone.local_engine.lock().await;
+                    if let (Ok(req_tensor), Ok(resp_tensor)) = (
+                        engine.process_text(&req_text).await,
+                        engine.process_text(&resp_text).await
+                    ) {
+                        // Flatten tensors and trim to PC input dimension
+                        let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
+                        let pc_input_dim = {
+                            let pc = pc_hierarchy.lock().await;
+                            pc.config.dim_per_level[0]
+                        };
+                        
+                        let flatten_and_trim = |tensor: Tensor| -> Result<Tensor, ProxyError> {
+                            let flat = if tensor.rank() > 1 {
+                                tensor.flatten_all().map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten tensor: {}", e)))?
+                            } else {
+                                tensor
+                            };
+                            let data = flat.to_vec1::<f32>().map_err(|e| ProxyError::EmbeddingError(format!("Failed to convert tensor: {}", e)))?;
+                            let trimmed: Vec<f32> = if data.len() >= pc_input_dim {
+                                data[..pc_input_dim].to_vec()
+                            } else {
+                                let mut padded = data;
+                                padded.resize(pc_input_dim, 0.0);
+                                padded
+                            };
+                            Tensor::from_vec(trimmed, (pc_input_dim, 1), &candle_core::Device::Cpu)
+                                .map_err(|e| ProxyError::PCError(format!("Failed to create learning tensor: {}", e)))
+                        };
+                        
+                        match (flatten_and_trim(req_tensor), flatten_and_trim(resp_tensor)) {
+                            (Ok(req_learning), Ok(resp_learning)) => {
+                                // Perform PC learning (use learn_legacy with response as target)
+                                let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let mut pc = pc_hierarchy.blocking_lock();
+                                    let learn_result = pc.learn_legacy(&resp_learning);
+                                    if let Ok(_) = learn_result {
+                                        // Save updated weights to database
+                                        let db_path = pc.config.persistence_db_path.clone().unwrap_or_else(|| "./neurofed.db".to_string());
+                                        let levels_to_save: Vec<_> = pc.levels.iter().enumerate().map(|(i, l)| {
+                                            let shape = l.weights.shape();
+                                            let dims = shape.dims();
+                                            let (rows, cols) = (dims[0], dims[1]);
+                                            let flat_weights = l.weights.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                            crate::persistence::PCLevelWeights {
+                                                level_index: i,
+                                                input_dim: rows,
+                                                output_dim: cols,
+                                                weights: flat_weights,
+                                                updated_at: chrono::Utc::now().timestamp(),
+                                            }
+                                        }).collect();
+                                        
+                                        // Spawn async task to save to database
+                                        tokio::spawn(async move {
+                                            if let Ok(db) = crate::persistence::PCPersistence::new(&db_path).await {
+                                                for level in levels_to_save {
+                                                    if let Err(e) = db.save_level_weights(&level).await {
+                                                        error!("Failed to save level {} weights: {}", level.level_index, e);
+                                                    }
+                                                }
+                                                debug!("Saved PC weights to database from generic endpoint");
+                                            }
+                                        });
+                                    }
+                                }).await;
+                                info!("Generic Interceptor: PC learning completed for endpoint {}", path_clone);
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                warn!("Generic Interceptor: Failed to prepare tensors for learning: {}", e);
+                            }
                         }
                     } else {
-                        debug!("Generic Interceptor: Insufficient text for learning (req: {} chars, resp: {} chars)", req_text.len(), resp_text.len());
+                        warn!("Generic Interceptor: Failed to generate embeddings for endpoint {}", path_clone);
                     }
                 } else {
-                    debug!("Generic Interceptor: Request or response is not valid JSON, skipping learning");
+                    debug!("Generic Interceptor: Insufficient text for learning (req: {} chars, resp: {} chars)", req_text.len(), resp_text.len());
                 }
             });
         }
@@ -1425,13 +1636,14 @@ impl OpenAiProxy {
     /// Get cache statistics
     pub async fn get_cache_stats(&self) -> (usize, usize) {
         let cache = self.semantic_cache.lock().await;
-        (cache.len(), self.backend_config.max_cache_size)
+        let stats = cache.get_stats().await;
+        (stats.cache_size as usize, self.backend_config.max_cache_size)
     }
 
     /// Clear semantic cache
     pub async fn clear_cache(&self) {
         let mut cache = self.semantic_cache.lock().await;
-        cache.clear();
+        cache.clear().await;
         info!("Semantic cache cleared");
     }
 

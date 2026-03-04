@@ -220,7 +220,7 @@ impl PrivacyNetworkManager {
     }
     
     /// Send data through the current network
-    pub async fn send(&self, data: &[u8], destination: &str) -> Result<(), PrivacyNetworkError> {
+    pub async fn send(&self, _data: &[u8], _destination: &str) -> Result<(), PrivacyNetworkError> {
         match self.current_network {
             PrivacyNetwork::Direct => {
                 // For direct connections, we would use regular networking

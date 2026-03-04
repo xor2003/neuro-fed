@@ -2,7 +2,7 @@
 // Main application entry point with CLI
 
 use clap::{Parser, Subcommand};
-use neuro_fed_node::bootstrap::{Bootstrap, LlamaContext};
+use neuro_fed_node::bootstrap::Bootstrap;
 use neuro_fed_node::config::NodeConfig;
 use neuro_fed_node::pc_hierarchy;
 use neuro_fed_node::PredictiveCoding;
@@ -13,13 +13,14 @@ use neuro_fed_node::payment_verifier::PaymentVerifier;
 use neuro_fed_node::pow_verifier::PoWVerifier;
 use neuro_fed_node::privacy_networks::PrivacyNetworkManager;
 use neuro_fed_node::openai_proxy::OpenAiProxy;
+use neuro_fed_node::model_manager::ModelManager;
 use candle_core::{Tensor, Device};
 use reqwest;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, Duration as TokioDuration};
-use tracing::{info, warn, Level};
+use tracing::{info, warn, error, Level};
 use tracing_subscriber;
 
 /// CLI arguments
@@ -127,21 +128,93 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
     let config = NodeConfig::load_or_default();
     let proxy_config = config.proxy_config.clone();
     
-    // Create ML Engine
+    // Create ML Engine with ModelManager auto-download
     let device_type = neuro_fed_node::types::DeviceType {
         name: "CPU".to_string(),
         description: "CPU device".to_string(),
         supported: true,
     };
+    
+    // 1. Auto-Download the required model!
+    info!("Checking local AI models...");
+    let mut manager = ModelManager::new(config.clone());
+    let recommended_model = manager.get_recommended_model().await
+        .map_err(|e| Box::<dyn Error>::from(format!("Failed to get recommended model: {}", e)))?;
+
+    if !manager.is_model_downloaded(&recommended_model.name).await {
+        info!("First run detected! Downloading optimal AI model ({})...", recommended_model.name);
+        // (Optional: Hook up the progress bar callback here)
+        manager.download_model(&recommended_model.name).await
+            .map_err(|e| Box::<dyn Error>::from(format!("Download failed: {}", e)))?;
+    }
+
+    // 2. NOW initialize the ML Engine using the guaranteed local path
     let local_engine = Arc::new(tokio::sync::Mutex::new(
-        neuro_fed_node::ml_engine::MLEngine::new(&config.model_path, device_type)?
+        neuro_fed_node::ml_engine::MLEngine::new_with_manager(
+            Arc::new(manager),
+            &recommended_model.name,
+        ).await?
     ));
     
     // Create Predictive Coding hierarchy
-    let pc_config = pc_hierarchy::PCConfig::new(3, vec![512, 256, 128]);
-    let pc_hierarchy = Arc::new(tokio::sync::Mutex::new(
-        PredictiveCoding::new(pc_config)?
-    ));
+    let pc_config: neuro_fed_node::pc_hierarchy::PCConfig = config.pc_config.clone().into();
+    
+    // Initialize persistence
+    let db_path = pc_config.persistence_db_path.clone().unwrap_or_else(|| {
+        // Use relative path to avoid issues with absolute path parsing in SQLite
+        "neurofed.db".to_string()
+    });
+    let persistence = neuro_fed_node::persistence::PCPersistence::new(&db_path).await.expect("Failed to init DB");
+
+    // Try to load existing weights
+    let saved_levels = persistence.load_all_levels().await.unwrap_or_default();
+
+    let mut pc = PredictiveCoding::new(pc_config)?;
+
+    // Inject saved weights into the PC Hierarchy
+    if !saved_levels.is_empty() {
+        info!("Loading {} levels from database...", saved_levels.len());
+        let mut loaded_count = 0;
+        for saved_level in &saved_levels {
+            let idx = saved_level.level_index;
+            if idx < pc.levels.len() {
+                // Use the helper from persistence.rs to convert Vec<f32> back to Tensor
+                if let Ok(tensor) = neuro_fed_node::persistence::vec_to_tensor(
+                    saved_level.weights.clone(),
+                    saved_level.input_dim,
+                    saved_level.output_dim,
+                    &Device::Cpu // Currently using CPU device by default in main.rs
+                ) {
+                    pc.levels[idx].weights = tensor;
+                    loaded_count += 1;
+                    info!("  Level {}: loaded weights {}x{} ({} parameters)",
+                        idx, saved_level.input_dim, saved_level.output_dim,
+                        saved_level.input_dim * saved_level.output_dim);
+                }
+            }
+        }
+        info!("Successfully loaded {} weight matrices from database", loaded_count);
+    }
+
+    let pc_hierarchy = Arc::new(tokio::sync::Mutex::new(pc));
+    
+    // Check if we should run bootstrap (no saved levels and bootstrap enabled)
+    if saved_levels.is_empty() && config.bootstrap_on_start {
+        info!("No saved weights found and bootstrap enabled, running bootstrap learning phase...");
+        
+        // Create BootstrapManager
+        let bootstrapper = neuro_fed_node::bootstrap::BootstrapManager::new(
+            config.bootstrap_config.clone(),
+            local_engine.clone(),
+            pc_hierarchy.clone()
+        );
+        
+        // Run bootstrap before creating proxy
+        match bootstrapper.run().await {
+            Ok(_) => info!("✅ Bootstrap completed successfully"),
+            Err(e) => error!("❌ Bootstrap failed: {}", e),
+        }
+    }
     
     info!("NeuroPC Node initialized successfully");
 
@@ -366,7 +439,8 @@ async fn run_full_node(brain_sharing: bool, privacy: bool) -> Result<(), Box<dyn
     
     // Create components using the single GGUF model path
     let model_path = config.model_path.clone();
-    let _llama_ctx = LlamaContext::new(&model_path, config.context_size);
+    // LlamaContext is deprecated - using MLEngine instead
+    // let _llama_ctx = LlamaContext::new(&model_path, config.context_size);
     // Convert config::PCConfig to pc_hierarchy::PCConfig
     let pc_config: crate::pc_hierarchy::PCConfig = config.pc_config.clone().into();
     let pc_hierarchy = PredictiveCoding::new(pc_config)?;

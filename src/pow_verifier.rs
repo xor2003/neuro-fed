@@ -4,7 +4,7 @@
 use std::time::{Duration, SystemTime, Instant};
 use sha2::{Sha256, Digest};
 use ndarray_rand::rand::Rng;
-use ndarray_rand::rand::thread_rng;
+use ndarray_rand::rand::rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -172,14 +172,14 @@ impl PoWVerifier {
         // Perform CPU-intensive mining in spawn_blocking
         tokio::task::spawn_blocking(move || {
             let start_time = Instant::now();
-            let mut rng = thread_rng();
+            let mut rng = rng();
 
             for _attempt in 0..max_nonce {
                 if start_time.elapsed() > timeout {
                     return Err(PoWVerifierError::Timeout("Mining timed out".to_string()));
                 }
 
-                let nonce = rng.gen_range(0..max_nonce);
+                let nonce = rng.random_range(0..max_nonce);
                 let hash = Self::compute_hash_static(&data, nonce, &hash_algorithm);
 
                 if Self::check_difficulty_static(&hash, difficulty) {

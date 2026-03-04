@@ -16,6 +16,8 @@ pub mod openai_proxy;
 pub mod blossom_client;
 pub mod brain_manager;
 pub mod pc_hierarchy;
+pub mod persistence;
+pub mod semantic_cache;
 pub mod types;
 pub mod payment_verifier;
 pub mod pow_verifier;

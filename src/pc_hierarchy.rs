@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::knowledge_filter::{PrecisionCalculator, PrecisionConfig, PrecisionContext};
+use crate::persistence::{PCPersistence, PersistenceError};
 
 #[derive(Debug)]
 pub struct PCError(String);
@@ -32,6 +33,7 @@ pub struct PCConfig {
     pub learning_rate: f32,
     pub inference_steps: usize,
     pub surprise_threshold: f32,
+    pub convergence_threshold: f32,
     pub selective_update: bool,
     pub mu_pc_scaling: bool,
     // Precision weighting configuration
@@ -44,6 +46,8 @@ pub struct PCConfig {
     pub enable_code_verification: bool,
     pub enable_nostr_zap_tracking: bool,
     pub min_zaps_for_consensus: usize,
+    /// Path to SQLite database for persisting PC weights (optional)
+    pub persistence_db_path: Option<String>,
 }
 
 impl PCConfig {
@@ -54,6 +58,7 @@ impl PCConfig {
             learning_rate: 0.01,
             inference_steps: 20,
             surprise_threshold: 1.0,
+            convergence_threshold: 0.01,
             selective_update: true,
             mu_pc_scaling: false,
             // Precision weighting defaults
@@ -66,11 +71,17 @@ impl PCConfig {
             enable_code_verification: false,
             enable_nostr_zap_tracking: false,
             min_zaps_for_consensus: 3,
+            persistence_db_path: None,
         }
     }
 
     pub fn with_mu_pc_scaling(mut self, enabled: bool) -> Self {
         self.mu_pc_scaling = enabled;
+        self
+    }
+
+    pub fn with_convergence_threshold(mut self, threshold: f32) -> Self {
+        self.convergence_threshold = threshold;
         self
     }
 
@@ -131,20 +142,32 @@ impl PCLevel {
         Tensor::zeros((output_dim, batch), DType::F32, &self.device)
     }
 
-    pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Tensor, precision: Option<&Tensor>) -> CandleResult<()> {
+    pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Tensor, precision: Option<&Tensor>, mu_pc_scaling: bool) -> CandleResult<()> {
         // Delta U_l = eta * epsilon_l * r_{l+1}^T * π
         // If precision is provided, apply element-wise multiplication
         let next_t = next_level_beliefs.t()?;
         let matmul_result = self.errors.matmul(&next_t)?;
+        
+        // --- NEW: MU-PC SCALING MATH ---
+        let (input_dim, _) = self.weights.shape().dims2()?;
+        let mut effective_lr = eta;
+        if mu_pc_scaling {
+            // Scale learning rate by 1 / sqrt(dimension) to prevent exploding gradients
+            effective_lr = eta / (input_dim as f32).sqrt();
+        }
+        // --------------------------------
+        
         // Create scalar eta tensor and broadcast to match matmul_result shape
-        let eta_tensor = Tensor::from_slice(&[eta], (1, 1), &matmul_result.device())?
+        let eta_tensor = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
             .broadcast_as(matmul_result.shape())?;
         let mut delta_weights = matmul_result.mul(&eta_tensor)?;
         
         if let Some(precision_matrix) = precision {
             // Apply precision weighting element-wise
             // Note: precision_matrix should have shape (input_dim, 1) for broadcasting
-            delta_weights = (&delta_weights * precision_matrix)?;
+            // Broadcast precision_matrix to match delta_weights shape
+            let broadcasted_precision = precision_matrix.broadcast_as(delta_weights.shape())?;
+            delta_weights = (&delta_weights * &broadcasted_precision)?;
         }
         
         self.weights = (&self.weights + &delta_weights)?;
@@ -153,7 +176,7 @@ impl PCLevel {
     
     /// Legacy method for backward compatibility
     pub fn update_weights_legacy(&mut self, eta: f32, next_level_beliefs: &Tensor) -> CandleResult<()> {
-        self.update_weights(eta, next_level_beliefs, None)
+        self.update_weights(eta, next_level_beliefs, None, false)
     }
 }
 
@@ -303,6 +326,12 @@ impl PredictiveCoding {
             if fe > self.config.surprise_threshold {
                 stats.high_surprise_indices.push(step);
             }
+
+            // Early exiting: if free energy drops below convergence threshold, stop inference
+            if fe < self.config.convergence_threshold {
+                tracing::debug!("PC inference converged early at step {} (FE: {:.4})", step, fe);
+                break;
+            }
         }
         
         stats.total_surprise = stats.free_energy_history.iter().sum::<f32>();
@@ -313,6 +342,29 @@ impl PredictiveCoding {
         // Perform inference to compute errors
         let stats = self.infer(input, self.config.inference_steps)?;
         
+        // Calculate free energy drop for gossip trigger
+        let free_energy_drop = if stats.free_energy_history.len() >= 2 {
+            let initial_fe = stats.free_energy_history.first().unwrap_or(&0.0);
+            let final_fe = stats.free_energy_history.last().unwrap_or(&0.0);
+            initial_fe - final_fe  // Positive drop means free energy decreased (good)
+        } else {
+            0.0
+        };
+        
+        // Check if free energy drop exceeds threshold for gossip trigger
+        if free_energy_drop > self.config.free_energy_drop_threshold {
+            tracing::info!(
+                "GOSSIP TRIGGER: Free energy drop {:.4} exceeds threshold {:.4}",
+                free_energy_drop,
+                self.config.free_energy_drop_threshold
+            );
+            
+            // TODO: Package delta weights into NIP-8700 event and send to mpsc::channel
+            // The delta weights (ΔU) would need to be captured during weight updates
+            // For now, log that gossip would be triggered
+            tracing::debug!("Would package delta weights for Nostr gossip (NIP-8700)");
+        }
+        
         // Record free energy for tracking
         if let Some(ref mut calculator) = self.precision_calculator {
             let current_free_energy = stats.free_energy_history.last().unwrap_or(&0.0);
@@ -322,47 +374,70 @@ impl PredictiveCoding {
         // Clone beliefs for all levels to avoid borrow issues
         let next_level_beliefs: Vec<Tensor> = self.levels.iter().map(|level| level.beliefs.clone()).collect();
         
-        // Calculate precision if enabled
-        let precision_matrix = if let Some(ref calculator) = self.precision_calculator {
-            if let Some(context) = context {
-                let precision_result = calculator.calculate_precision(&context);
-                // Create a precision matrix from the scalar precision value
-                // For now, we'll create a matrix with the same precision for all units
-                let (input_dim, _) = self.levels[0].beliefs.shape().dims2()?;
-                let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
-                let precision_tensor = Tensor::from_slice(&[precision_result.precision], (1, 1), &self.device)?
-                    .broadcast_as(ones.shape())?;
-                Some(ones.mul(&precision_tensor)?)
-            } else {
-                // Default precision matrix (all ones) if no context provided
-                let (input_dim, _) = self.levels[0].beliefs.shape().dims2()?;
-                let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
-                let default_precision_tensor = Tensor::from_slice(&[self.config.default_precision], (1, 1), &self.device)?
-                    .broadcast_as(ones.shape())?;
-                Some(ones.mul(&default_precision_tensor)?)
-            }
-        } else {
-            None
-        };
-        
         // Update weights only for high-surprise components
         if self.config.selective_update {
             for l in 0..self.levels.len() - 1 {
                 if stats.high_surprise_indices.is_empty() {
+                    // Create precision matrix for this level if enabled
+                    let level_precision_matrix = if let Some(ref calculator) = self.precision_calculator {
+                        if let Some(ref context) = context {
+                            let precision_result = calculator.calculate_precision(context);
+                            // Create a precision matrix with the input dimension of this level
+                            let (input_dim, _) = self.levels[l].beliefs.shape().dims2()?;
+                            let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
+                            let precision_tensor = Tensor::from_slice(&[precision_result.precision], (1, 1), &self.device)?
+                                .broadcast_as(ones.shape())?;
+                            Some(ones.mul(&precision_tensor)?)
+                        } else {
+                            // Default precision matrix (all ones) if no context provided
+                            let (input_dim, _) = self.levels[l].beliefs.shape().dims2()?;
+                            let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
+                            let default_precision_tensor = Tensor::from_slice(&[self.config.default_precision], (1, 1), &self.device)?
+                                .broadcast_as(ones.shape())?;
+                            Some(ones.mul(&default_precision_tensor)?)
+                        }
+                    } else {
+                        None
+                    };
+                    
                     self.levels[l].update_weights(
                         self.config.learning_rate,
                         &next_level_beliefs[l + 1],
-                        precision_matrix.as_ref()
+                        level_precision_matrix.as_ref(),
+                        self.config.mu_pc_scaling
                     )?;
                 }
             }
         } else {
             // Update all weights
             for l in 0..self.levels.len() - 1 {
+                // Create precision matrix for this level if enabled
+                let level_precision_matrix = if let Some(ref calculator) = self.precision_calculator {
+                    if let Some(ref context) = context {
+                        let precision_result = calculator.calculate_precision(context);
+                        // Create a precision matrix with the input dimension of this level
+                        let (input_dim, _) = self.levels[l].beliefs.shape().dims2()?;
+                        let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
+                        let precision_tensor = Tensor::from_slice(&[precision_result.precision], (1, 1), &self.device)?
+                            .broadcast_as(ones.shape())?;
+                        Some(ones.mul(&precision_tensor)?)
+                    } else {
+                        // Default precision matrix (all ones) if no context provided
+                        let (input_dim, _) = self.levels[l].beliefs.shape().dims2()?;
+                        let ones = Tensor::ones((input_dim, 1), DType::F32, &self.device)?;
+                        let default_precision_tensor = Tensor::from_slice(&[self.config.default_precision], (1, 1), &self.device)?
+                            .broadcast_as(ones.shape())?;
+                        Some(ones.mul(&default_precision_tensor)?)
+                    }
+                } else {
+                    None
+                };
+                
                 self.levels[l].update_weights(
                     self.config.learning_rate,
                     &next_level_beliefs[l + 1],
-                    precision_matrix.as_ref()
+                    level_precision_matrix.as_ref(),
+                    self.config.mu_pc_scaling
                 )?;
             }
         }
@@ -414,6 +489,114 @@ impl PredictiveCoding {
             return Err(PCError("Level index out of bounds".to_string()));
         }
         Ok(&self.levels[level].errors)
+    }
+
+    /// Export memory as a JSON-serializable structure for human-readable inspection.
+    /// Returns a serde_json::Value containing hierarchy configuration, weights, beliefs, and errors.
+    pub fn export_memory(&self) -> Result<serde_json::Value, PCError> {
+        use serde_json::json;
+
+        let mut levels_json = Vec::new();
+        for (i, level) in self.levels.iter().enumerate() {
+            // Extract tensor data as flat vectors (could be large)
+            let weights_shape = level.weights.shape().dims2()?;
+            let beliefs_shape = level.beliefs.shape().dims2()?;
+            let errors_shape = level.errors.shape().dims2()?;
+
+            // Convert tensors to Vec<f32> (flatten)
+            let weights_vec = level.weights.flatten_all()?.to_vec1::<f32>()?;
+            let beliefs_vec = level.beliefs.flatten_all()?.to_vec1::<f32>()?;
+            let errors_vec = level.errors.flatten_all()?.to_vec1::<f32>()?;
+
+            // Limit output size: take first 10 elements for preview
+            let weights_preview: Vec<f32> = weights_vec.iter().take(10).cloned().collect();
+            let beliefs_preview: Vec<f32> = beliefs_vec.iter().take(10).cloned().collect();
+            let errors_preview: Vec<f32> = errors_vec.iter().take(10).cloned().collect();
+
+            levels_json.push(json!({
+                "level": i,
+                "input_dim": weights_shape.0,
+                "output_dim": weights_shape.1,
+                "beliefs_shape": [beliefs_shape.0, beliefs_shape.1],
+                "errors_shape": [errors_shape.0, errors_shape.1],
+                "weights_preview": weights_preview,
+                "beliefs_preview": beliefs_preview,
+                "errors_preview": errors_preview,
+                "weights_total_elements": weights_vec.len(),
+                "beliefs_total_elements": beliefs_vec.len(),
+                "errors_total_elements": errors_vec.len(),
+            }));
+        }
+
+        let config_json = json!({
+            "n_levels": self.config.n_levels,
+            "dim_per_level": self.config.dim_per_level,
+            "learning_rate": self.config.learning_rate,
+            "inference_steps": self.config.inference_steps,
+            "surprise_threshold": self.config.surprise_threshold,
+            "convergence_threshold": self.config.convergence_threshold,
+            "selective_update": self.config.selective_update,
+            "mu_pc_scaling": self.config.mu_pc_scaling,
+            "enable_precision_weighting": self.config.enable_precision_weighting,
+            "free_energy_drop_threshold": self.config.free_energy_drop_threshold,
+            "default_precision": self.config.default_precision,
+            "min_precision": self.config.min_precision,
+            "max_precision": self.config.max_precision,
+            "free_energy_history_size": self.config.free_energy_history_size,
+            "enable_code_verification": self.config.enable_code_verification,
+            "enable_nostr_zap_tracking": self.config.enable_nostr_zap_tracking,
+            "min_zaps_for_consensus": self.config.min_zaps_for_consensus,
+            "persistence_db_path": self.config.persistence_db_path,
+        });
+
+        let result = json!({
+            "config": config_json,
+            "levels": levels_json,
+            "free_energy": self.free_energy,
+            "surprise_threshold": self.surprise_threshold,
+        });
+
+        Ok(result)
+    }
+
+    /// Dream (top‑down generative translation): produce a bottom‑level representation from a top‑level seed.
+    /// The seed should have shape `(batch, dim_per_level.last())`. The returned tensor has shape
+    /// `(batch, dim_per_level[0])`.
+    pub fn dream(&self, top_seed: &Tensor) -> Result<Tensor, PCError> {
+        let (batch, top_dim) = top_seed.shape().dims2()?;
+        let expected_top_dim = self.config.dim_per_level.last().ok_or_else(||
+            PCError("Hierarchy has no levels".to_string())
+        )?;
+        if top_dim != *expected_top_dim {
+            return Err(PCError(format!(
+                "Top seed dimension {} does not match top level dimension {}",
+                top_dim, expected_top_dim
+            )));
+        }
+
+        // Start with the seed as the current representation at the top level
+        let mut current = top_seed.clone();
+
+        // Traverse levels from top to bottom (excluding the bottom level, which is the target)
+        for l in (0..self.levels.len() - 1).rev() {
+            // Use the weight matrix U_l^T to project from level l+1 to level l
+            let weight_t = self.levels[l].weights.t()?;
+            // current shape: (batch, dim_{l+1})
+            // weight_t shape: (dim_{l+1}, dim_l)
+            // result shape: (batch, dim_l)
+            current = current.matmul(&weight_t)?;
+            // Optionally apply a non‑linearity? For pure linear generative mapping we keep as is.
+            // Could add ReLU or sigmoid, but we keep it linear for now.
+        }
+
+        tracing::info!(
+            "PC dreaming completed: seed shape ({}, {}), generated shape {:?}",
+            batch,
+            top_dim,
+            current.shape()
+        );
+
+        Ok(current)
     }
 }
 
@@ -528,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_edge_case_zero_input() -> Result<(), PCError> {
-        let config = PCConfig::new(3, vec![8, 4, 2]);
+        let config = PCConfig::new(3, vec![8, 4, 2]).with_convergence_threshold(-1.0);
         let mut pc = PredictiveCoding::new(config)?;
         
         let device = Device::Cpu;

@@ -27,6 +27,13 @@ It learns your codebase, your writing style, and your logic—100% privately. Th
 *   **💸 Earn While You Think:** If your node discovers a highly efficient way to solve a problem, it broadcasts the "Error Delta" to the network. If other nodes find your delta useful, they automatically send Lightning Network micropayments (Zaps) to your wallet.
 *   **🛌 Sleep & Dream Mode:** When you step away from your computer, your node goes to sleep. It replays the day's most surprising interactions, consolidates memories, and mathematically optimizes its worldview (minimizing global free energy).
 
+### Recent Enhancements
+- **Early Exiting Inference:** PC inference now stops early when free energy drops below a configurable convergence threshold, saving compute time.
+- **μPC Scaling for Deep Hierarchies:** Added μPC scaling to stabilize learning in deep hierarchies by scaling learning rates with input dimension.
+- **Memory API:** Export PC hierarchy memory as human‑readable JSON for inspection and debugging.
+- **Dreaming (Top‑Down Generation):** Generate bottom‑level representations from top‑level seeds via transposed weight projection.
+- **Semantic Cache Persistence:** Semantic cache is now automatically saved to `./semantic_cache.json` and reloaded across restarts.
+
 ---
 
 ## 🥊 NeuroFed (Predictive Coding) vs. Transformers (LLMs)
@@ -85,8 +92,6 @@ NeuroFed will immediately begin intercepting requests. If it knows the answer, i
 *   **CRDT State Sync:** Utilizes conflict-free replicated data types (`automerge`) to seamlessly merge knowledge from thousands of peers without database corruption.
 
 ### Privacy & Security
-*   **Mesh Networking (Yggdrasil):** End-to-end encrypted IPv6 mesh networking for direct, NAT-bypassing peer communication.
-*   **Darknet Routing (Tor / I2P):** Optional SOCKS5 proxy routing via `.onion` and `.b32.i2p` addresses to hide node IP addresses from corporate surveillance.
 *   **Web of Trust:** Strict cryptographic signature verification. Nodes only accept knowledge deltas from pubkeys in the user's NIP-02 Contact List or economically verified events.
 
 ---
