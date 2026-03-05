@@ -278,6 +278,20 @@ impl PredictiveCoding {
     }
 
     pub fn infer(&mut self, input: &Tensor, steps: usize) -> Result<SurpriseStats, PCError> {
+        // Auto-align input tensor shape: PC expects (embedding_dim, 1)
+        // If input is (1, embedding_dim), transpose it
+        let input = if input.shape().dims()[0] == 1 && input.shape().dims()[1] == self.config.dim_per_level[0] {
+            match input.t() {
+                Ok(transposed) => {
+                    tracing::debug!("PC infer: transposed input from {:?} to {:?}", input.shape(), transposed.shape());
+                    transposed
+                }
+                Err(e) => return Err(PCError(format!("Failed to transpose input tensor: {}", e))),
+            }
+        } else {
+            input.clone()
+        };
+        
         let (input_dim, _) = input.shape().dims2()?;
         if input_dim != self.config.dim_per_level[0] {
             tracing::debug!("PC infer: input_dim={}, config.dim_per_level[0]={}, config.dim_per_level={:?}",
@@ -289,7 +303,7 @@ impl PredictiveCoding {
         tracing::debug!("PC infer: input shape {:?}, steps {}", input.shape(), steps);
         
         // Initialize bottom level with input
-        self.levels[0].beliefs = input.clone();
+        self.levels[0].beliefs = input;
         
         let mut stats = SurpriseStats::default();
         
@@ -598,6 +612,76 @@ impl PredictiveCoding {
         );
 
         Ok(current)
+    }
+
+    /// Inject pre-trained weights from GGUF model into PC hierarchy
+    /// This makes PC hierarchy a "mathematical continuation" of the pre-trained model
+    pub fn inject_pretrained_weights(&mut self, ml_engine: &crate::ml_engine::MLEngine) -> Result<(), PCError> {
+        use candle_core::Tensor;
+        
+        tracing::info!("Injecting pre-trained weights from GGUF into PC hierarchy");
+        
+        // Extract layer weights from GGUF
+        // For TinyLlama, we can use blk.0.ffn_down.weight (shape: [2048, 5632])
+        // or other layer weights that match our PC hierarchy dimensions
+        let layer_weight_names = vec![
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+        ];
+        
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            if i >= layer_weight_names.len() {
+                break; // No more layer weights to inject
+            }
+            
+            let tensor_name = layer_weight_names[i];
+            match ml_engine.extract_layer_weight(tensor_name) {
+                Ok(weight_tensor) => {
+                    let weight_shape = weight_tensor.shape();
+                    let level_shape = level.weights.shape();
+                    
+                    tracing::info!("Level {}: GGUF tensor {} shape {:?}, PC weights shape {:?}",
+                        i, tensor_name, weight_shape, level_shape);
+                    
+                    // Check if dimensions are compatible
+                    if weight_shape.dims().len() == 2 {
+                        let (gguf_rows, gguf_cols) = (weight_shape.dims()[0], weight_shape.dims()[1]);
+                        let (pc_rows, pc_cols) = level_shape.dims2()?;
+                        
+                        // We need to transpose if necessary and potentially slice/reshape
+                        // For now, we'll use the weight tensor as-is if dimensions match
+                        if gguf_rows == pc_rows && gguf_cols == pc_cols {
+                            level.weights = weight_tensor;
+                            tracing::info!("Successfully injected {} into PC level {}", tensor_name, i);
+                        } else {
+                            tracing::warn!("Dimension mismatch: GGUF {}x{} vs PC {}x{}",
+                                gguf_rows, gguf_cols, pc_rows, pc_cols);
+                            // Try to transpose if that matches
+                            if gguf_rows == pc_cols && gguf_cols == pc_rows {
+                                let transposed = weight_tensor.t()
+                                    .map_err(|e| PCError(format!("Failed to transpose GGUF weight: {}", e)))?;
+                                level.weights = transposed;
+                                tracing::info!("Transposed and injected {} into PC level {}", tensor_name, i);
+                            } else {
+                                tracing::warn!("Cannot inject {} - dimension mismatch, keeping random weights", tensor_name);
+                            }
+                        }
+                    } else {
+                        tracing::warn!("GGUF tensor {} has unexpected rank {}, skipping",
+                            tensor_name, weight_shape.dims().len());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to extract {} from GGUF: {}, keeping random weights", tensor_name, e);
+                }
+            }
+        }
+        
+        Ok(())
     }
 }
 

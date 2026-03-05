@@ -49,40 +49,76 @@ impl BootstrapManager {
         };
         drop(engine); // Release engine lock
 
-        // Flatten & reshape for PC
+        // Get embedding dimension from ML engine
+        let engine = self.ml_engine.lock().await;
+        let embedding_dim = engine.embedding_dim();
+        drop(engine);
+
+        // Get PC dimension
         let pc_dim = self.pc_hierarchy.lock().await.config.dim_per_level[0];
         
-        // Convert to vec
-        let data = match tensor.to_vec1::<f32>() {
-            Ok(d) => d,
+        // Ensure tensor is 2D with shape (1, embedding_dim)
+        let tensor = match tensor.reshape((1, embedding_dim)) {
+            Ok(t) => t,
             Err(e) => {
-                warn!("Failed to convert tensor to vec: {}", e);
+                warn!("Failed to reshape tensor to (1, {}): {}", embedding_dim, e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
         
-        let mut processed_data = if data.len() >= pc_dim {
-            data[..pc_dim].to_vec()
-        } else {
-            let mut resized = data;
-            resized.resize(pc_dim, 0.0);
-            resized
-        };
-
-        // Ensure we have enough data
-        if processed_data.len() < pc_dim {
-            processed_data.resize(pc_dim, 0.0);
-        }
-
-        let pc_tensor = match candle_core::Tensor::from_vec(
-            processed_data,
-            (pc_dim, 1),
-            &candle_core::Device::Cpu
-        ) {
+        // Transpose from (1, embedding_dim) to (embedding_dim, 1) for PC hierarchy
+        let tensor_t = match tensor.t() {
             Ok(t) => t,
             Err(e) => {
-                warn!("Failed to create tensor for PC: {}", e);
+                warn!("Failed to transpose tensor: {}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
+            }
+        };
+        
+        // Flatten & reshape for PC if dimensions don't match
+        let pc_tensor = if embedding_dim == pc_dim {
+            // Dimensions match, use as-is
+            tensor_t
+        } else {
+            // Dimensions don't match, need to resize
+            // Convert to vec
+            let data = match tensor_t.flatten_all() {
+                Ok(flat_tensor) => match flat_tensor.to_vec1::<f32>() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to convert tensor to vec: {}", e);
+                        return Err(Box::new(e) as Box<dyn std::error::Error>);
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to flatten tensor: {}", e);
+                    return Err(Box::new(e) as Box<dyn std::error::Error>);
+                }
+            };
+            
+            let mut processed_data = if data.len() >= pc_dim {
+                data[..pc_dim].to_vec()
+            } else {
+                let mut resized = data;
+                resized.resize(pc_dim, 0.0);
+                resized
+            };
+
+            // Ensure we have enough data
+            if processed_data.len() < pc_dim {
+                processed_data.resize(pc_dim, 0.0);
+            }
+
+            match candle_core::Tensor::from_vec(
+                processed_data,
+                (pc_dim, 1),
+                &candle_core::Device::Cpu
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("Failed to create tensor for PC: {}", e);
+                    return Err(Box::new(e) as Box<dyn std::error::Error>);
+                }
             }
         };
 

@@ -192,7 +192,17 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
 
     let mut pc = PredictiveCoding::new(pc_config)?;
 
-    // Inject saved weights into the PC Hierarchy
+    // Inject pre-trained weights from GGUF model into PC hierarchy
+    // This makes PC hierarchy a "mathematical continuation" of the pre-trained model
+    {
+        let engine = local_engine.lock().await;
+        match pc.inject_pretrained_weights(&engine) {
+            Ok(_) => info!("Successfully injected pre-trained weights from GGUF into PC hierarchy"),
+            Err(e) => warn!("Failed to inject pre-trained weights: {}", e),
+        }
+    }
+
+    // Inject saved weights into the PC Hierarchy (overrides pre-trained weights if they exist)
     if !saved_levels.is_empty() {
         info!("Loading {} levels from database...", saved_levels.len());
         let mut loaded_count = 0;

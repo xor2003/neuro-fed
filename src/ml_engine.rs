@@ -7,6 +7,7 @@ use candle_core::{Device, Tensor, DType};
 use tokenizers::Tokenizer;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::warn;
 use crate::types::{DeviceType, MLError};
 use crate::model_manager::ModelManager;
 
@@ -16,21 +17,87 @@ pub struct MLEngine {
     tokenizer: Tokenizer,
     device: Device,
     embedding_dim: usize, // Store the actual embedding dimension from the model
+    model_path: String,   // Store the path to the GGUF file for later weight extraction
 }
 
 impl MLEngine {
     /// Load the Motor Cortex (Eyes and Mouth) from a GGUF file
     pub fn new(model_path: &str, _device_type: DeviceType) -> Result<Self, MLError> {
-        let device = Device::Cpu; // Keep it under 100MB RAM by staying on CPU/Mmap
-        
-        // 1. Load Tokenizer (Essential for "Eyes")
-        // We expect tokenizer.json to be in the same directory or we use a default
+        // Default tokenizer path: tokenizer.json in same directory as model
         let tokenizer_path = Path::new(model_path).parent()
             .unwrap_or(Path::new("."))
-            .join("tokenizer.json");
+            .join("tokenizer.json")
+            .to_string_lossy()
+            .to_string();
         
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| MLError::ModelLoadError(format!("Missing tokenizer.json: {}", e)))?;
+        Self::new_with_tokenizer(model_path, &tokenizer_path, _device_type)
+    }
+
+    /// Create an ML engine using a ModelManager to handle model selection and downloading
+    pub async fn new_with_manager(
+        model_manager: Arc<ModelManager>,
+        model_name: &str,
+    ) -> Result<Self, MLError> {
+        // Get recommended model from manager
+        let recommended_model = model_manager
+            .get_recommended_model()
+            .await
+            .map_err(|e| MLError::ModelLoadError(e.to_string()))?;
+
+        // Ensure model is downloaded (this will also download tokenizer if needed)
+        if !model_manager.is_model_downloaded(&recommended_model.name).await {
+            model_manager
+                .download_model(&recommended_model.name)
+                .await
+                .map_err(|e| MLError::ModelLoadError(e.to_string()))?;
+        }
+
+        // Get tokenizer path from model info
+        let tokenizer_path = recommended_model.tokenizer_local_path
+            .unwrap_or_else(|| {
+                // Fallback: use tokenizer.json in same directory as model
+                let model_path = Path::new(&recommended_model.local_path);
+                model_path.parent()
+                    .unwrap_or(Path::new("."))
+                    .join("tokenizer.json")
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        // Use the existing constructor with the local path and tokenizer path
+        // Device type is not used in current implementation; we pass a dummy.
+        let device_type = DeviceType {
+            name: "cpu".to_string(),
+            description: "CPU".to_string(),
+            supported: true,
+        };
+        Self::new_with_tokenizer(&recommended_model.local_path, &tokenizer_path, device_type)
+    }
+
+    /// Create an ML engine with explicit tokenizer path
+    pub fn new_with_tokenizer(
+        model_path: &str,
+        tokenizer_path: &str,
+        _device_type: DeviceType,
+    ) -> Result<Self, MLError> {
+        let device = Device::Cpu; // Keep it under 100MB RAM by staying on CPU/Mmap
+        
+        // 1. Load Tokenizer from specified path
+        let tokenizer = if Path::new(tokenizer_path).exists() {
+            Tokenizer::from_file(tokenizer_path)
+                .map_err(|e| MLError::ModelLoadError(format!("Invalid tokenizer.json at {}: {}", tokenizer_path, e)))?
+        } else {
+            // Fallback: Attempt to download tokenizer if missing
+            warn!("tokenizer.json not found at {}. Trying to download from HuggingFace Hub...", tokenizer_path);
+            let api = hf_hub::api::sync::Api::new()
+                .map_err(|e| MLError::ModelLoadError(e.to_string()))?;
+            // Use TinyLlama as a generic fallback - this should work for most Llama-based models
+            let repo = api.model("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".to_string());
+            let tok_path = repo.get("tokenizer.json")
+                .map_err(|e| MLError::ModelLoadError(format!("Failed to download tokenizer: {}", e)))?;
+            Tokenizer::from_file(tok_path)
+                .map_err(|e| MLError::ModelLoadError(e.to_string()))?
+        };
 
         // 2. Open GGUF File
         let mut file = std::fs::File::open(model_path)
@@ -57,7 +124,6 @@ impl MLEngine {
         let embedding_dim = Self::extract_embedding_dim(&content, &token_embeddings)
             .unwrap_or_else(|| {
                 tracing::warn!("Could not extract embedding dimension from GGUF metadata, using tensor shape inference");
-                // Fallback: use token_embeddings shape [vocab_size, embedding_dim]
                 let shape = token_embeddings.shape();
                 let dims = shape.dims();
                 if dims.len() >= 2 {
@@ -76,36 +142,8 @@ impl MLEngine {
             tokenizer,
             device,
             embedding_dim,
+            model_path: model_path.to_string(),
         })
-    }
-
-    /// Create an ML engine using a ModelManager to handle model selection and downloading
-    pub async fn new_with_manager(
-        model_manager: Arc<ModelManager>,
-        model_name: &str,
-    ) -> Result<Self, MLError> {
-        // Get recommended model from manager
-        let recommended_model = model_manager
-            .get_recommended_model()
-            .await
-            .map_err(|e| MLError::ModelLoadError(e.to_string()))?;
-
-        // Ensure model is downloaded
-        if !model_manager.is_model_downloaded(&recommended_model.name).await {
-            model_manager
-                .download_model(&recommended_model.name)
-                .await
-                .map_err(|e| MLError::ModelLoadError(e.to_string()))?;
-        }
-
-        // Use the existing constructor with the local path
-        // Device type is not used in current implementation; we pass a dummy.
-        let device_type = DeviceType {
-            name: "cpu".to_string(),
-            description: "CPU".to_string(),
-            supported: true,
-        };
-        Self::new(&recommended_model.local_path, device_type)
     }
 
     /// Extract embedding dimension from GGUF metadata or tensor shape
@@ -196,9 +234,46 @@ impl MLEngine {
 
     /// "The Mouth": Convert a PC Brain "belief" vector back into English tokens
     pub fn decode_belief(&self, belief: &Tensor) -> Result<String, MLError> {
-        // 1. Project belief (2048) through LM Head to get Vocab Logits
-        // lm_head is (vocab_size, 2048)
-        let logits = belief.matmul(&self.lm_head.t().map_err(|e| MLError::InvalidResponse(e.to_string()))?)
+        // Log tensor shapes for debugging
+        let belief_shape = belief.shape();
+        let lm_head_shape = self.lm_head.shape();
+        tracing::debug!("decode_belief: belief shape {:?}, lm_head shape {:?}", belief_shape, lm_head_shape);
+
+        // Check vocabulary size compatibility
+        let tokenizer_vocab_size = self.tokenizer.get_vocab_size(true);
+        let lm_head_vocab_size = lm_head_shape.dims()[0];
+        if tokenizer_vocab_size as usize != lm_head_vocab_size {
+            tracing::warn!("Vocabulary size mismatch: tokenizer={}, lm_head={}. This may cause decoding issues.",
+                tokenizer_vocab_size, lm_head_vocab_size);
+        }
+
+        // 1. Project belief through LM Head to get Vocab Logits
+        // belief shape should be (1, embedding_dim) or (embedding_dim, 1)
+        // lm_head shape is (vocab_size, embedding_dim)
+        // We need belief * lm_head^T to get (1, vocab_size)
+        
+        // First, ensure belief is (1, embedding_dim)
+        let belief_2d = if belief_shape.rank() == 1 {
+            // Reshape from (embedding_dim,) to (1, embedding_dim)
+            belief.reshape((1, belief_shape.dims()[0]))
+                .map_err(|e| MLError::InvalidResponse(format!("Failed to reshape belief tensor: {}", e)))?
+        } else if belief_shape.rank() == 2 && belief_shape.dims()[0] == 1 {
+            // Already (1, embedding_dim)
+            belief.clone()
+        } else if belief_shape.rank() == 2 && belief_shape.dims()[1] == 1 {
+            // (embedding_dim, 1) -> transpose to (1, embedding_dim)
+            belief.t()
+                .map_err(|e| MLError::InvalidResponse(format!("Failed to transpose belief tensor: {}", e)))?
+        } else {
+            return Err(MLError::InvalidResponse(format!("Unexpected belief tensor shape: {:?}", belief_shape)));
+        };
+
+        // Transpose LM Head: (vocab_size, embedding_dim) -> (embedding_dim, vocab_size)
+        let lm_head_t = self.lm_head.t()
+            .map_err(|e| MLError::InvalidResponse(format!("Failed to transpose LM Head: {}", e)))?;
+
+        // Matrix multiply: (1, embedding_dim) * (embedding_dim, vocab_size) = (1, vocab_size)
+        let logits = belief_2d.matmul(&lm_head_t)
             .map_err(|e| MLError::InvalidResponse(format!("LM Head projection failed: {}", e)))?;
 
         // 2. Sample the most likely token (Greedy for now)
@@ -216,10 +291,18 @@ impl MLEngine {
             }
         }
 
+        // Ensure token ID is within vocabulary bounds
+        if max_idx >= tokenizer_vocab_size as usize {
+            tracing::warn!("Token ID {} exceeds tokenizer vocabulary size {}, clamping to {}",
+                max_idx, tokenizer_vocab_size, tokenizer_vocab_size - 1);
+            max_idx = tokenizer_vocab_size as usize - 1;
+        }
+
         // 3. Convert ID back to string
         let word = self.tokenizer.decode(&[max_idx as u32], true)
             .map_err(|e| MLError::InvalidResponse(format!("Decode error: {}", e)))?;
 
+        tracing::debug!("decode_belief: decoded token ID {} -> '{}'", max_idx, word);
         Ok(word)
     }
 
@@ -234,6 +317,49 @@ impl MLEngine {
         info.insert("embedding_dim".to_string(), self.embedding_dim.to_string());
         info.insert("vocab_size".to_string(), self.tokenizer.get_vocab_size(true).to_string());
         info
+    }
+
+    /// Extract a specific layer weight tensor from the GGUF file
+    /// This allows loading pre-trained weights for PC hierarchy initialization
+    pub fn extract_layer_weight(&self, tensor_name: &str) -> Result<Tensor, MLError> {
+        // Reopen the GGUF file to extract additional tensors
+        let mut file = std::fs::File::open(&self.model_path)
+            .map_err(|e| MLError::ModelLoadError(format!("Failed to open GGUF for weight extraction: {}", e)))?;
+        
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| MLError::ModelLoadError(format!("GGUF Read Error for weight extraction: {}", e)))?;
+        
+        // Extract the requested tensor
+        let tensor = content.tensor(&mut file, tensor_name, &self.device)
+            .map_err(|e| MLError::ModelLoadError(format!("Missing tensor {}: {}", tensor_name, e)))?
+            .dequantize(&self.device)
+            .map_err(|e| MLError::ModelLoadError(format!("Dequantize Error for {}: {}", tensor_name, e)))?;
+        
+        tracing::info!("Extracted layer weight {} with shape {:?}", tensor_name, tensor.shape());
+        Ok(tensor)
+    }
+
+    /// Get a list of available layer weight tensor names from the GGUF file
+    pub fn list_layer_weights(&self) -> Result<Vec<String>, MLError> {
+        let mut file = std::fs::File::open(&self.model_path)
+            .map_err(|e| MLError::ModelLoadError(format!("Failed to open GGUF for listing: {}", e)))?;
+        
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| MLError::ModelLoadError(format!("GGUF Read Error for listing: {}", e)))?;
+        
+        // Filter for layer weights (e.g., blk.*.ffn_down.weight, blk.*.attn_q.weight, etc.)
+        let layer_weights: Vec<String> = content.tensor_infos.iter()
+            .filter_map(|(name, _)| {
+                if name.contains("blk.") && (name.contains(".weight") || name.contains(".bias")) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        tracing::info!("Found {} layer weights in GGUF file", layer_weights.len());
+        Ok(layer_weights)
     }
 
     pub fn clear_cache(&self) {}

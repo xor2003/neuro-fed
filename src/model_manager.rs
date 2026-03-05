@@ -27,6 +27,8 @@ pub struct ModelInfo {
     pub quantization: String,
     pub download_url: String,
     pub local_path: String,
+    pub tokenizer_url: Option<String>,
+    pub tokenizer_local_path: Option<String>,
 }
 
 /// Model download progress
@@ -267,13 +269,31 @@ impl ModelManager {
 
         if self.is_model_downloaded(model_name).await {
             info!("Model {} already downloaded", model_name);
-            return Ok(());
+        } else {
+            info!("Starting download for model: {}", model_name);
+            self.download_file(&model.download_url, Path::new(&model.local_path)).await?;
+            info!("Model {} downloaded successfully", model_name);
         }
 
-        info!("Starting download for model: {}", model_name);
-        
-        let url = &model.download_url;
-        let file_path = Path::new(&model.local_path);
+        // Download tokenizer if URL is provided
+        if let Some(tokenizer_url) = &model.tokenizer_url {
+            if let Some(tokenizer_path) = &model.tokenizer_local_path {
+                let tokenizer_path = Path::new(tokenizer_path);
+                if !tokenizer_path.exists() {
+                    info!("Downloading tokenizer for model: {}", model_name);
+                    self.download_file(tokenizer_url, tokenizer_path).await?;
+                    info!("Tokenizer for {} downloaded successfully", model_name);
+                } else {
+                    info!("Tokenizer for {} already exists", model_name);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper function to download a file with progress tracking
+    async fn download_file(&self, url: &str, file_path: &Path) -> Result<(), ModelManagerError> {
         let dir_path = file_path.parent().unwrap();
 
         // Create directory if it doesn't exist
@@ -339,7 +359,7 @@ impl ModelManager {
 
         file.sync_all().await.map_err(|e| ModelManagerError::FileError(e.to_string()))?;
         
-        info!("Model {} downloaded successfully ({} MB)", model_name, downloaded / 1024 / 1024);
+        info!("File downloaded successfully ({} MB)", downloaded / 1024 / 1024);
         Ok(())
     }
 
@@ -442,6 +462,8 @@ impl ModelManager {
             quantization: "Q2_K".to_string(),
             download_url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
             local_path: "models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
+            tokenizer_url: Some("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/raw/main/tokenizer.json".to_string()),
+            tokenizer_local_path: Some("models/tinyllama_tokenizer.json".to_string()),
         });
 
         /*
@@ -455,6 +477,8 @@ impl ModelManager {
             quantization: "Q4_K_M".to_string(),
             download_url: "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf".to_string(),
             local_path: "models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf".to_string(),
+            tokenizer_url: Some("https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct/raw/main/tokenizer.json".to_string()),
+            tokenizer_local_path: Some("models/llama3_tokenizer.json".to_string()),
         });
 
         // Qwen2.5 1.5B Instruct (GGUF, Q4_K_M)
@@ -467,6 +491,8 @@ impl ModelManager {
             quantization: "Q4_K_M".to_string(),
             download_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
             local_path: "models/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
+            tokenizer_url: Some("https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/raw/main/tokenizer.json".to_string()),
+            tokenizer_local_path: Some("models/qwen_tokenizer.json".to_string()),
         });
         */
 
