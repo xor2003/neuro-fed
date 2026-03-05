@@ -80,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend_config,
         local_engine,
         pc_hierarchy,
+        512, // embedding_dim from PC config
     );
 
     // 5. Start the proxy server (in a separate task)

@@ -605,8 +605,10 @@ impl OpenAiProxy {
                 debug!("PC inference completed with surprise: {}", stats.total_surprise);
                 
                 // Check if PC recognizes this pattern (low surprise)
-                // Threshold: if surprise < 0.1, consider it recognized
-                let surprise_threshold = 0.1;
+                // Threshold: if surprise < 1.0, consider it recognized
+                // Note: 0.1 was unrealistic for 2048-dimensional vectors
+                // Using 1.0 (config default) which is more appropriate for L2-normalized vectors
+                let surprise_threshold = 1.0;
                 
                 if stats.total_surprise < surprise_threshold {
                     info!("PC recognizes pattern (surprise: {} < threshold: {})",
@@ -1804,7 +1806,8 @@ mod tests {
             description: "CPU device".to_string(),
             supported: true,
         };
-        let local_engine = Arc::new(Mutex::new(MLEngine::new("test-model", device_type).unwrap()));
+        // Use the default model path from NodeConfig::default()
+        let local_engine = Arc::new(Mutex::new(MLEngine::new(&config.model_path, device_type).unwrap()));
         
         let pc_config = PCConfig::new(3, vec![512, 256, 128]);
         let pc_hierarchy = Arc::new(Mutex::new(PredictiveCoding::new(pc_config).unwrap()));

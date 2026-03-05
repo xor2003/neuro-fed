@@ -355,6 +355,8 @@ pub enum MLError {
     InvalidResponse(String),
     ConfigurationError(String),
     TokenizationError(String),
+    TensorError(String),
+    FileError(String),
 }
 
 impl std::fmt::Display for MLError {
@@ -366,6 +368,8 @@ impl std::fmt::Display for MLError {
             MLError::InvalidResponse(msg) => write!(f, "InvalidResponse: {}", msg),
             MLError::ConfigurationError(msg) => write!(f, "ConfigurationError: {}", msg),
             MLError::TokenizationError(msg) => write!(f, "TokenizationError: {}", msg),
+            MLError::TensorError(msg) => write!(f, "TensorError: {}", msg),
+            MLError::FileError(msg) => write!(f, "FileError: {}", msg),
         }
     }
 }

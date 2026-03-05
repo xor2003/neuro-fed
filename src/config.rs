@@ -406,7 +406,7 @@ impl Default for PCConfig {
             n_levels: 3,
             dim_per_level: vec![2048, 1024, 512],
             learning_rate: 0.01,
-            mu_pc_scaling: false,
+            mu_pc_scaling: true,
             // Precision weighting defaults
             enable_precision_weighting: false,
             free_energy_drop_threshold: 0.5,

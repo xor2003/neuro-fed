@@ -3,7 +3,7 @@
 //! This example tests the OpenAI proxy with OpenRouter API
 
 use neuro_fed_node::{
-    openai_proxy::{OpenAiProxy, OpenAiRequest, Message},
+    openai_proxy::OpenAiProxy,
     config::{NodeConfig, BackendConfig},
     ml_engine::MLEngine,
     pc_hierarchy::{PredictiveCoding, PCConfig},
@@ -12,7 +12,6 @@ use neuro_fed_node::{
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde_json::json;
-use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend_config,
         local_engine,
         pc_hierarchy,
+        512, // embedding_dim from PC config
     );
 
     // 5. Start the proxy server

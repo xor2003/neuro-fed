@@ -60,7 +60,7 @@ impl PCConfig {
             surprise_threshold: 1.0,
             convergence_threshold: 0.01,
             selective_update: true,
-            mu_pc_scaling: false,
+            mu_pc_scaling: true,
             // Precision weighting defaults
             enable_precision_weighting: false,
             free_energy_drop_threshold: 0.5,
@@ -169,6 +169,21 @@ impl PCLevel {
             let broadcasted_precision = precision_matrix.broadcast_as(delta_weights.shape())?;
             delta_weights = (&delta_weights * &broadcasted_precision)?;
         }
+        
+        // --- NEW: GRADIENT CLIPPING TO PREVENT NUMERICAL EXPLOSION ---
+        let clip_threshold = 1.0; // Maximum L2 norm for weight updates
+        let norm_sq = delta_weights.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let norm = norm_sq.sqrt();
+        
+        if norm > clip_threshold {
+            // Scale delta_weights to have norm = clip_threshold
+            let scale = clip_threshold / norm;
+            let scale_tensor = Tensor::from_slice(&[scale], (1, 1), &delta_weights.device())?
+                .broadcast_as(delta_weights.shape())?;
+            delta_weights = (&delta_weights * &scale_tensor)?;
+            tracing::debug!("Gradient clipped: norm {} > threshold {}, scaled by {}", norm, clip_threshold, scale);
+        }
+        // -------------------------------------------------------------
         
         // Use broadcast_add for in-place addition without reallocating
         self.weights = self.weights.broadcast_add(&delta_weights)?;
@@ -316,11 +331,13 @@ impl PredictiveCoding {
             
             // Downward pass: update beliefs based on errors
             for l in (0..self.levels.len() - 1).rev() {
-                // Belief update: r_l = r_l + eta * epsilon_l
+                // Belief update: r_l = r_l - eta * epsilon_l (MUST BE MINUS to minimize free energy)
                 let lr_tensor = Tensor::from_slice(&[self.config.learning_rate], (1, 1), &self.levels[l].errors.device())?
                     .broadcast_as(self.levels[l].errors.shape())?;
                 let update = self.levels[l].errors.mul(&lr_tensor)?;
-                self.levels[l].beliefs = (&self.levels[l].beliefs + &update)?;
+                
+                // 🔴 BUG FIX: Changed + to -
+                self.levels[l].beliefs = (&self.levels[l].beliefs - &update)?;
                 
                 // Propagate error upward to influence beliefs at next level: r_{l+1} += eta * U_l^T · epsilon_l
                 // Only propagate if there is a next level (l+1 exists)
@@ -330,6 +347,7 @@ impl PredictiveCoding {
                     let lr_tensor2 = Tensor::from_slice(&[self.config.learning_rate], (1, 1), &matmul_result.device())?
                         .broadcast_as(matmul_result.shape())?;
                     let belief_update = matmul_result.mul(&lr_tensor2)?;
+                    // NOTE: Upward propagation stays PLUS (Mathematically correct: r_{l+1} = r_{l+1} - eta * dF/dr_{l+1})
                     self.levels[l+1].beliefs = (&self.levels[l+1].beliefs + &belief_update)?;
                 }
             }
@@ -342,8 +360,9 @@ impl PredictiveCoding {
                 stats.high_surprise_indices.push(step);
             }
 
-            // Early exiting: if free energy drops below convergence threshold, stop inference
-            if fe < self.config.convergence_threshold {
+            // ИЗМЕНИ ЭТОТ БЛОК:
+            // Early exiting: stop ONLY if FE is extremely low AND we've thought for at least 3 steps
+            if fe < 0.0001 && step > 3 {
                 tracing::debug!("PC inference converged early at step {} (FE: {:.4})", step, fe);
                 break;
             }
@@ -474,7 +493,11 @@ impl PredictiveCoding {
         for l in 0..self.levels.len() - 1 {
             let prediction_error = (&self.levels[l].beliefs - &self.levels[l].predictions)?;
             let squared_error = prediction_error.sqr()?.sum_all()?.to_scalar::<f32>()?;
-            fe += squared_error;
+            
+            // --- FIX: Convert SSE to MSE ---
+            // Divide the total error by the number of dimensions
+            let (dim, _) = self.levels[l].beliefs.shape().dims2()?;
+            fe += squared_error / (dim as f32);
         }
         
         Ok(fe / self.levels.len() as f32)
@@ -614,73 +637,43 @@ impl PredictiveCoding {
         Ok(current)
     }
 
-    /// Inject pre-trained weights from GGUF model into PC hierarchy
-    /// This makes PC hierarchy a "mathematical continuation" of the pre-trained model
     pub fn inject_pretrained_weights(&mut self, ml_engine: &crate::ml_engine::MLEngine) -> Result<(), PCError> {
-        use candle_core::Tensor;
-        
         tracing::info!("Injecting pre-trained weights from GGUF into PC hierarchy");
         
-        // Extract layer weights from GGUF
-        // For TinyLlama, we can use blk.0.ffn_down.weight (shape: [2048, 5632])
-        // or other layer weights that match our PC hierarchy dimensions
-        let layer_weight_names = vec![
-            "blk.0.ffn_down.weight",
-            "blk.0.ffn_up.weight",
-            "blk.0.attn_q.weight",
-            "blk.0.attn_k.weight",
-            "blk.0.attn_v.weight",
-            "blk.0.attn_output.weight",
-        ];
+        let knowledge_matrix = ml_engine.extract_knowledge_matrix()
+            .map_err(|e| PCError(format!("Failed to extract knowledge matrix: {}", e)))?;
         
+        let knowledge_shape = knowledge_matrix.shape();
+        
+        let levels_len = self.levels.len();
         for (i, level) in self.levels.iter_mut().enumerate() {
-            if i >= layer_weight_names.len() {
-                break; // No more layer weights to inject
-            }
+            // Для последнего слоя веса не обновляем (у него выход 1)
+            if i == levels_len - 1 { continue; }
+
+            let (target_rows, target_cols) = level.weights.shape().dims2()?;
+            let (src_rows, src_cols) = knowledge_shape.dims2()?;
             
-            let tensor_name = layer_weight_names[i];
-            match ml_engine.extract_layer_weight(tensor_name) {
-                Ok(weight_tensor) => {
-                    let weight_shape = weight_tensor.shape();
-                    let level_shape = level.weights.shape();
-                    
-                    tracing::info!("Level {}: GGUF tensor {} shape {:?}, PC weights shape {:?}",
-                        i, tensor_name, weight_shape, level_shape);
-                    
-                    // Check if dimensions are compatible
-                    if weight_shape.dims().len() == 2 {
-                        let (gguf_rows, gguf_cols) = (weight_shape.dims()[0], weight_shape.dims()[1]);
-                        let (pc_rows, pc_cols) = level_shape.dims2()?;
-                        
-                        // We need to transpose if necessary and potentially slice/reshape
-                        // For now, we'll use the weight tensor as-is if dimensions match
-                        if gguf_rows == pc_rows && gguf_cols == pc_cols {
-                            level.weights = weight_tensor;
-                            tracing::info!("Successfully injected {} into PC level {}", tensor_name, i);
-                        } else {
-                            tracing::warn!("Dimension mismatch: GGUF {}x{} vs PC {}x{}",
-                                gguf_rows, gguf_cols, pc_rows, pc_cols);
-                            // Try to transpose if that matches
-                            if gguf_rows == pc_cols && gguf_cols == pc_rows {
-                                let transposed = weight_tensor.t()
-                                    .map_err(|e| PCError(format!("Failed to transpose GGUF weight: {}", e)))?;
-                                level.weights = transposed;
-                                tracing::info!("Transposed and injected {} into PC level {}", tensor_name, i);
-                            } else {
-                                tracing::warn!("Cannot inject {} - dimension mismatch, keeping random weights", tensor_name);
-                            }
-                        }
-                    } else {
-                        tracing::warn!("GGUF tensor {} has unexpected rank {}, skipping",
-                            tensor_name, weight_shape.dims().len());
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to extract {} from GGUF: {}, keeping random weights", tensor_name, e);
+            // Вычисляем, сколько мы можем отрезать (Surgical Slicing)
+            let rows_to_take = src_rows.min(target_rows);
+            let cols_to_take = src_cols.min(target_cols);
+            
+            if rows_to_take > 0 && cols_to_take > 0 {
+                // Отрезаем нужный кусок от большой матрицы GGUF
+                let sliced = knowledge_matrix
+                    .narrow(0, 0, rows_to_take).unwrap()
+                    .narrow(1, 0, cols_to_take).unwrap();
+                
+                // Если отрезанный кусок идеально совпадает с нашим слоем — вставляем!
+                if rows_to_take == target_rows && cols_to_take == target_cols {
+                    // Assign the sliced tensor directly (Note: user suggested .set() but we use Tensor)
+                    level.weights = sliced;
+                    tracing::info!("✅ Level {}: Successfully injected {}x{} weights from GGUF", i, target_rows, target_cols);
+                } else {
+                    tracing::warn!("Level {}: Sliced matrix {}x{} doesn't fill target {}x{}. Keeping random.", 
+                        i, rows_to_take, cols_to_take, target_rows, target_cols);
                 }
             }
         }
-        
         Ok(())
     }
 }
@@ -920,6 +913,61 @@ mod tests {
         let config = PCConfig::new(3, vec![512, 256, 128]);
         let pc = PredictiveCoding::new(config)?;
         assert_eq!(pc.levels.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_early_exiting_prevention() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let config = PCConfig::new(3, vec![2048, 1024, 512]);
+        let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+        
+        let zero_input = Tensor::zeros((2048, 1), DType::F32, &device)
+            .map_err(|e| PCError(e.to_string()))?;
+        
+        // Инференс нулей мгновенно дает нулевую ошибку.
+        // Мы ожидаем, что он выполнит МИНИМУМ 4 шага (step 0, 1, 2, 3), прежде чем прервется.
+        let stats = pc.infer(&zero_input, 15)?;
+        
+        assert!(stats.free_energy_history.len() > 3, "Inference must not exit before step 3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_free_energy_is_mse_not_sse() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        
+        // Create a TINY hierarchy
+        let config_small = PCConfig::new(2, vec![10, 5]);
+        let mut pc_small = PredictiveCoding::new_with_device(config_small, &device)?;
+        let input_small = Tensor::randn(0f32, 1.0, (10, 1), &device)?;
+        
+        // Create a MASSIVE hierarchy
+        let config_large = PCConfig::new(2, vec![2000, 1000]);
+        let mut pc_large = PredictiveCoding::new_with_device(config_large, &device)?;
+        let input_large = Tensor::randn(0f32, 1.0, (2000, 1), &device)?;
+
+        // Run 1 step of inference
+        let stats_small = pc_small.infer(&input_small, 1)?;
+        let stats_large = pc_large.infer(&input_large, 1)?;
+
+        let fe_small = stats_small.free_energy_history.last().unwrap();
+        let fe_large = stats_large.free_energy_history.last().unwrap();
+
+        // If the codebase regresses to Sum of Squared Errors (SSE),
+        // the large hierarchy will have ~200x more Free Energy than the small one.
+        // If the code is correctly using Mean Squared Error (MSE),
+        // the ratio between the two will be close to 1.0.
+        let ratio = fe_large / fe_small;
+        
+        assert!(
+            ratio > 0.5 && ratio < 2.0,
+            "REGRESSION DETECTED: Free Energy is scaling with dimensionality! \
+            This means you are using SSE instead of MSE in `compute_free_energy`. \
+            fe_small: {:.4}, fe_large: {:.4}, Ratio: {:.2}",
+            fe_small, fe_large, ratio
+        );
+
         Ok(())
     }
 

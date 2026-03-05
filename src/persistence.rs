@@ -76,8 +76,10 @@ impl PCPersistence {
         
         // For in-memory database, use special handling
         let options = if db_path == ":memory:" {
+            // For in-memory databases with connection pooling, we need to use a shared cache
+            // so all connections in the pool share the same in-memory database
             SqliteConnectOptions::new()
-                .filename(":memory:")
+                .filename("file::memory:?cache=shared")
         } else {
             // Ensure parent directory exists for file-based databases
             if let Some(parent) = std::path::Path::new(db_path).parent() {
