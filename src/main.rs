@@ -156,14 +156,35 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
         ).await?
     ));
     
-    // Create Predictive Coding hierarchy
-    let pc_config: neuro_fed_node::pc_hierarchy::PCConfig = config.pc_config.clone().into();
+    // Extract embedding dimension from the loaded model
+    let embedding_dim = {
+        let engine = local_engine.lock().await;
+        engine.embedding_dim()
+    };
+    info!("Detected model embedding dimension: {}", embedding_dim);
     
-    // Initialize persistence
+    // Create Predictive Coding hierarchy with dynamic dimension
+    let mut pc_config: neuro_fed_node::pc_hierarchy::PCConfig = config.pc_config.clone().into();
+    
+    // Update the first level dimension to match the model's embedding dimension
+    if !pc_config.dim_per_level.is_empty() {
+        pc_config.dim_per_level[0] = embedding_dim;
+        info!("Updated PC hierarchy dimensions: {:?}", pc_config.dim_per_level);
+    } else {
+        // If dim_per_level is empty, create a default hierarchy with the detected dimension
+        pc_config.dim_per_level = vec![embedding_dim, embedding_dim / 2, embedding_dim / 4];
+        pc_config.n_levels = pc_config.dim_per_level.len();
+        info!("Created new PC hierarchy with dimensions: {:?}", pc_config.dim_per_level);
+    }
+    
+    // Initialize persistence with absolute path to avoid SQLite "unable to open database file" errors
     let db_path = pc_config.persistence_db_path.clone().unwrap_or_else(|| {
-        // Use relative path to avoid issues with absolute path parsing in SQLite
-        "neurofed.db".to_string()
+        // Convert relative path to absolute path
+        std::env::current_dir()
+            .map(|cwd| cwd.join("neurofed.db").to_string_lossy().to_string())
+            .unwrap_or_else(|_| "neurofed.db".to_string())
     });
+    info!("Initializing database at path: {}", db_path);
     let persistence = neuro_fed_node::persistence::PCPersistence::new(&db_path).await.expect("Failed to init DB");
 
     // Try to load existing weights
@@ -203,7 +224,7 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
         info!("No saved weights found and bootstrap enabled, running bootstrap learning phase...");
         
         // Create BootstrapManager
-        let bootstrapper = neuro_fed_node::bootstrap::BootstrapManager::new(
+        let mut bootstrapper = neuro_fed_node::bootstrap::BootstrapManager::new(
             config.bootstrap_config.clone(),
             local_engine.clone(),
             pc_hierarchy.clone()
@@ -218,12 +239,13 @@ async fn start_daemon(port: u16, host: String) -> Result<(), Box<dyn Error>> {
     
     info!("NeuroPC Node initialized successfully");
 
-    // Create OpenAI proxy
+    // Create OpenAI proxy with dynamic embedding dimension
     let proxy: OpenAiProxy = OpenAiProxy::new(
         config,
         proxy_config,
         local_engine,
         pc_hierarchy,
+        embedding_dim,
     );
 
     info!("Starting OpenAI proxy server on {}:{}", host, port);

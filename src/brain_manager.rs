@@ -164,7 +164,7 @@ impl BrainManager {
         }
 
         // Load safetensors bytes.
-        let brain_bytes = BlossomClient::load_brain(&record.local_path, Some(brain_id))?;
+        let brain_bytes = BlossomClient::load_brain(&record.local_path, Some(brain_id)).await?;
 
         // Update loaded brain ID.
         self.loaded_brain_id = Some(brain_id.to_string());
@@ -216,7 +216,8 @@ impl BrainManager {
             .await?;
 
         // Compute hash to verify.
-        let computed_hash = BlossomClient::compute_file_hash(&downloaded_path)?;
+        let computed_hash_result = BlossomClient::compute_file_hash(&downloaded_path).await;
+        let computed_hash = computed_hash_result?;
         if computed_hash != brain_id {
             return Err(BrainManagerError::InvalidBrain(format!(
                 "Hash mismatch: expected {}, got {}",

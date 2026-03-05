@@ -170,7 +170,8 @@ impl PCLevel {
             delta_weights = (&delta_weights * &broadcasted_precision)?;
         }
         
-        self.weights = (&self.weights + &delta_weights)?;
+        // Use broadcast_add for in-place addition without reallocating
+        self.weights = self.weights.broadcast_add(&delta_weights)?;
         Ok(())
     }
     

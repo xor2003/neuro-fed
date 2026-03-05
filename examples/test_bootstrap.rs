@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pc = Arc::new(Mutex::new(PredictiveCoding::new_with_device(pc_config, &device)?));
     
     // Create BootstrapManager
-    let bootstrapper = BootstrapManager::new(
+    let mut bootstrapper = BootstrapManager::new(
         config,
         ml_engine,
         pc,

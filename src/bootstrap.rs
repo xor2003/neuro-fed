@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
 use walkdir::WalkDir;
 use serde_json;
+use std::fs::File;
+use std::io::Write;
 
 use crate::ml_engine::MLEngine;
 use crate::pc_hierarchy::{PredictiveCoding, PCError};
@@ -17,6 +19,7 @@ pub struct BootstrapManager {
     config: BootstrapConfig,
     ml_engine: Arc<Mutex<MLEngine>>,
     pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+    qa_pairs: Vec<(String, String)>, // Store (question, answer) pairs
 }
 
 impl BootstrapManager {
@@ -29,6 +32,7 @@ impl BootstrapManager {
             config,
             ml_engine,
             pc_hierarchy,
+            qa_pairs: Vec::new(),
         }
     }
 
@@ -100,10 +104,11 @@ impl BootstrapManager {
     }
 
     /// Run the bootstrapping process on local directories
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("🚀 Starting Bootstrap Learning Phase...");
         let mut total_files = 0;
         let mut total_chunks = 0;
+        let mut local_qa_pairs = Vec::new();
 
         for dir_path in &self.config.document_paths {
             let path = Path::new(dir_path);
@@ -126,7 +131,7 @@ impl BootstrapManager {
                 // Handle different file types
                 if ext == "jsonl" {
                     // Process JSONL files with request-response format
-                    let content = match std::fs::read_to_string(entry.path()) {
+                    let content = match tokio::fs::read_to_string(entry.path()).await {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
@@ -148,6 +153,8 @@ impl BootstrapManager {
                                     if let Err(e) = self.process_text_chunk(&request_response, entry.path(), total_chunks).await {
                                         warn!("Failed to process JSONL entry: {}", e);
                                     }
+                                    // Store Q&A pair for later use
+                                    local_qa_pairs.push((prompt.to_string(), solution.to_string()));
                                     total_chunks += 1;
                                 }
                             }
@@ -159,7 +166,7 @@ impl BootstrapManager {
                     }
                 } else {
                     // Process regular text files
-                    let text = match std::fs::read_to_string(entry.path()) {
+                    let text = match tokio::fs::read_to_string(entry.path()).await {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
@@ -183,11 +190,42 @@ impl BootstrapManager {
             }
         }
 
-        info!("✅ Bootstrap Complete! Processed {} files ({} semantic chunks).", total_files, total_chunks);
+        // Add collected Q&A pairs to self.qa_pairs
+        self.qa_pairs.extend(local_qa_pairs);
+
+        info!("✅ Bootstrap Complete! Processed {} files ({} semantic chunks). Collected {} Q&A pairs.", total_files, total_chunks, self.qa_pairs.len());
         
         // Save the new "Smart" Brain to the Database
         self.save_brain_state().await;
+        
+        // Save Q&A pairs to file for PC inference to use
+        self.save_qa_pairs().await?;
 
+        Ok(())
+    }
+
+    async fn save_qa_pairs(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.qa_pairs.is_empty() {
+            info!("No Q&A pairs to save");
+            return Ok(());
+        }
+        
+        let qa_data: Vec<serde_json::Value> = self.qa_pairs.iter()
+            .map(|(question, answer)| {
+                serde_json::json!({
+                    "question": question,
+                    "answer": answer
+                })
+            })
+            .collect();
+        
+        let json_data = serde_json::to_string_pretty(&qa_data)?;
+        let file_path = "./bootstrap_qa_cache.json";
+        
+        let mut file = File::create(file_path)?;
+        file.write_all(json_data.as_bytes())?;
+        
+        info!("💾 Saved {} Q&A pairs to {}", self.qa_pairs.len(), file_path);
         Ok(())
     }
 

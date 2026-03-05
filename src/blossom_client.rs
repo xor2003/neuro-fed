@@ -2,8 +2,8 @@
 // Blossom client for Nostr's file storage protocol (NIP-94)
 
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::io;
+use tokio::fs;
 
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ impl BlossomClient {
         info!("Uploading brain from {:?}", brain_path);
 
         // 1. Validate the brain file (safetensors).
-        let file_bytes = fs::read(brain_path)
+        let file_bytes = tokio::fs::read(brain_path).await
             .map_err(|e| BlossomError::Io(e))?;
         let _ = SafeTensors::deserialize(&file_bytes)
             .map_err(|e| BlossomError::Safetensors(e.to_string()))?;
@@ -139,7 +139,7 @@ impl BlossomClient {
         let cached_path = self.cache_dir.join(format!("{}.safetensors", brain_id));
         if cached_path.exists() {
             // Verify hash.
-            let file_bytes = fs::read(&cached_path)
+            let file_bytes = tokio::fs::read(&cached_path).await
                 .map_err(|e| BlossomError::Io(e))?;
             let mut hasher = Sha256::new();
             hasher.update(&file_bytes);
@@ -170,7 +170,7 @@ impl BlossomClient {
         }
 
         // 6. Save to cache.
-        fs::write(&cached_path, &bytes)
+        tokio::fs::write(&cached_path, &bytes).await
             .map_err(|e| BlossomError::Io(e))?;
 
         info!("Brain downloaded successfully to {:?}", cached_path);
@@ -226,8 +226,8 @@ impl BlossomClient {
     }
 
     /// Compute SHA256 hash of a file.
-    pub fn compute_file_hash(path: impl AsRef<Path>) -> Result<String, BlossomError> {
-        let bytes = fs::read(path).map_err(BlossomError::Io)?;
+    pub async fn compute_file_hash(path: impl AsRef<Path>) -> Result<String, BlossomError> {
+        let bytes = tokio::fs::read(path).await.map_err(BlossomError::Io)?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         Ok(hex::encode(hasher.finalize()))
@@ -242,12 +242,12 @@ impl BlossomClient {
 
     /// Load a brain from a safetensors file and validate metadata.
     /// Returns the raw bytes of the brain file.
-    pub fn load_brain(
+    pub async fn load_brain(
         path: impl AsRef<Path>,
         expected_brain_id: Option<&str>,
     ) -> Result<Vec<u8>, BlossomError> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(BlossomError::Io)?;
+        let bytes = tokio::fs::read(path).await.map_err(BlossomError::Io)?;
         
         // Validate hash if expected_brain_id is provided
         if let Some(expected) = expected_brain_id {
@@ -279,8 +279,8 @@ mod tests {
     async fn test_compute_file_hash() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.bin");
-        fs::write(&file_path, b"hello world").unwrap();
-        let hash = BlossomClient::compute_file_hash(&file_path).unwrap();
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
+        let hash = BlossomClient::compute_file_hash(&file_path).await.unwrap();
         // SHA256 of "hello world"
         assert_eq!(
             hash,

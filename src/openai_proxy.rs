@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::error::Error as StdError;
 use chrono::Utc;
 
-use axum::{routing, Router, Json, http::StatusCode};
+use axum::{routing, Router, Json, http::StatusCode, response::IntoResponse};
 use axum::extract::State;
 use tokio::sync::Mutex;
 use reqwest::Client;
@@ -247,6 +247,7 @@ impl OpenAiProxy {
         backend_config: BackendConfig,
         local_engine: Arc<Mutex<MLEngine>>,
         pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+        embedding_dim: usize,
     ) -> Self {
         info!("OpenAI Proxy: Initializing with PC learning enabled: {}", backend_config.pc_learning_enabled);
         info!("OpenAI Proxy: PC inference enabled: {}", backend_config.pc_inference_enabled);
@@ -257,8 +258,9 @@ impl OpenAiProxy {
         }
         
         let max_cache_size = backend_config.max_cache_size;
-        let embedding_dim = config.ml_config.embedding_dim;
         let similarity_threshold = backend_config.semantic_similarity_threshold;
+        
+        info!("OpenAI Proxy: Using embedding dimension: {} (from model detection)", embedding_dim);
         
         Self {
             config,
@@ -397,7 +399,7 @@ impl OpenAiProxy {
     pub async fn handle_chat_completion(
         State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
-    ) -> Result<Json<OpenAiResponse>, StatusCode> {
+    ) -> impl IntoResponse {
         let start_time = Instant::now();
         
         // Update metrics
@@ -601,9 +603,64 @@ impl OpenAiProxy {
         }).await {
             Ok(Ok(stats)) => {
                 debug!("PC inference completed with surprise: {}", stats.total_surprise);
-                // For now, return None to let backend handle it
-                // In a more advanced implementation, we could generate response from PC beliefs
-                None
+                
+                // Check if PC recognizes this pattern (low surprise)
+                // Threshold: if surprise < 0.1, consider it recognized
+                let surprise_threshold = 0.1;
+                
+                if stats.total_surprise < surprise_threshold {
+                    info!("PC recognizes pattern (surprise: {} < threshold: {})",
+                          stats.total_surprise, surprise_threshold);
+                    
+                    // PC recognizes this pattern - now we need to return a response
+                    // First, check semantic cache for similar responses
+                    // We need to move self into the closure to access semantic cache
+                    // This is complex due to async/blocking boundaries
+                    // For now, we'll return a simple response indicating recognition
+                    
+                    // Extract "The Mouth": Use LM Head to decode PC belief into words
+                    let belief = {
+                        let pc = self.pc_hierarchy.lock().await;
+                        pc.get_beliefs(0).unwrap().clone()
+                    };
+                    
+                    let engine = self.local_engine.lock().await;
+                    let response_content = match engine.decode_belief(&belief) {
+                        Ok(word) => format!("PC-Inference: I am thinking of the concept: {}", word),
+                        Err(_) => "I recognize this pattern but cannot articulate it.".to_string(),
+                    };
+                    
+                    // Create response with actual answer or generic message
+                    let response = OpenAiResponse {
+                        id: format!("pc-{}", chrono::Utc::now().timestamp()),
+                        object: "chat.completion".to_string(),
+                        created: chrono::Utc::now().timestamp(),
+                        model: "neurofed-pc".to_string(),
+                        choices: vec![Choice {
+                            index: 0,
+                            message: Message {
+                                role: "assistant".to_string(),
+                                content: serde_json::json!(response_content),
+                                name: None,
+                            },
+                            finish_reason: Some("stop".to_string()),
+                            logprobs: None,
+                        }],
+                        usage: Usage {
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            total_tokens: 0,
+                        },
+                        neurofed_source: Some("pc_inference".to_string()),
+                    };
+                    
+                    info!("PC generated response for recognized pattern");
+                    Some(response)
+                } else {
+                    debug!("PC does not recognize pattern (surprise: {} >= threshold: {})",
+                           stats.total_surprise, surprise_threshold);
+                    None
+                }
             }
             Ok(Err(e)) => {
                 warn!("PC inference failed: {}", e);
@@ -616,8 +673,71 @@ impl OpenAiProxy {
         }
     }
 
+    /// Find answer in Q&A cache loaded from bootstrap
+    async fn find_answer_in_qa_cache(&self, req: &OpenAiRequest) -> Option<String> {
+        use tokio::fs;
+        
+        // Extract question from request
+        let question = self.request_to_text(req);
+        if question.is_empty() {
+            return None;
+        }
+        
+        // Try to load Q&A cache file
+        let cache_path = "./bootstrap_qa_cache.json";
+        let cache_content = match fs::read_to_string(cache_path).await {
+            Ok(content) => content,
+            Err(_) => {
+                debug!("Q&A cache file not found: {}", cache_path);
+                return None;
+            }
+        };
+        
+        // Parse JSON
+        let qa_pairs: Vec<serde_json::Value> = match serde_json::from_str(&cache_content) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                warn!("Failed to parse Q&A cache JSON: {}", e);
+                return None;
+            }
+        };
+        
+        // Simple string matching: find pair where question contains key phrases
+        // This is a naive implementation - in production should use embedding similarity
+        for pair in qa_pairs {
+            if let (Some(cached_question), Some(cached_answer)) = (
+                pair.get("question").and_then(|v| v.as_str()),
+                pair.get("answer").and_then(|v| v.as_str()),
+            ) {
+                // Check if the current question contains words from cached question
+                // or vice versa (simple heuristic)
+                let question_lower = question.to_lowercase();
+                let cached_question_lower = cached_question.to_lowercase();
+                
+                // Simple word overlap check
+                let question_words: Vec<&str> = question_lower.split_whitespace().collect();
+                let cached_words: Vec<&str> = cached_question_lower.split_whitespace().collect();
+                
+                let common_words: Vec<&str> = question_words.iter()
+                    .filter(|w| cached_words.contains(w))
+                    .copied()
+                    .collect();
+                
+                // If at least 2 words match or question contains cached question (or vice versa)
+                if common_words.len() >= 2 ||
+                   question_lower.contains(&cached_question_lower) ||
+                   cached_question_lower.contains(&question_lower) {
+                    info!("Found matching question in Q&A cache: '{}'", cached_question);
+                    return Some(cached_answer.to_string());
+                }
+            }
+        }
+        
+        None
+    }
+
     /// Learn from API response using PC hierarchy
-    async fn learn_from_response(&self, req: &OpenAiRequest, response: &OpenAiResponse) -> Result<(), ProxyError> {
+    async fn learn_from_response(&self, _req: &OpenAiRequest, response: &OpenAiResponse) -> Result<(), ProxyError> {
         info!("PC learning: Starting to learn from response (model: {}, choices: {})",
               response.model, response.choices.len());
         
@@ -1217,7 +1337,7 @@ impl OpenAiProxy {
     pub async fn handle_completion(
         State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
-    ) -> Result<Json<OpenAiResponse>, StatusCode> {
+    ) -> impl IntoResponse {
         // Convert completion request to chat completion format
         Self::handle_chat_completion(State(proxy), Json(req)).await
     }
@@ -1226,7 +1346,7 @@ impl OpenAiProxy {
     pub async fn handle_embeddings(
         State(proxy): State<Arc<OpenAiProxy>>,
         Json(req): Json<OpenAiRequest>,
-    ) -> Result<Json<OpenAiResponse>, StatusCode> {
+    ) -> impl IntoResponse {
         // Generate embedding using ML engine
         let text = proxy.request_to_text(&req);
         let engine = proxy.local_engine.lock().await;
@@ -1550,7 +1670,7 @@ impl OpenAiProxy {
                         };
                         
                         match (flatten_and_trim(req_tensor), flatten_and_trim(resp_tensor)) {
-                            (Ok(req_learning), Ok(resp_learning)) => {
+                            (Ok(_req_learning), Ok(resp_learning)) => {
                                 // Perform PC learning (use learn_legacy with response as target)
                                 let pc_hierarchy = proxy_clone.pc_hierarchy.clone();
                                 let _ = tokio::task::spawn_blocking(move || {
@@ -1689,7 +1809,8 @@ mod tests {
         let pc_config = PCConfig::new(3, vec![512, 256, 128]);
         let pc_hierarchy = Arc::new(Mutex::new(PredictiveCoding::new(pc_config).unwrap()));
         
-        OpenAiProxy::new(config, backend_config, local_engine, pc_hierarchy)
+        // Use default embedding dimension for tests (512 matches the PC config)
+        OpenAiProxy::new(config, backend_config, local_engine, pc_hierarchy, 512)
     }
 
     #[test]

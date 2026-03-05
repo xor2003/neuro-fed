@@ -68,6 +68,7 @@ futures = "0.3.30"
 
 # Tokenization for proper text processing
 tokenizers = "0.22.2"
+hf-hub = "0.5.0"
 
 # Privacy networks (optional, placeholder versions for simulation)
 
