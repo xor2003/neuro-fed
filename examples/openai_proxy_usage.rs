@@ -1,45 +1,20 @@
-//! OpenAI Smart Proxy usage example
-//!
-//! This example demonstrates:
-//! 1. Setting up the OpenAI Smart Proxy with ML Engine and Predictive Coding
-//! 2. Starting the proxy server
-//! 3. Making requests through the proxy
-//! 4. Checking metrics and cache statistics
-
-use neuro_fed_node::{
-    openai_proxy::{OpenAiProxy, OpenAiRequest, Message},
-    config::{NodeConfig, BackendConfig},
-    ml_engine::MLEngine,
-    pc_hierarchy::{PredictiveCoding, PCConfig},
-    types::DeviceType,
-};
+use neuro_fed_node::config::{NodeConfig, BackendConfig};
+use neuro_fed_node::ml_engine::MLEngine;
+use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
+use neuro_fed_node::pc_decoder::ThoughtDecoder;
+use neuro_fed_node::openai_proxy::OpenAiProxy;
+use neuro_fed_node::types::{DeviceType, CognitiveDictionary};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use serde_json::json;
-use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== OpenAI Smart Proxy Usage Example ===\n");
-
-    // 1. Create configuration
-    println!("1. Creating configuration...");
+    // 1. Initialize configuration
+    println!("1. Initializing configuration...");
     let config = NodeConfig::default();
+    let mut backend_config = BackendConfig::default();
+    backend_config.pc_inference_enabled = true;
     
-    let backend_config = BackendConfig {
-        openai_api_key: Some("your-openai-api-key-here".to_string()), // Replace with actual key
-        openai_base_url: "https://api.openai.com".to_string(),
-        ollama_base_url: "http://localhost:11434".to_string(),
-        ollama_model: "tinyllama".to_string(),
-        local_fallback_enabled: true,
-        tool_bypass_enabled: true,
-        semantic_cache_enabled: true,
-        semantic_similarity_threshold: 0.8,
-        pc_inference_enabled: true,
-        pc_learning_enabled: true,
-        max_cache_size: 100,
-    };
-
     // 2. Initialize ML Engine
     println!("2. Initializing ML Engine...");
     let device_type = DeviceType {
@@ -48,14 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supported: true,
     };
     
-    // Note: In a real scenario, you would load an actual model
-    // For this example, we'll create a mock engine
+    // Create a mock engine
     let local_engine = Arc::new(Mutex::new(
         MLEngine::new("models/example-model.gguf", device_type.clone())
             .unwrap_or_else(|_| {
                 println!("   Using mock ML Engine (no actual model loaded)");
-                // Create a minimal mock engine for demonstration
-                // In production, you would load a real model
                 let fallback_device_type = DeviceType {
                     name: "CPU".to_string(),
                     description: "CPU device".to_string(),
@@ -73,6 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Failed to create Predictive Coding hierarchy")
     ));
 
+    // Initialize Cognitive Components
+    let cognitive_dict = Arc::new(Mutex::new(CognitiveDictionary::default()));
+    let vocab_size = cognitive_dict.lock().await.len();
+    let thought_decoder = Arc::new(Mutex::new(
+        ThoughtDecoder::new(512, vocab_size, &candle_core::Device::Cpu)?
+    ));
+
     // 4. Create OpenAI Proxy
     println!("4. Creating OpenAI Smart Proxy...");
     let proxy = OpenAiProxy::new(
@@ -81,6 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_engine,
         pc_hierarchy,
         512, // embedding_dim from PC config
+        thought_decoder,
+        cognitive_dict,
     );
 
     // 5. Start the proxy server (in a separate task)
@@ -101,117 +82,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create HTTP client for making requests
     let client = reqwest::Client::new();
     
-    // Example request payload
-    let request_payload = json!({
-        "model": "gpt-4",
+    // Example: Chat Completion
+    println!("   Testing chat completion endpoint...");
+    let chat_req = serde_json::json!({
+        "model": "neurofed-v2",
         "messages": [
-            {
-                "role": "user",
-                "content": "What is the capital of France?"
-            }
-        ],
-        "max_tokens": 100,
-        "temperature": 0.7
+            {"role": "user", "content": "How do I implement a binary search in Rust?"}
+        ]
     });
+    
+    // In a real environment, this would forward to Ollama/OpenAI
+    // For this example, we just show the request structure
+    println!("   Request: {}", serde_json::to_string_pretty(&chat_req)?);
 
-    println!("   Example request payload created");
-    println!("   Proxy server running on http://localhost:8080");
-    println!("   You can test it with:");
-    println!("   curl -X POST http://localhost:8080/v1/chat/completions \\");
-    println!("     -H \"Content-Type: application/json\" \\");
-    println!("     -d '{{\"model\": \"gpt-4\", \"messages\": [{{\"role\": \"user\", \"content\": \"Hello!\"}}]}}'");
-    
-    // 7. Check metrics (public API)
-    println!("7. Checking proxy metrics...");
-    
-    // Get cache stats
-    let (cache_size, max_size) = proxy.get_cache_stats().await;
-    println!("   Cache stats: {}/{} entries", cache_size, max_size);
-    
-    // Get metrics
-    let metrics = proxy.get_metrics().await;
-    println!("   Proxy metrics:");
-    println!("     Total requests: {}", metrics.total_requests);
-    println!("     Cache hits: {}", metrics.cache_hits);
-    println!("     Cache misses: {}", metrics.cache_misses);
-    println!("     Tool bypass requests: {}", metrics.tool_bypass_requests);
-    println!("     PC inference calls: {}", metrics.pc_inference_calls);
-    println!("     PC learning calls: {}", metrics.pc_learning_calls);
-    println!("     Semantic similarity hits: {}", metrics.semantic_similarity_hits);
-    println!("     Total tokens saved: {}", metrics.total_tokens_saved);
-    println!("     Average response time: {:.2}ms", metrics.average_response_time_ms);
-    
-    // 8. Demonstrate tool bypass scenario
-    println!("8. Demonstrating tool bypass scenario...");
-    
-    // Create a request with function call (tool)
-    let mut tool_args = HashMap::new();
-    tool_args.insert("city".to_string(), "Paris".to_string());
-    
-    let request_with_tools = OpenAiRequest {
-        model: "gpt-4".to_string(),
-        messages: vec![
-            Message {
-                role: "user".to_string(),
-                content: json!("Get the weather in Paris"),
-                name: None,
-            },
-        ],
-        max_tokens: Some(100),
-        temperature: Some(0.7),
-        top_p: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        stream: None,
-        n: None,
-        echo: None,
-        logit_bias: None,
-        function_call: Some(neuro_fed_node::types::FunctionCall {
-            name: "get_weather".to_string(),
-            arguments: tool_args,
-        }),
-        tools: None,
-        tool_calls: None,
-        usage: None,
-        api_key: None,
-    };
-    
-    println!("   Created request with function call (tool)");
-    println!("   With tool_bypass_enabled=true, this request would bypass local processing");
-    println!("   and be forwarded directly to the backend API");
-    
-    // 9. Cleanup
-    println!("9. Cleaning up...");
-    
-    // Clear cache
-    proxy.clear_cache().await;
-    println!("   Cache cleared");
-    
-    // Reset metrics
-    proxy.reset_metrics().await;
-    println!("   Metrics reset");
-    
-    let final_metrics = proxy.get_metrics().await;
-    println!("   Final total requests: {}", final_metrics.total_requests);
-    
-    println!("\n=== Example completed successfully ===");
-    println!("\nSummary:");
-    println!("- OpenAI Smart Proxy server started on port 8080");
-    println!("- Tool bypass enabled: Requests with tools will bypass local processing");
-    println!("- Semantic caching enabled: Similar requests will return cached responses");
-    println!("- Predictive Coding inference enabled: Can generate responses locally");
-    println!("- Predictive Coding learning enabled: Learns from API responses");
-    println!("- Multiple backend support: OpenAI API and Ollama");
-    println!("- Comprehensive metrics collection");
-    
-    println!("\nNext steps:");
-    println!("1. Configure your OpenAI API key in the backend_config");
-    println!("2. Run: cargo run --example openai_proxy_usage");
-    println!("3. Test with: curl -X POST http://localhost:8080/v1/chat/completions \\");
-    println!("   -H \"Content-Type: application/json\" \\");
-    println!("   -d '{{\"model\": \"gpt-4\", \"messages\": [{{\"role\": \"user\", \"content\": \"Hello!\"}}]}}'");
-    println!("4. Check metrics: curl http://localhost:8080/v1/metrics");
-    
+    // Example: Metrics
+    println!("   Checking proxy metrics...");
+    let metrics_url = "http://localhost:8080/v1/metrics";
+    match client.get(metrics_url).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                println!("   Metrics: {}", serde_json::to_string_pretty(&json)?);
+            }
+        }
+        Err(_) => println!("   Note: Server might not have fully started or backend unavailable."),
+    }
+
+    println!("OpenAI Proxy Usage demonstration complete.");
     Ok(())
 }

@@ -197,6 +197,10 @@ pub struct PCConfig {
     pub persistence_db_path: Option<String>,
     /// Convergence threshold for early exiting during inference
     pub convergence_threshold: f32,
+    /// Factor for hidden dimension calculation: hidden_dim = embedding_dim * factor
+    pub hidden_dim_factor: f32,
+    /// Threshold for surprise detection based on statistical distribution
+    pub surprise_threshold: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -254,7 +258,7 @@ impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
             dim_per_level: config.dim_per_level,
             learning_rate: config.learning_rate,
             inference_steps: 20, // default value
-            surprise_threshold: 1.0, // default value
+            surprise_threshold: config.surprise_threshold,
             convergence_threshold: config.convergence_threshold,
             selective_update: true, // default value
             mu_pc_scaling: config.mu_pc_scaling,
@@ -268,6 +272,7 @@ impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
             enable_nostr_zap_tracking: config.enable_nostr_zap_tracking,
             min_zaps_for_consensus: config.min_zaps_for_consensus,
             persistence_db_path: config.persistence_db_path,
+            hidden_dim_factor: config.hidden_dim_factor,
         }
     }
 }
@@ -419,6 +424,8 @@ impl Default for PCConfig {
             min_zaps_for_consensus: 3,
             persistence_db_path: Some("./neurofed.db".to_string()),
             convergence_threshold: 0.01,
+            hidden_dim_factor: 0.5,
+            surprise_threshold: 2.0,
         }
     }
 }

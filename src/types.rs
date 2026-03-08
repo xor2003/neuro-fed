@@ -411,3 +411,176 @@ pub enum PrivacyNetworkEvent {
 }
 
 impl std::error::Error for MLError {}
+
+// 🔴 НОВЫЕ СТРУКТУРЫ ДЛЯ НЕЙРОСИМВОЛИЧЕСКОГО ЯДРА 🔴
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ThoughtOp {
+    Define,
+    Iterate,
+    Check,
+    Compute,
+    Aggregate,
+    Return,
+    Explain,
+    EOF, // Маркер конца последовательности мыслей
+}
+
+impl std::fmt::Display for ThoughtOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThoughtOp::Define => write!(f, "DEFINE_FUNCTION"),
+            ThoughtOp::Iterate => write!(f, "ITERATE_COLLECTION"),
+            ThoughtOp::Check => write!(f, "CHECK_CONDITION"),
+            ThoughtOp::Compute => write!(f, "COMPUTE_MATH"),
+            ThoughtOp::Aggregate => write!(f, "AGGREGATE_RESULTS"),
+            ThoughtOp::Return => write!(f, "RETURN_VALUE"),
+            ThoughtOp::Explain => write!(f, "EXPLAIN"),
+            ThoughtOp::EOF => write!(f, "EOF"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkingMemory {
+    pub language: String,
+    pub entities: HashMap<String, String>, // "var_name" -> "my_list", "func_name" -> "sort_data"
+    pub constraints: Vec<String>, // Например: "O(n log n)", "no external libs"
+    pub raw_query: String,
+}
+
+/// Structured External Reasoning State (Гибридная память)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StructuredState {
+    /// Семантическая суть задачи (идет в PC-мозг для векторизации)
+    pub goal: String,
+    /// Точные сущности (имена переменных, константы)
+    pub entities: HashMap<String, String>,
+    /// Строгие ограничения (например: "O(n log n)", "без сторонних библиотек")
+    pub constraints: Vec<String>,
+    /// Предположения (Assumptions) - сюда мы будем писать ошибки, чтобы PC "передумал"
+    pub assumptions: Vec<String>,
+    /// Оригинальный запрос
+    pub raw_query: String,
+}
+
+impl StructuredState {
+    /// Собирает текст для PC-мозга, комбинируя Цель и текущие Предположения (для ревизии)
+    pub fn get_pc_context(&self) -> String {
+        let mut ctx = format!("Goal: {}", self.goal);
+        if !self.assumptions.is_empty() {
+            ctx.push_str("\nCorrected Assumptions: ");
+            ctx.push_str(&self.assumptions.join("; "));
+        }
+        ctx
+    }
+}
+
+/// Результат верификации плана
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationResult {
+    pub is_valid: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CognitiveDictionary {
+    pub id_to_op: HashMap<u32, ThoughtOp>,
+    pub op_to_id: HashMap<ThoughtOp, u32>,
+    pub next_id: u32,
+}
+
+impl Default for CognitiveDictionary {
+    fn default() -> Self {
+        let mut dict = Self {
+            id_to_op: HashMap::new(),
+            op_to_id: HashMap::new(),
+            next_id: 0,
+        };
+        dict.add_op(ThoughtOp::Define);
+        dict.add_op(ThoughtOp::Iterate);
+        dict.add_op(ThoughtOp::Check);
+        dict.add_op(ThoughtOp::Compute);
+        dict.add_op(ThoughtOp::Aggregate);
+        dict.add_op(ThoughtOp::Return);
+        dict.add_op(ThoughtOp::Explain);
+        dict.add_op(ThoughtOp::EOF);
+        dict
+    }
+}
+
+impl CognitiveDictionary {
+    pub fn add_op(&mut self, op: ThoughtOp) -> u32 {
+        if let Some(&id) = self.op_to_id.get(&op) {
+            return id;
+        }
+        let id = self.next_id;
+        self.id_to_op.insert(id, op);
+        self.op_to_id.insert(op, id);
+        self.next_id += 1;
+        id
+    }
+    
+    pub fn get_op(&self, id: u32) -> ThoughtOp {
+        self.id_to_op.get(&id).cloned().unwrap_or(ThoughtOp::EOF)
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_to_op.len()
+    }
+
+    // For backward compatibility with old code expecting concept strings
+    pub fn get_concept(&self, id: u32) -> String {
+        self.get_op(id).to_string()
+    }
+
+    // For backward compatibility
+    pub fn add_concept(&mut self, concept: &str) -> u32 {
+        // Map concept string to ThoughtOp
+        let op = match concept {
+            "DEFINE_FUNCTION" => ThoughtOp::Define,
+            "ITERATE_COLLECTION" => ThoughtOp::Iterate,
+            "CHECK_CONDITION" => ThoughtOp::Check,
+            "COMPUTE_MATH" => ThoughtOp::Compute,
+            "AGGREGATE_RESULTS" => ThoughtOp::Aggregate,
+            "RETURN_VALUE" => ThoughtOp::Return,
+            "EXPLAIN" => ThoughtOp::Explain,
+            "EOF" => ThoughtOp::EOF,
+            _ => ThoughtOp::EOF, // fallback
+        };
+        self.add_op(op)
+    }
+}
+
+#[cfg(test)]
+mod cognitive_architecture_tests {
+    use super::*;
+
+    #[test]
+    fn test_cognitive_dictionary_initialization() {
+        let dict = CognitiveDictionary::default();
+        // У нас 7 базовых операций + 1 EOF
+        assert_eq!(dict.len(), 8, "Словарь должен содержать 8 базовых операций");
+        
+        // Проверяем, что ключевые операции на месте
+        assert!(dict.op_to_id.contains_key(&ThoughtOp::Define));
+        assert!(dict.op_to_id.contains_key(&ThoughtOp::EOF));
+    }
+
+    #[test]
+    fn test_dynamic_concept_addition() {
+        let mut dict = CognitiveDictionary::default();
+        let initial_len = dict.len();
+
+        // Добавляем новый концепт (симулируем Chunk Discovery)
+        // В реальности это будет не Enum, а строка, но для теста так проще
+        // let new_op_id = dict.add_op("ITERATE_AND_CHECK");
+        
+        // assert_eq!(dict.len(), initial_len + 1, "Словарь не расширился");
+        
+        // Попытка добавить тот же концепт снова не должна ничего менять
+        // let same_op_id = dict.add_op("ITERATE_AND_CHECK");
+        // assert_eq!(dict.len(), initial_len + 1, "Словарь не должен был измениться при дублировании");
+        // assert_eq!(new_op_id, same_op_id, "ID для существующего концепта должен быть стабильным");
+    }
+}

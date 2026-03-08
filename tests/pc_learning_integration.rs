@@ -20,7 +20,7 @@ fn test_pc_inference() -> Result<(), Box<dyn Error>> {
     // 1. Create a PC hierarchy with small dimensions for fast testing
     let config = PCConfig::new(2, vec![16, 8]);
     let device = Device::Cpu;
-    let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+    let mut pc = PredictiveCoding::new_with_device(config, device)?;
 
     // 2. Create a fake embedding
     let embedding = fake_embedding(16, 0.5);
@@ -36,7 +36,7 @@ fn test_pc_inference() -> Result<(), Box<dyn Error>> {
 fn test_pc_learning() -> Result<(), Box<dyn Error>> {
     let config = PCConfig::new(2, vec![16, 8]);
     let device = Device::Cpu;
-    let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+    let mut pc = PredictiveCoding::new_with_device(config, device)?;
 
     // Generate some training data (fake embeddings)
     let texts = ["Hello world", "Predictive coding is cool", "Rust is fast"];
@@ -65,7 +65,7 @@ fn test_pc_answer_with_learned_knowledge() -> Result<(), Box<dyn Error>> {
 
     let config = PCConfig::new(2, vec![16, 8]);
     let device = Device::Cpu;
-    let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+    let mut pc = PredictiveCoding::new_with_device(config, device)?;
 
     // 1. Learn from a specific pattern
     let pattern_embedding = fake_embedding(16, 7.7);
@@ -105,7 +105,7 @@ fn test_full_pc_pipeline() -> Result<(), Box<dyn Error>> {
     // Create PC
     let config = PCConfig::new(3, vec![32, 16, 8]);
     let device = Device::Cpu;
-    let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+    let mut pc = PredictiveCoding::new_with_device(config, device)?;
 
     // Step 1: Inference on a query
     let query_embedding = fake_embedding(32, 123.0);

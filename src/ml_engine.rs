@@ -211,7 +211,8 @@ impl MLEngine {
         
         let token_ids = tokens.get_ids();
         if token_ids.is_empty() {
-            return Ok(Tensor::zeros((1, self.embedding_dim), DType::F32, &self.device).unwrap());
+            return Tensor::zeros((1, self.embedding_dim), DType::F32, &self.device)
+                .map_err(|e| MLError::InvalidResponse(format!("Zero tensor creation error: {}", e)));
         }
 
         // Get embeddings for all tokens
@@ -229,12 +230,24 @@ impl MLEngine {
         let mean_emb = stacked.mean(0)
             .map_err(|e| MLError::InvalidResponse(format!("Mean pool error: {}", e)))?;
 
-        // Восстанавливаем масштаб вектора (L2 Normalization approximation)
-        let scale_factor = (self.embedding_dim as f64).sqrt();
-        let mean_emb = (mean_emb * scale_factor)
-            .map_err(|e| MLError::InvalidResponse(format!("Scale error: {}", e)))?;
+        // --- БЕЗОПАСНАЯ L2-НОРМАЛИЗАЦИЯ (Без Tensor Broadcast) ---
+        let norm_sq = mean_emb.sqr()
+            .map_err(|e| MLError::InvalidResponse(format!("Sqr error: {}", e)))?
+            .sum_all()
+            .map_err(|e| MLError::InvalidResponse(format!("Sum error: {}", e)))?
+            .to_scalar::<f32>()
+            .map_err(|e| MLError::InvalidResponse(format!("Scalar error: {}", e)))?;
+            
+        let norm = norm_sq.sqrt() as f64;
+        let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
 
-        Ok(mean_emb.reshape((1, self.embedding_dim)).unwrap())
+        // Умножаем тензор напрямую на число (f64), избегая крашей совместимости форм!
+        let normalized = (mean_emb * scale_factor)
+            .map_err(|e| MLError::InvalidResponse(format!("Scale error: {}", e)))?;
+        // ----------------------------------------------------------
+
+        normalized.reshape((1, self.embedding_dim))
+            .map_err(|e| MLError::InvalidResponse(format!("Reshape error: {}", e)))
     }
 
     /// "The Mouth": Convert a PC Brain "belief" vector back into English tokens
@@ -290,6 +303,32 @@ impl MLEngine {
                     "Normalized tensor L2 norm must be 1.0, got {}", new_norm
                 );
         
+                Ok(())
+            }
+
+            #[test]
+            fn test_input_l2_normalization_accuracy() -> Result<(), Box<dyn std::error::Error>> {
+                let device = Device::Cpu;
+                
+                // 1. Создаем случайный вектор с ОГРОМНЫМИ значениями (как было в баге)
+                let huge_values = vec![100.0f32; 2048];
+                let tensor = Tensor::from_vec(huge_values, (1, 2048), &device)?;
+
+                // 2. Применяем логику нормализации из process_text
+                let norm_sq = tensor.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                let norm = norm_sq.sqrt();
+                let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
+                
+                // Масштабируем
+                let normalized = (tensor * (scale_factor as f64))?;
+
+                // 3. Проверяем длину (норму) итогового вектора
+                let final_norm_sq = normalized.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                let final_norm = final_norm_sq.sqrt();
+
+                // Норма должна быть идеально равна 1.0 (с учетом погрешности float)
+                assert!((final_norm - 1.0).abs() < 1e-5, "L2 нормализация не работает! Норма: {}", final_norm);
+                
                 Ok(())
             }
         }
@@ -430,8 +469,9 @@ impl MLEngine {
         Ok(layer_weights)
     }
 
-    /// Extract the "knowledge matrix" from a middle layer (e.g., blk.12.ffn_down.weight)
+    /// Extract the "knowledge matrix" from a middle layer (e.g., blk.{middle}.ffn_down.weight)
     /// This represents the "intelligence genes" of the pre-trained model
+    /// Dynamically calculates total layers from GGUF metadata and uses middle layer
     pub fn extract_knowledge_matrix(&self) -> Result<candle_core::Tensor, MLError> {
         use candle_core::Device;
         
@@ -441,9 +481,39 @@ impl MLEngine {
         let content = candle_core::quantized::gguf_file::Content::read(&mut file)
             .map_err(|e| MLError::ModelLoadError(format!("GGUF Read Error for knowledge extraction: {}", e)))?;
         
-        // Try layer 12 first (center of knowledge in 22-32 layer models)
-        // If not found, try layer 6, then layer 0
-        let layer_candidates = vec![12, 6, 0];
+        // Parse all layer numbers from tensor names to determine total layers
+        let mut layer_numbers: Vec<usize> = Vec::new();
+        for (tensor_name, _) in content.tensor_infos.iter() {
+            if let Some(stripped) = tensor_name.strip_prefix("blk.") {
+                if let Some(dot_pos) = stripped.find('.') {
+                    if let Ok(layer_num) = stripped[..dot_pos].parse::<usize>() {
+                        layer_numbers.push(layer_num);
+                    }
+                }
+            }
+        }
+        
+        layer_numbers.sort();
+        layer_numbers.dedup();
+        
+        let total_layers = if !layer_numbers.is_empty() {
+            *layer_numbers.iter().max().unwrap() + 1  // layers are 0-indexed
+        } else {
+            // Fallback to default if no layer numbers found
+            tracing::warn!("No layer numbers found in GGUF metadata, using default 24 layers");
+            24
+        };
+        
+        // Calculate middle layer (use integer division)
+        let middle_layer = total_layers / 2;
+        
+        tracing::info!("Detected {} total layers in GGUF model, using middle layer {} for knowledge extraction",
+                     total_layers, middle_layer);
+        
+        // Try middle layer first, then fallback to other layers
+        // Create a list of candidates: middle, then quarter, then 0, then all layers
+        let quarter_layer = total_layers / 4;
+        let layer_candidates = vec![middle_layer, quarter_layer, 0];
         let mut last_error: Option<String> = None;
         
         for layer_num in layer_candidates {
