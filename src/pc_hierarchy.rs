@@ -2,14 +2,11 @@
 // Pure Predictive Coding (PC) implementation based on Rao-Ballard/Friston free-energy minimization
 // Migrated from ndarray to candle-core for GPU acceleration
 
-use candle_core::{Device, Tensor, DType, Result as CandleResult};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use candle_core::{Device, Tensor, DType};
 
 use crate::knowledge_filter::{PrecisionCalculator, PrecisionConfig, PrecisionContext};
 pub use crate::pc_types::{PCError, PCConfig, SurpriseStats};
 use crate::pc_level::PCLevel;
-use crate::types::ThoughtOp;
 
 /// Main Predictive Coding hierarchy
 pub struct PredictiveCoding {

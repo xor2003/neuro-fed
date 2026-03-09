@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::io;
-use tokio::fs;
 
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};

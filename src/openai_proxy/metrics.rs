@@ -1,5 +1,4 @@
 // src/openai_proxy/metrics.rs
-use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProxyMetrics {

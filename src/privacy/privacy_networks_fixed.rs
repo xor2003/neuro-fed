@@ -6,7 +6,6 @@
 //! and fallback mechanisms between networks.
 
 use std::time::Duration;
-use async_trait::async_trait;
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
 use tracing::info;
@@ -198,7 +197,7 @@ impl PrivacyNetworkManager {
     }
     
     /// Send data through the current network
-    pub async fn send(&self, data: &[u8], destination: &str) -> Result<(), PrivacyNetworkError> {
+    pub async fn send(&self, _data: &[u8], _destination: &str) -> Result<(), PrivacyNetworkError> {
         match self.current_network {
             PrivacyNetwork::Direct => {
                 // For direct connections, we would use regular networking

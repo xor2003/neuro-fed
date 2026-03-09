@@ -36,7 +36,7 @@ impl MLEngine {
     /// Create an ML engine using a ModelManager to handle model selection and downloading
     pub async fn new_with_manager(
         model_manager: Arc<ModelManager>,
-        model_name: &str,
+        _model_name: &str,
     ) -> Result<Self, MLError> {
         // Get recommended model from manager
         let recommended_model = model_manager
@@ -613,7 +613,7 @@ impl MLEngine {
                 target_rows, target_cols, src_rows, src_cols);
             
             // Create zero tensor of target size
-            let mut padded = Tensor::zeros((target_rows, target_cols), candle_core::DType::F32, &device)
+            let padded = Tensor::zeros((target_rows, target_cols), candle_core::DType::F32, &device)
                 .map_err(|e| MLError::TensorError(format!("Failed to create zero tensor: {}", e)))?;
             
             // Copy cropped weights into the top-left corner
@@ -621,7 +621,7 @@ impl MLEngine {
             let cols_to_copy = cols_to_take;
             
             // Create a view of the destination region
-            let dest_region = padded
+            let _dest_region = padded
                 .narrow(0, 0, rows_to_copy)
                 .map_err(|e| MLError::TensorError(format!("Failed to narrow dest rows: {}", e)))?
                 .narrow(1, 0, cols_to_copy)
@@ -634,7 +634,7 @@ impl MLEngine {
             // Let's use a different approach: create the padded tensor by concatenation
             
             // Create zero padding for rows if needed
-            let row_pad = if target_rows > src_rows {
+            let _row_pad = if target_rows > src_rows {
                 Tensor::zeros((target_rows - src_rows, cols_to_copy), candle_core::DType::F32, &device)
                     .map_err(|e| MLError::TensorError(format!("Failed to create row padding: {}", e)))?
             } else {
@@ -643,7 +643,7 @@ impl MLEngine {
             };
             
             // Create zero padding for columns if needed
-            let col_pad = if target_cols > src_cols {
+            let _col_pad = if target_cols > src_cols {
                 Tensor::zeros((target_rows, target_cols - src_cols), candle_core::DType::F32, &device)
                     .map_err(|e| MLError::TensorError(format!("Failed to create col padding: {}", e)))?
             } else {

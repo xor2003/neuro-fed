@@ -1,6 +1,5 @@
 // src/pc_level.rs
 use candle_core::{Device, Tensor, DType, Result as CandleResult};
-use crate::pc_types::PCError;
 
 #[derive(Debug, Clone)]
 pub struct PCLevel {

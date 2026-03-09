@@ -10,9 +10,8 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tracing::{info, warn, error, debug};
-use candle_core::{Tensor, Device};
+use serde_json::json;
+use tracing::{info, warn, error};
 use chrono::Utc;
 
 pub mod metrics;
@@ -235,11 +234,11 @@ impl OpenAiProxy {
         }
     }
 
-    async fn forward_to_ollama(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
+    async fn forward_to_ollama(&self, _req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
         Err(ProxyError::BackendError("Not implemented".to_string()))
     }
 
-    async fn update_metrics_success(&self, elapsed: Duration, response: &OpenAiResponse) {
+    async fn update_metrics_success(&self, elapsed: Duration, _response: &OpenAiResponse) {
         let mut metrics = self.metrics.lock().await;
         metrics.total_processing_time_ms += elapsed.as_millis() as u64;
     }

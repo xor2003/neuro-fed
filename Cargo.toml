@@ -7,6 +7,10 @@ description = "Decentralized Federated Nervous System with Pure Hierarchical Pre
 license = "MIT"
 repository = "https://github.com/neuro-fed/neuro-fed-node"
 
+[[bin]]
+name = "neuro-fed-node"
+path = "src/main.rs"
+
 [dependencies]
 
 # Core dependencies

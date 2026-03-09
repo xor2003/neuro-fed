@@ -1,12 +1,11 @@
 // src/persistence.rs
 // SQLite database and state persistence for PC weights
 
-use std::path::Path;
-use sqlx::{sqlite::SqlitePool, Sqlite, Pool, Row};
+use sqlx::{Sqlite, Pool, Row};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn, error, debug};
-use candle_core::{Tensor, Device, DType, Error as CandleError};
+use tracing::{info, debug};
+use candle_core::Error as CandleError;
 use chrono;
 
 #[derive(Debug, Error)]

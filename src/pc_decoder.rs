@@ -1,5 +1,5 @@
 // src/pc_decoder.rs
-use candle_core::{Tensor, Device, Var, DType};
+use candle_core::{Tensor, Device, Var};
 use candle_nn::{ops, loss, Optimizer};
 use crate::pc_types::PCError;
 use crate::types::ThoughtOp;

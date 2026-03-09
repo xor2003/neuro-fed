@@ -119,7 +119,7 @@ pub struct ProxyMetrics {
 
 impl OpenAiResponse {
     /// Create an error response with a given error message
-    pub fn error(message: &str) -> Self {
+    pub fn error(_message: &str) -> Self {
         Self {
             id: "error".to_string(),
             object: "error".to_string(),
