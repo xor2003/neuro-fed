@@ -21,7 +21,7 @@ async fn test_persistence_save_load() -> Result<(), Box<dyn Error>> {
     // Create a PC hierarchy with small dimensions for fast testing
     let config = PCConfig::new(2, vec![16, 8]);
     let device = Device::Cpu;
-    let mut pc = PredictiveCoding::new_with_device(config, &device)?;
+    let mut pc = PredictiveCoding::new_with_device(config, device)?;
     
     // Perform some learning to change weights from random initialization
     let embedding = fake_embedding(16, 0.5);
@@ -46,7 +46,7 @@ async fn test_persistence_save_load() -> Result<(), Box<dyn Error>> {
     }
     
     // Create a new PC hierarchy with same config
-    let mut pc2 = PredictiveCoding::new_with_device(PCConfig::new(2, vec![16, 8]), &Device::Cpu)?;
+    let mut pc2 = PredictiveCoding::new_with_device(PCConfig::new(2, vec![16, 8]), Device::Cpu)?;
     
     // Load weights from database
     let loaded_levels = persistence.load_all_levels().await?;
@@ -86,7 +86,10 @@ async fn test_persistence_save_load() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn test_persistence_empty_load() -> Result<(), Box<dyn Error>> {
     // Fresh in-memory database should have no saved levels
-    let db_path = ":memory:".to_string();
+    // Use a unique in-memory database with shared cache to allow connection pooling
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let db_path = format!("file:memdb_{}?mode=memory&cache=shared", timestamp);
     let persistence = PCPersistence::new(&db_path).await?;
     let loaded_levels = persistence.load_all_levels().await?;
     assert!(loaded_levels.is_empty(), "Fresh database should have no levels");

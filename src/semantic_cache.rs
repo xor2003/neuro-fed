@@ -9,7 +9,7 @@ use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
 use anyhow::Result;
 
-use crate::openai_proxy::{OpenAiRequest, OpenAiResponse};
+use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse};
 
 /// Semantic cache entry with vector embedding
 #[derive(Debug, Clone, Serialize, Deserialize)]

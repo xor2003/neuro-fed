@@ -1,16 +1,17 @@
-// src/bootstrap.rs
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 use candle_core::Tensor;
 use crate::ml_engine::MLEngine;
 use crate::pc_decoder::ThoughtDecoder;
+use crate::pc_hierarchy::PredictiveCoding;
 use crate::types::{CognitiveDictionary, ThoughtOp};
 
 pub struct BootstrapManager {
     ml_engine: Arc<Mutex<MLEngine>>,
     thought_decoder: Arc<Mutex<ThoughtDecoder>>,
     dict: Arc<Mutex<CognitiveDictionary>>,
+    pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
 }
 
 impl BootstrapManager {
@@ -18,17 +19,20 @@ impl BootstrapManager {
         ml_engine: Arc<Mutex<MLEngine>>,
         thought_decoder: Arc<Mutex<ThoughtDecoder>>,
         dict: Arc<Mutex<CognitiveDictionary>>,
+        pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
     ) -> Self {
-        Self { ml_engine, thought_decoder, dict }
+        Self { ml_engine, thought_decoder, dict, pc_hierarchy }
     }
 
     pub async fn run_synthetic_training(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("🚀 Запускаем синтетическое обучение Декодера Мыслей...");
-        let synthetic_data = self.generate_synthetic_dataset().await;
+        info!("🚀 Запускаем Curriculum Learning для Декодера Мыслей...");
+        let mut synthetic_data = self.generate_synthetic_dataset().await;
+        
+        synthetic_data.sort_by_key(|(_, seq)| seq.len());
         
         let mut decoder = self.thought_decoder.lock().await;
 
-        for epoch in 0..100 { // Увеличим количество эпох для лучшего обучения
+        for epoch in 0..100 { 
             let mut total_loss = 0.0;
             for (belief, seq) in &synthetic_data {
                 let loss = decoder.train_step(belief, seq, 0.01)?;
@@ -67,6 +71,16 @@ impl BootstrapManager {
         let q1_emb = engine.process_text(&q1).await.unwrap();
         let q2_emb = engine.process_text(&q2).await.unwrap();
 
-        vec![(q1_emb.flatten_all().unwrap(), seq1), (q2_emb.flatten_all().unwrap(), seq2)]
+        // 🔴 THE FIX: Run inference to get the compressed 512-dim belief
+        let mut pc = self.pc_hierarchy.lock().await;
+        
+        pc.infer(&q1_emb, 15).unwrap();
+        // Flatten the[512, 1] tensor to a 1D tensor [512] for the decoder
+        let q1_belief = pc.levels.last().unwrap().beliefs.flatten_all().unwrap();
+        
+        pc.infer(&q2_emb, 15).unwrap();
+        let q2_belief = pc.levels.last().unwrap().beliefs.flatten_all().unwrap();
+
+        vec![(q1_belief, seq1), (q2_belief, seq2)]
     }
 }

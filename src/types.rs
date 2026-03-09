@@ -583,4 +583,13 @@ mod cognitive_architecture_tests {
         // assert_eq!(dict.len(), initial_len + 1, "Словарь не должен был измениться при дублировании");
         // assert_eq!(new_op_id, same_op_id, "ID для существующего концепта должен быть стабильным");
     }
+    
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct StructuredState {
+        pub goal: String,
+        pub entities: HashMap<String, String>,
+        pub constraints: Vec<String>,
+        pub assumptions: Vec<String>,
+        pub raw_query: String,
+    }
 }
