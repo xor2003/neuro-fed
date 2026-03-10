@@ -303,6 +303,54 @@ impl PredictiveCoding {
             self.belief_history.remove(0);
         }
     }
+
+    /// Advances the temporal state of all levels
+    pub fn step_time(&mut self) -> Result<(), PCError> {
+        for level in &mut self.levels {
+            level.step_time()?;
+        }
+        Ok(())
+    }
+
+    pub fn checkpoint_weights(&mut self) -> Result<(), PCError> {
+        for level in &mut self.levels {
+            level.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_weights(&mut self) -> Result<(), PCError> {
+        for level in &mut self.levels {
+            level.rollback()?;
+        }
+        tracing::warn!("PC weights rolled back due to unstable Free Energy rise.");
+        Ok(())
+    }
+
+    /// Processes a sequence of latents, updating the causal temporal state at each step.
+    pub fn infer_sequence(&mut self, sequence_tensor: &Tensor, steps_per_token: usize) -> Result<SurpriseStats, PCError> {
+        let seq_len = sequence_tensor.shape().dims()[0];
+        let mut overall_stats = SurpriseStats::default();
+        
+        for t in 0..seq_len {
+            // Extract [1, embedding_dim] and reshape to[embedding_dim, 1]
+            let token_emb = sequence_tensor.narrow(0, t, 1)?
+                .reshape((self.config.dim_per_level[0], 1))?;
+            
+            let stats = self.infer(&token_emb, steps_per_token)?;
+            overall_stats.free_energy_history.extend(stats.free_energy_history);
+            overall_stats.total_surprise += stats.total_surprise;
+            
+            // Critical: Advance temporal state for the next token!
+            self.step_time()?;
+        }
+        
+        overall_stats.novelty_score = *overall_stats.free_energy_history.first().unwrap_or(&0.0);
+        let final_fe = *overall_stats.free_energy_history.last().unwrap_or(&0.0);
+        overall_stats.confidence_score = 1.0 / (1.0 + final_fe);
+        
+        Ok(overall_stats)
+    }
 }
 
 

@@ -25,6 +25,19 @@ impl ThoughtDecoder {
 
     /// Graph of Thoughts (Beam Search) with Length Normalization
     pub fn decode_sequence(&self, anchor_belief: &Tensor, max_steps: usize, beam_width: usize) -> Result<Vec<u32>, PCError> {
+        self.decode_sequence_with_costs(anchor_belief, max_steps, beam_width, None)
+    }
+
+    /// Graph of Thoughts with Length Normalization AND Action-Cost routing
+    pub fn decode_sequence_with_costs(
+        &self,
+        anchor_belief: &Tensor,
+        max_steps: usize,
+        beam_width: usize,
+        action_costs: Option<&std::collections::HashMap<u32, f32>> // NEW
+    ) -> Result<Vec<u32>, PCError> {
+        use std::collections::HashMap;
+        
         let anchor_flat = anchor_belief.flatten_all()?;
         let belief_dim = anchor_flat.dims()[0];
         let anchor_2d = anchor_flat.reshape((1, belief_dim))?;
@@ -58,14 +71,18 @@ impl ThoughtDecoder {
                 for (token_id, &lp) in log_probs_vec.iter().enumerate() {
                     let mut new_seq = seq.clone();
                     new_seq.push(token_id as u32);
-                    let new_raw_score = raw_score + lp;
                     
-                    // Apply length penalty: score / (length ^ alpha)
+                    // Apply explicit action costs if provided
+                    let cost = action_costs
+                        .and_then(|costs| costs.get(&(token_id as u32)))
+                        .copied()
+                        .unwrap_or(0.0); // Default zero extra cost
+                        
+                    // Penalize score by cost
+                    let new_raw_score = raw_score + lp - cost;
+                    
                     let norm_score = new_raw_score / (new_seq.len() as f32).powf(0.7);
-                    
-                    // EOF token ID is 7 in the default CognitiveDictionary
-                    // TODO: Make this configurable via parameter
-                    let done = token_id as u32 == 7;
+                    let done = token_id as u32 == 7; // EOF
                     new_beams.push((norm_score, new_raw_score, new_seq, h_next.clone(), done));
                 }
             }

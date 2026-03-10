@@ -269,6 +269,30 @@ impl MLEngine {
             .map_err(|e| MLError::InvalidResponse(format!("Reshape error: {}", e)))
     }
 
+    /// Returns unpooled sequence of embeddings: shape [seq_len, embedding_dim]
+    pub async fn process_text_sequence(&self, text: &str) -> Result<Tensor, MLError> {
+        let tokens = self.tokenizer.encode(text, true)
+            .map_err(|e| MLError::InvalidResponse(format!("Tokenization error: {}", e)))?;
+        
+        let token_ids = tokens.get_ids();
+        if token_ids.is_empty() {
+            return Tensor::zeros((1, self.embedding_dim), DType::F32, &self.device)
+                .map_err(|e| MLError::InvalidResponse(format!("Zero tensor creation error: {}", e)));
+        }
+
+        let mut embeddings = Vec::new();
+        for &id in token_ids.iter() {
+            let emb = self.token_embeddings.get(id as usize)
+                .map_err(|e| MLError::InvalidResponse(format!("Embedding lookup error: {}", e)))?;
+            embeddings.push(emb);
+        }
+
+        let stacked = Tensor::stack(&embeddings, 0)
+            .map_err(|e| MLError::InvalidResponse(format!("Stack error: {}", e)))?;
+            
+        Ok(stacked) // Returns[seq_len, embedding_dim]
+    }
+
     /// "The Mouth": Convert a PC Brain "belief" vector back into English tokens
     pub fn decode_belief(&self, belief: &Tensor) -> Result<String, MLError> {
         // Log tensor shapes for debugging
