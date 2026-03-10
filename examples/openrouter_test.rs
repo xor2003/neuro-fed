@@ -1,8 +1,9 @@
-use neuro_fed_node::config::{NodeConfig, BackendConfig};
+use neuro_fed_node::config::NodeConfig;
 use neuro_fed_node::ml_engine::MLEngine;
 use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
-use neuro_fed_node::openai_proxy::OpenAiProxy;
+use neuro_fed_node::openai_proxy::{OpenAiProxy, create_router};
+use neuro_fed_node::openai_proxy::components::ProxyConfig;
 use neuro_fed_node::types::{DeviceType, CognitiveDictionary};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,7 +13,7 @@ use std::env;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize configuration
     println!("1. Initializing configuration...");
-    let mut config = NodeConfig::default();
+    let config = NodeConfig::default();
     
     // Check for OpenRouter API key in environment
     let api_key = env::var("OPENROUTER_API_KEY").ok();
@@ -20,11 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   Warning: OPENROUTER_API_KEY not set. Using dummy key.");
     }
     
-    let mut backend_config = BackendConfig::default();
-    backend_config.openai_api_key = api_key.or(Some("sk-or-v1-dummy-key".to_string()));
-    backend_config.openai_base_url = "https://openrouter.ai/api/v1".to_string();
-    backend_config.ollama_model = "google/palm-2-chat-bison".to_string();
-    backend_config.pc_inference_enabled = true;
+    let mut proxy_config = ProxyConfig::default();
+    proxy_config.fallback_url = "https://openrouter.ai/api/v1".to_string();
+    proxy_config.ollama_url = "http://localhost:11434".to_string();
     
     // 2. Initialize ML Engine
     println!("2. Initializing ML Engine...");
@@ -65,24 +64,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create OpenAI Proxy
     println!("4. Creating OpenAI Smart Proxy...");
-    let proxy = OpenAiProxy::new(
+    let proxy = Arc::new(OpenAiProxy::new(
         config,
-        backend_config,
+        proxy_config,
         local_engine,
         pc_hierarchy,
         512, // embedding_dim from PC config
         thought_decoder,
         cognitive_dict,
-    );
+    ));
 
     // 5. Start the proxy server
     println!("5. Starting proxy server on port 8080...");
-    let proxy_clone = proxy.clone();
+    let proxy_clone = Arc::clone(&proxy);
     let server_task = tokio::spawn(async move {
         println!("   Starting server...");
-        if let Err(e) = proxy_clone.start(8080).await {
-            eprintln!("Failed to start proxy server: {}", e);
-        }
+        let app = create_router(proxy_clone);
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
 
     // Give server time to start
