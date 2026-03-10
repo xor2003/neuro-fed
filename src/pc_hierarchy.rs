@@ -312,6 +312,19 @@ impl PredictiveCoding {
         Ok(())
     }
 
+    /// NEW: Structurally grounds confidence into the PC precision matrices
+    pub fn modulate_precision(&mut self, calibrated_confidence: f32) -> Result<(), PCError> {
+        for level in &mut self.levels {
+            let ones = Tensor::ones_like(&level.precision)?;
+            // Prevent absolute zero precision to avoid gradient vanishing
+            let safe_confidence = calibrated_confidence.max(0.01);
+            let scale = Tensor::from_slice(&[safe_confidence], (1, 1), &self.device)?
+                .broadcast_as(ones.shape())?;
+            level.precision = ones.mul(&scale)?;
+        }
+        Ok(())
+    }
+
     pub fn checkpoint_weights(&mut self) -> Result<(), PCError> {
         for level in &mut self.levels {
             level.checkpoint()?;
@@ -351,6 +364,98 @@ impl PredictiveCoding {
         
         Ok(overall_stats)
     }
+
+    /// NEW: Learn over entire sequences (safe sleep phase processing)
+    pub fn learn_sequence(&mut self, sequence_tensor: &Tensor, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
+        let seq_len = sequence_tensor.shape().dims()[0];
+        let mut overall_stats = SurpriseStats::default();
+
+        for t in 0..seq_len {
+            let token_emb = sequence_tensor.narrow(0, t, 1)?
+                .reshape((self.config.dim_per_level[0], 1))?;
+            
+            let stats = self.learn(&token_emb, context.clone())?;
+            overall_stats.free_energy_history.extend(stats.free_energy_history);
+            overall_stats.total_surprise += stats.total_surprise;
+            
+            self.step_time()?;
+        }
+        Ok(overall_stats)
+    }
 }
 
+#[cfg(test)]
+mod sequence_and_calibration_tests {
+    use super::*;
+    use candle_core::{Device, Tensor, DType};
+
+    #[test]
+    fn test_modulate_precision_scales_correctly() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let config = PCConfig::new(2, vec![8, 4]);
+        let mut pc = PredictiveCoding::new(config)?;
+
+        // Base precision is initialized to 1.0
+        let initial_precision = pc.levels[0].precision.to_vec2::<f32>()?;
+        assert_eq!(initial_precision[0][0], 1.0);
+
+        // Apply a calibrated confidence of 20% (0.2)
+        pc.modulate_precision(0.2)?;
+
+        let modulated_precision = pc.levels[0].precision.to_vec2::<f32>()?;
+        
+        // The precision matrix should now be scaled down to 0.2
+        assert!((modulated_precision[0][0] - 0.2).abs() < 0.001,
+            "Precision matrix did not scale correctly. Got {}", modulated_precision[0][0]);
+            
+        Ok(())
+    }
+
+    #[test]
+    fn test_modulate_precision_prevents_zero_vanishing_gradient() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let config = PCConfig::new(2, vec![8, 4]);
+        let mut pc = PredictiveCoding::new(config)?;
+
+        // If confidence is absolutely 0.0 (total failure historical rate)
+        pc.modulate_precision(0.0)?;
+
+        let modulated_precision = pc.levels[0].precision.to_vec2::<f32>()?;
+        
+        // It must clamp to 0.01 to prevent the network from entirely dying (vanishing gradients)
+        assert!((modulated_precision[0][0] - 0.01).abs() < 0.0001,
+            "Precision failed to clamp minimum bound. Got {}", modulated_precision[0][0]);
+            
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_sequence_accumulates_stats_and_progresses_time() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let config = PCConfig::new(2, vec![4, 2]);
+        let mut pc = PredictiveCoding::new(config)?;
+
+        // Create a sequence of 3 tokens, each with dimension 4. Shape: [3, 4]
+        let seq_data = vec![
+            0.1f32, 0.2, 0.3, 0.4, // Token 1
+            0.5, 0.6, 0.7, 0.8, // Token 2
+            0.9, 1.0, 1.1, 1.2, // Token 3
+        ];
+        let seq_tensor = Tensor::from_vec(seq_data, (3, 4), &device)?;
+
+        let stats = pc.infer_sequence(&seq_tensor, 5)?;
+
+        // Ensure stats accumulated over the 3 steps
+        assert!(stats.free_energy_history.len() > 5, "Should have multiple steps of history");
+        assert!(stats.total_surprise > 0.0, "Total surprise should be non-zero");
+
+        // Verify temporal progression actually happened (prev_beliefs != 0)
+        let prev_beliefs = pc.levels[0].prev_beliefs.to_vec2::<f32>()?;
+        let sum_prev: f32 = prev_beliefs.iter().map(|row| row[0]).sum();
+        
+        assert!(sum_prev > 0.0, "Temporal state (prev_beliefs) was not updated during sequence inference");
+
+        Ok(())
+    }
+}
 

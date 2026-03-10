@@ -23,6 +23,28 @@ impl ThoughtDecoder {
         })
     }
 
+    /// NEW: Dynamically expands the vocabulary matrix when new chunks are discovered
+    pub fn resize_vocab(&mut self, new_vocab_size: usize) -> Result<(), PCError> {
+        let old_vocab_size = self.w_vocab.shape().dims()[0];
+        if new_vocab_size <= old_vocab_size {
+            return Ok(());
+        }
+        
+        let old_tensor = self.w_vocab.as_tensor();
+        let belief_dim = old_tensor.dims()[1];
+        let added_size = new_vocab_size - old_vocab_size;
+        
+        // Initialize new vocabulary rows
+        let new_weights = Tensor::randn(0f32, 0.01f32, (added_size, belief_dim), &self.device)?;
+        
+        // Concatenate old weights with new weights to preserve existing knowledge
+        let combined = Tensor::cat(&[old_tensor, &new_weights], 0)?;
+        self.w_vocab = Var::from_tensor(&combined)?;
+        
+        tracing::info!("Expanded ThoughtDecoder vocabulary from {} to {}", old_vocab_size, new_vocab_size);
+        Ok(())
+    }
+
     /// Graph of Thoughts (Beam Search) with Length Normalization
     pub fn decode_sequence(&self, anchor_belief: &Tensor, max_steps: usize, beam_width: usize) -> Result<Vec<u32>, PCError> {
         self.decode_sequence_with_costs(anchor_belief, max_steps, beam_width, None)
@@ -36,8 +58,6 @@ impl ThoughtDecoder {
         beam_width: usize,
         action_costs: Option<&std::collections::HashMap<u32, f32>> // NEW
     ) -> Result<Vec<u32>, PCError> {
-        use std::collections::HashMap;
-        
         let anchor_flat = anchor_belief.flatten_all()?;
         let belief_dim = anchor_flat.dims()[0];
         let anchor_2d = anchor_flat.reshape((1, belief_dim))?;
@@ -257,6 +277,69 @@ mod tests {
             generated_seq, target_seq
         );
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dynamic_decoder_tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_decoder_resizes_vocab_safely() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let belief_dim = 16;
+        let mut decoder = ThoughtDecoder::new(belief_dim, 8, &device)?;
+
+        // Store original weights
+        let original_weights = decoder.w_vocab.as_tensor().to_vec2::<f32>()?;
+        
+        // Simulate discovering 3 new chunks (total vocab goes 8 -> 11)
+        decoder.resize_vocab(11)?;
+        
+        let new_weights = decoder.w_vocab.as_tensor().to_vec2::<f32>()?;
+        
+        // Verify dimensions expanded
+        assert_eq!(new_weights.len(), 11, "Matrix should have exactly 11 rows");
+        assert_eq!(new_weights[0].len(), 16, "Matrix should retain belief_dim width");
+        
+        // Verify foundational knowledge (rows 0-7) is PERFECTLY preserved
+        for i in 0..8 {
+            for j in 0..16 {
+                assert_eq!(new_weights[i][j], original_weights[i][j], "Old weights got corrupted during resize!");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_sequence_with_costs_routes_around_penalties() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let decoder = ThoughtDecoder::new(16, 8, &device)?;
+        let belief = Tensor::randn(0f32, 1.0, (16,), &device)?;
+        
+        // Decode normally
+        let default_plan = decoder.decode_sequence_with_costs(&belief, 3, 5, None)?;
+        assert!(!default_plan.is_empty());
+        
+        // Find the token it wants to choose first
+        let preferred_token = default_plan[0];
+        
+        // Apply a massive penalty to its preferred token
+        let mut costs = HashMap::new();
+        costs.insert(preferred_token, 100.0);
+        
+        // Decode with the cost penalty
+        let penalized_plan = decoder.decode_sequence_with_costs(&belief, 3, 5, Some(&costs))?;
+        
+        // The beam search should have actively routed around the expensive token
+        if !penalized_plan.is_empty() {
+            assert_ne!(penalized_plan[0], preferred_token,
+                "Action cost was ignored! Decoder still chose the penalized token.");
+        }
+        
         Ok(())
     }
 }

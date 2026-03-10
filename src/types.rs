@@ -231,6 +231,7 @@ pub struct StructuredState {
     pub entities: HashMap<String, String>,
     pub constraints: Vec<String>,
     pub assumptions: Vec<String>,
+    pub tests: String, // NEW: Task-specific assertions/unit tests
     pub raw_query: String,
 }
 
@@ -254,7 +255,7 @@ pub struct VerificationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
     pub raw_query: String,
-    pub query_embedding: Vec<f32>, // Used for fast cosine retrieval
+    pub query_sequence: Vec<Vec<f32>>, // NEW: Retains temporal sequence structure [seq_len, dim]
     pub novelty: f32,
     pub confidence: f32,
     pub generated_code: String,
@@ -364,7 +365,7 @@ mod cognitive_dictionary_tests {
         for _ in 0..4 {
             episodes.push(Episode {
                 raw_query: "test".into(),
-                query_embedding: vec![],
+                query_sequence: vec![], // Changed from query_embedding
                 novelty: 0.0,
                 confidence: 1.0,
                 generated_code: "".into(),
@@ -384,5 +385,29 @@ mod cognitive_dictionary_tests {
         let new_op2 = ThoughtOp::Dynamic("CHECK_CONDITION_EOF".into());
         assert!(dict.op_to_id.contains_key(&new_op1), "The combined chunk must exist in the dictionary");
         assert!(dict.op_to_id.contains_key(&new_op2), "The second combined chunk must exist in the dictionary");
+    }
+}
+
+#[cfg(test)]
+mod types_architecture_tests {
+    use super::*;
+
+    #[test]
+    fn test_structured_state_generates_correct_pc_context() {
+        let state = StructuredState {
+            goal: "Write a binary search tree".to_string(),
+            entities: HashMap::new(),
+            constraints: vec!["O(log n)".to_string()],
+            assumptions: vec!["The array is already sorted".to_string(), "Failed previously on empty array".to_string()],
+            tests: "assert bst([1,2,3], 2) == 1".to_string(),
+            raw_query: "Provide a BST".to_string(),
+        };
+
+        let context = state.get_pc_context();
+        
+        // The PC context must include both the goal and the corrective assumptions
+        // to ensure it learns from its past failures.
+        assert!(context.contains("Goal: Write a binary search tree"));
+        assert!(context.contains("Corrected Assumptions: The array is already sorted; Failed previously on empty array"));
     }
 }

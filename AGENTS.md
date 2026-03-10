@@ -3,6 +3,19 @@
 ## Project Overview
 NeuroFed (NeuroFed) Node is a decentralized federated AGI system based on pure hierarchical predictive coding. It implements a biologically plausible, fully decentralized, offline-first federated AGI system using Rust, candle framework, and Nostr protocol.
 
+## Project Ideas / Goals
+- Build a personal AI that can be used by other users and is not tied to any organization.
+- Self-study via proxy use, local/remote books, YouTube subtitles, internet research, and fact checking.
+- Strong coding capability with durable code knowledge; also strong text understanding and reasoning.
+- Final package size under 500 MB.
+- Use modern algorithms; support CPU/GPU/TPU when available; prioritize CPU cache locality.
+- Avoid long-term degradation (stability of learned knowledge over time).
+- TODO: Share database with other users (e.g., via Nostr). Support federated redundancy and multi-user desktop deployment to share compute resources and resist corporate centralization.
+- TODO: Viral and eye-candy experience (memorable UI/UX and shareable story).
+- License: GPL-3.0-or-later.
+- Support fast and slow thinking modes.
+- Primary target: x86_64_v3, 32 GB RAM.
+
 ## Current Status
 - Treat the current codebase as an experimental single-process prototype, not a fully integrated node.
 - The authoritative architecture is the code under `src/`, not the aspirational module list below.

@@ -178,6 +178,49 @@ impl CodeVerifier {
         }
     }
 
+    /// Executes code with embedded unit tests (extracts test code from the tests string)
+    /// Returns Ok(stdout) if both code and tests pass, Err(stderr) if either fails
+    pub fn execute_with_tests(&self, code: &str, tests: &str) -> Result<String, String> {
+        if !self.enabled {
+            return Ok("Simulation disabled. Assuming success.".to_string());
+        }
+        
+        // Combine code and tests into a single executable script
+        let combined_script = format!("{}\n\n{}", code, tests);
+        
+        // Use a unique temporary filename to avoid concurrency issues
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_path = format!(".neurofed_sim_env_{}.py", timestamp);
+        
+        if let Err(e) = std::fs::write(&file_path, &combined_script) {
+            return Err(format!("Simulator IO Error: {}", e));
+        }
+
+        let output = Command::new("python3")
+            .arg(&file_path)
+            .output();
+
+        let _ = std::fs::remove_file(&file_path); // Cleanup
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                
+                if out.status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(stderr)
+                }
+            }
+            Err(e) => Err(format!("Failed to invoke python3: {}", e)),
+        }
+    }
+
     /// Pre-execution Symbolic Check: Validates Python AST (Abstract Syntax Tree)
     pub fn verify_syntax_ast(&self, code: &str) -> Result<(), String> {
         if !self.enabled { return Ok(()); }
@@ -717,5 +760,40 @@ mod integration_tests {
         assert!(pc.precision_calculator.is_none());
         
         println!("Integration test passed: Precision weighting disabled works correctly");
+    }
+}
+
+#[cfg(test)]
+mod test_harness_verification_tests {
+    use super::*;
+
+    #[test]
+    fn test_execute_with_tests_success() {
+        let verifier = CodeVerifier::new(true);
+        
+        let code = "def multiply(a, b):\n    return a * b";
+        let assertions = "assert multiply(3, 4) == 12, 'Math failed'\nprint('All tests passed!')";
+        
+        let result = verifier.execute_with_tests(code, assertions);
+        
+        assert!(result.is_ok(), "Test harness should pass correct logic");
+        assert!(result.unwrap().contains("All tests passed!"));
+    }
+
+    #[test]
+    fn test_execute_with_tests_catches_hallucination() {
+        let verifier = CodeVerifier::new(true);
+        
+        // LLM generates code that doesn't crash, but does the wrong thing
+        let code = "def multiply(a, b):\n    return a + b"; // Accidental addition
+        let assertions = "assert multiply(3, 4) == 12, 'Math failed'";
+        
+        let result = verifier.execute_with_tests(code, assertions);
+        
+        // The CodeVerifier MUST fail this, providing the AssertionError stderr
+        assert!(result.is_err(), "Test harness MUST fail incorrect logic");
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("AssertionError"), "Error missing AssertionError flag: {}", err_msg);
+        assert!(err_msg.contains("Math failed"), "Error missing custom assertion message");
     }
 }
