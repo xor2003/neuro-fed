@@ -15,6 +15,9 @@ use serde_json::json;
 use tracing::{info, warn, error};
 use chrono::Utc;
 
+// Для статической карты стоимости действий
+use lazy_static::lazy_static;
+
 pub mod metrics;
 pub mod types;
 pub mod components;
@@ -33,6 +36,21 @@ use crate::semantic_cache::SemanticCache;
 use crate::knowledge_filter::CodeVerifier;
 use crate::openai_proxy::calibration::CalibrationStore;
 use crate::openai_proxy::client::BackendClient;
+
+// Добавляем статический словарь цен действий
+lazy_static::lazy_static! {
+    static ref ACTION_COSTS: HashMap<u32, f32> = {
+        let mut m = HashMap::new();
+        m.insert(0, 0.1); // Define
+        m.insert(1, 0.2); // Iterate
+        m.insert(2, 0.3); // Check
+        m.insert(3, 0.5); // Compute (может быть ресурсоемким)
+        m.insert(4, 0.4); // Aggregate
+        m.insert(5, 0.1); // Return
+        m.insert(6, 1.0); // Explain (требует много генерации)
+        m
+    };
+}
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
@@ -133,7 +151,7 @@ impl OpenAiProxy {
 
             // Action Selection
             let decoder = self.thought_decoder.read().await;
-            let thought_ids = decoder.decode_sequence_with_costs(&current_belief, 1, 1, None)
+            let thought_ids = decoder.decode_sequence_with_costs(&current_belief, 1, 1, Some(&ACTION_COSTS))
                 .map_err(|e| ProxyError::PCError(e.to_string()))?;
             drop(decoder);
             

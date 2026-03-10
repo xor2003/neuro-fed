@@ -38,10 +38,18 @@ impl PCLevel {
     }
 
     /// NEW: Causal Transition Model. Predictions come from BOTH top-down spatial weights AND lateral temporal weights.
+    /// ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
     pub fn predict(&mut self, beliefs_next: &Tensor) -> CandleResult<()> {
         let spatial_pred = self.weights.matmul(beliefs_next)?;
-        let temporal_pred = self.temporal_weights.matmul(&self.prev_beliefs)?;
-        self.predictions = spatial_pred.broadcast_add(&temporal_pred)?;
+        
+        // ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
+        let prev_beliefs_sum = self.prev_beliefs.sum_all()?.to_scalar::<f32>()?;
+        if prev_beliefs_sum.abs() > 1e-6 {
+            let temporal_pred = self.temporal_weights.matmul(&self.prev_beliefs)?;
+            self.predictions = spatial_pred.broadcast_add(&temporal_pred)?;
+        } else {
+            self.predictions = spatial_pred;
+        }
         Ok(())
     }
 
@@ -113,5 +121,34 @@ impl PCLevel {
         // Keep memory_buffer for backward compatibility
         // In a full implementation, this would be used for temporal context
         let _ = beliefs;
+    }
+}
+
+#[cfg(test)]
+mod temporal_logic_tests {
+    use super::*;
+
+    #[test]
+    fn test_temporal_prediction_skipped_if_prev_state_is_zero() -> CandleResult<()> {
+        let device = Device::Cpu;
+        let mut level = PCLevel::new(4, 2, &device)?;
+        let next_beliefs = Tensor::randn(0f32, 1.0, (2, 1), &device)?;
+        
+        // Изначально prev_beliefs = 0. Предсказание должно быть чисто пространственным.
+        let spatial_prediction = level.weights.matmul(&next_beliefs)?;
+        level.predict(&next_beliefs)?;
+        
+        // Compute difference manually
+        let predictions_vec = level.predictions.to_vec2::<f32>()?;
+        let spatial_vec = spatial_prediction.to_vec2::<f32>()?;
+        let mut diff = 0.0;
+        for (pred_row, spatial_row) in predictions_vec.iter().zip(spatial_vec.iter()) {
+            for (&p, &s) in pred_row.iter().zip(spatial_row.iter()) {
+                diff += (p - s).abs();
+            }
+        }
+        assert!(diff < 1e-6, "Temporal prediction was not skipped for zero prev_beliefs");
+        
+        Ok(())
     }
 }
