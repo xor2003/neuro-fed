@@ -107,19 +107,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_sleep_manager_clears_memory() {
-        let pc_config = PCConfig::new(2, vec![10, 5]);
+        let pc_config = PCConfig::new(2, vec![3, 2]); // Match embedding dimension
         let pc = PredictiveCoding::new(pc_config).unwrap();
         let pc_hierarchy = Arc::new(RwLock::new(pc));
         
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
         let decoder = Arc::new(RwLock::new(
-            ThoughtDecoder::new(5, 8, &Device::Cpu).unwrap()
+            ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap() // belief_dim = top level dim (2)
         ));
         
         let mut episodes = VecDeque::new();
         episodes.push_back(Episode {
             raw_query: "test".into(),
-            query_sequence: vec![vec![0.1, 0.2, 0.3]],
+            query_sequence: vec![vec![0.1, 0.2, 0.3]], // dim=3 matches PC input dim
             novelty: 3.0,
             confidence: 0.9,
             generated_code: "".into(),
@@ -138,7 +138,7 @@ mod tests {
         
         // Process sleep cycle
         let result = sleep_mgr.process_sleep_cycle().await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Sleep phase failed: {:?}", result.err());
         
         // Check that memory is cleared
         let memory = episodic_memory.read().await;

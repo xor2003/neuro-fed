@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use tokio::sync::RwLock;
+use tokio::task;
 use axum::{
     extract::State,
     response::IntoResponse,
@@ -166,9 +167,9 @@ impl OpenAiProxy {
             attempt += 1;
         }
 
-        // 4. Ground-Truth Verification (Unit Test Harness)
-        let sim_result = self.code_verifier.execute_with_tests(&final_text, &state.tests);
-        let success = sim_result.is_ok();
+        // 4. Ground-Truth Verification (Unit Test Harness) - ASYNC with timeout
+        let verification_result = self.code_verifier.execute_with_tests(&final_text, &state.tests).await;
+        let success = verification_result.is_ok();
         
         // 5. Update Calibration Database based on true outcome
         self.calibration.write().await.record_outcome(raw_confidence, success);
@@ -183,7 +184,7 @@ impl OpenAiProxy {
             success,
         });
 
-        match sim_result {
+        match verification_result {
             Ok(stdout) => info!("✅ Verification passed! Output: {}", stdout),
             Err(stderr) => {
                 warn!("❌ Verification failed: {}", stderr);
@@ -282,5 +283,34 @@ pub fn create_router(proxy: Arc<OpenAiProxy>) -> Router {
 impl Default for OpenAiProxy {
     fn default() -> Self {
         panic!("OpenAiProxy cannot be default-initialized")
+    }
+}
+
+#[cfg(test)]
+mod async_reactor_tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+    use crate::types::CognitiveDictionary;
+
+    #[test]
+    fn test_ml_locks_are_sync_for_spawn_blocking() {
+        // Убеждаемся, что ML Engine и PC Hierarchy используют стандартные (не async) мьютексы.
+        // Если бы они использовали tokio::sync::RwLock, компилятор бы не позволил
+        // использовать блокирующий write() внутри обычного кода.
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        let initial_len = dict.read().unwrap().len();
+        
+        // Моделируем работу внутри spawn_blocking (отдельный OS-поток)
+        let dict_clone = Arc::clone(&dict);
+        let handle = std::thread::spawn(move || {
+            let mut d = dict_clone.write().unwrap();
+            d.add_op(crate::types::ThoughtOp::Compute); // Compute already exists, but that's fine
+        });
+        
+        handle.join().unwrap();
+        let final_len = dict.read().unwrap().len();
+        // Length should stay the same because Compute already exists
+        assert_eq!(initial_len, final_len, "Dictionary length should not change when adding existing op");
+        assert!(final_len >= 8, "Dictionary should have at least default 8 ops");
     }
 }

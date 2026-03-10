@@ -81,9 +81,10 @@ impl PCLevel {
         let (input_dim, _) = self.weights.shape().dims2()?;
         let effective_lr = if mu_pc_scaling { eta / (input_dim as f32).sqrt() } else { eta };
         
-        let eta_tensor = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
+        // Create eta tensor for spatial weights update
+        let eta_tensor_spatial = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
             .broadcast_as(matmul_result.shape())?;
-        let mut delta_weights = matmul_result.mul(&eta_tensor)?;
+        let mut delta_weights = matmul_result.mul(&eta_tensor_spatial)?;
         
         if let Some(precision_matrix) = precision {
             let broadcasted_precision = precision_matrix.broadcast_as(delta_weights.shape())?;
@@ -97,7 +98,11 @@ impl PCLevel {
         
         // NEW: Also update temporal causal weights using Hebbian learning on prev_beliefs
         let prev_t = self.prev_beliefs.t()?;
-        let temporal_update = self.errors.matmul(&prev_t)?.mul(&eta_tensor)?; // Use same learning rate
+        let temporal_matmul = self.errors.matmul(&prev_t)?;
+        // Create separate eta tensor for temporal update with correct shape
+        let eta_tensor_temporal = Tensor::from_slice(&[effective_lr], (1, 1), &temporal_matmul.device())?
+            .broadcast_as(temporal_matmul.shape())?;
+        let temporal_update = temporal_matmul.mul(&eta_tensor_temporal)?;
         let decayed_temporal = (&self.temporal_weights * (1.0 - weight_decay))?;
         self.temporal_weights = decayed_temporal.broadcast_add(&temporal_update)?;
         

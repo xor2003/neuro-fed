@@ -12,6 +12,10 @@ use tokio::time::interval;
 
 use crate::types::{UserInput, FileEvent, NodeError, NostrEvent};
 use crate::pc_hierarchy::PredictiveCoding;
+use crate::sleep_phase::SleepManager;
+use crate::pc_decoder::ThoughtDecoder;
+use crate::types::CognitiveDictionary;
+use crate::openai_proxy::calibration::CalibrationStore;
 
 pub struct NodeLoop {
     rx_user_input: mpsc::Receiver<UserInput>,
@@ -20,6 +24,10 @@ pub struct NodeLoop {
     stop_signal: Arc<AtomicBool>,
     // Optional PC hierarchy for dream phase
     pc_hierarchy: Option<Arc<RwLock<PredictiveCoding>>>,
+    // Sleep manager for consolidation
+    sleep_manager: Option<Arc<SleepManager>>,
+    // Episodic memory for sleep phase
+    episodic_memory: Option<Arc<RwLock<std::collections::VecDeque<crate::types::Episode>>>>,
     // Inactivity tracking for dream phase
     last_activity_time: Arc<RwLock<Instant>>,
     dream_phase_interval: Duration,
@@ -38,6 +46,8 @@ impl NodeLoop {
             rx_nostr_events,
             stop_signal: Arc::new(AtomicBool::new(false)),
             pc_hierarchy: None,
+            sleep_manager: None,
+            episodic_memory: None,
             last_activity_time: Arc::new(RwLock::new(Instant::now())),
             dream_phase_interval: Duration::from_secs(300), // 5 minutes default
         }
@@ -49,6 +59,8 @@ impl NodeLoop {
         rx_file_events: mpsc::Receiver<FileEvent>,
         rx_nostr_events: mpsc::Receiver<NostrEvent>,
         pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
+        sleep_manager: Option<Arc<SleepManager>>,
+        episodic_memory: Option<Arc<RwLock<std::collections::VecDeque<crate::types::Episode>>>>,
         dream_phase_interval: Option<Duration>,
     ) -> Self {
         Self {
@@ -57,6 +69,8 @@ impl NodeLoop {
             rx_nostr_events,
             stop_signal: Arc::new(AtomicBool::new(false)),
             pc_hierarchy: Some(pc_hierarchy),
+            sleep_manager,
+            episodic_memory,
             last_activity_time: Arc::new(RwLock::new(Instant::now())),
             dream_phase_interval: dream_phase_interval.unwrap_or(Duration::from_secs(300)), // 5 minutes default
         }
@@ -164,17 +178,23 @@ impl NodeLoop {
         
         if inactivity_duration >= self.dream_phase_interval {
             tracing::info!(
-                "Inactivity detected ({:?}), triggering dream phase for offline consolidation",
+                "Inactivity detected ({:?}), triggering sleep phase for memory consolidation",
                 inactivity_duration
             );
             
-            if let Some(pc) = &self.pc_hierarchy {
-                // Use write lock for background processing
+            // Trigger SleepManager if available
+            if let Some(sleep_mgr) = &self.sleep_manager {
+                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
+                    tracing::error!("Sleep cycle failed: {}", e);
+                } else {
+                    tracing::info!("Sleep cycle completed successfully");
+                }
+            } else if let Some(pc) = &self.pc_hierarchy {
+                // Fallback: basic dream phase without SleepManager
                 let _pc_write = pc.write().await;
-                // In a full implementation, we would run pc.dream() here
-                tracing::info!("Dream phase running (offline weight consolidation)");
+                tracing::info!("Basic dream phase running (offline weight consolidation)");
             } else {
-                tracing::debug!("Dream phase skipped: no PC hierarchy configured");
+                tracing::debug!("Sleep phase skipped: no PC hierarchy or SleepManager configured");
             }
             
             // Reset activity time to prevent immediate retrigger

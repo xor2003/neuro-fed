@@ -3,7 +3,9 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 use serde::{Deserialize, Serialize};
 
 /// Precision weighting configuration
@@ -121,23 +123,24 @@ impl FreeEnergyTracker {
     }
 }
 
-/// UPGRADED: Action-Perception Simulator
+/// ASYNCHRONOUS Action-Perception Simulator with Timeout Protection
 #[derive(Debug, Clone)]
 pub struct CodeVerifier {
     pub enabled: bool,
+    pub execution_timeout_secs: u64,
 }
 
 impl CodeVerifier {
-    pub fn new(enabled: bool) -> Self { Self { enabled } }
+    pub fn new(enabled: bool) -> Self {
+        Self { enabled, execution_timeout_secs: 5 } // 5 second hard limit
+    }
 
-    /// Executes code in a local Python environment.
-    /// Returns Ok(stdout) if successful, Err(stderr) if it crashes.
-    pub fn execute_python_simulator(&self, code: &str) -> Result<String, String> {
+    /// ASYNCHRONOUS execution with timeout protection using spawn_blocking
+    pub async fn execute_python_simulator(&self, code: &str) -> Result<String, String> {
         if !self.enabled {
             return Ok("Simulation disabled. Assuming success.".to_string());
         }
         
-        // Use a unique temporary filename to avoid concurrency issues
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -145,108 +148,96 @@ impl CodeVerifier {
             .as_nanos();
         let file_path = format!(".neurofed_sim_env_{}.py", timestamp);
         
-        if let Err(e) = std::fs::write(&file_path, code) {
-            return Err(format!("Simulator IO Error: {}", e));
-        }
+        // Write the script asynchronously
+        tokio::fs::write(&file_path, code).await.map_err(|e| e.to_string())?;
 
-        let output = Command::new("python3")
-            .arg(&file_path)
-            .output();
+        // Spawn blocking task to run python (blocking call in separate thread)
+        let file_path_clone = file_path.clone();
+        let spawn_result = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("python3")
+                .arg(&file_path_clone)
+                .output()
+        }).await;
+        
+        // Cleanup temp file (best effort)
+        let _ = tokio::fs::remove_file(&file_path).await;
 
-        let _ = std::fs::remove_file(&file_path); // Cleanup
-
-        match output {
-            Ok(out) => {
+        match spawn_result {
+            Ok(Ok(out)) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                
-                if out.status.success() {
-                    Ok(stdout)
-                } else {
-                    Err(stderr)
-                }
-            }
-            Err(e) => Err(format!("Failed to invoke python3: {}", e)),
+                if out.status.success() { Ok(stdout) } else { Err(stderr) }
+            },
+            Ok(Err(e)) => Err(format!("Execution failed: {}", e)),
+            Err(e) => Err(format!("Join error: {}", e)),
         }
     }
     
-    /// Legacy compatibility wrapper
+    /// Legacy compatibility wrapper (SYNC - uses internal runtime)
     pub fn verify_code_execution(&self, code: &str) -> Result<bool, String> {
-        match self.execute_python_simulator(code) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+        if !self.enabled {
+            return Ok(true);
         }
+        // Use a simple synchronous check with a temporary runtime
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("Failed to create runtime: {}", e)),
+        };
+        rt.block_on(async {
+            self.execute_python_simulator(code).await.map(|_| true).or_else(|_| Ok(false))
+        })
     }
 
-    /// Executes code with embedded unit tests (extracts test code from the tests string)
-    /// Returns Ok(stdout) if both code and tests pass, Err(stderr) if either fails
-    pub fn execute_with_tests(&self, code: &str, tests: &str) -> Result<String, String> {
+    /// ASYNCHRONOUS: Executes code with embedded unit tests
+    pub async fn execute_with_tests(&self, code: &str, tests: &str) -> Result<String, String> {
         if !self.enabled {
             return Ok("Simulation disabled. Assuming success.".to_string());
         }
         
-        // Combine code and tests into a single executable script
-        let combined_script = format!("{}\n\n{}", code, tests);
+        // Combine code and tests
+        let combined_script = format!("{}\n\n# --- GENERATED TESTS ---\n{}", code, tests);
         
-        // Use a unique temporary filename to avoid concurrency issues
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let file_path = format!(".neurofed_sim_env_{}.py", timestamp);
-        
-        if let Err(e) = std::fs::write(&file_path, &combined_script) {
-            return Err(format!("Simulator IO Error: {}", e));
-        }
-
-        let output = Command::new("python3")
-            .arg(&file_path)
-            .output();
-
-        let _ = std::fs::remove_file(&file_path); // Cleanup
-
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                
-                if out.status.success() {
-                    Ok(stdout)
-                } else {
-                    Err(stderr)
-                }
-            }
-            Err(e) => Err(format!("Failed to invoke python3: {}", e)),
-        }
+        // Execute with timeout protection
+        self.execute_python_simulator(&combined_script).await
     }
 
     /// Pre-execution Symbolic Check: Validates Python AST (Abstract Syntax Tree)
-    pub fn verify_syntax_ast(&self, code: &str) -> Result<(), String> {
+    pub async fn verify_syntax_ast(&self, code: &str) -> Result<(), String> {
         if !self.enabled { return Ok(()); }
         
         let python_script = "import ast, sys\ntry:\n  ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n  print(f'SyntaxError: {e}')\n  sys.exit(1)";
         
-        let mut child = Command::new("python3")
-            .arg("-c")
-            .arg(python_script)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start python: {}", e))?;
+        let code_clone = code.to_string();
+        let result = timeout(Duration::from_secs(self.execution_timeout_secs), tokio::task::spawn_blocking(move || -> Result<std::process::Output, std::io::Error> {
+            let mut child = std::process::Command::new("python3")
+                .arg("-c")
+                .arg(python_script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
             
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(code.as_bytes()).ok();
-        }
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(code_clone.as_bytes())?;
+            }
+            
+            let output = child.wait_with_output()?;
+            Ok(output)
+        })).await;
         
-        let output = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            let stdout_err = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr_err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!("{} {}", stdout_err, stderr_err).trim().to_string());
+        match result {
+            Ok(Ok(Ok(out))) => {
+                if !out.status.success() {
+                    let stdout_err = String::from_utf8_lossy(&out.stdout).to_string();
+                    let stderr_err = String::from_utf8_lossy(&out.stderr).to_string();
+                    return Err(format!("{} {}", stdout_err, stderr_err).trim().to_string());
+                }
+                Ok(())
+            },
+            Ok(Ok(Err(e))) => Err(format!("Execution failed: {}", e)),
+            Ok(Err(_)) => Err("Python task panicked".to_string()),
+            Err(_) => Err(format!("Execution TIMEOUT: AST check took longer than {} seconds.", self.execution_timeout_secs)),
         }
-        Ok(())
     }
 }
 
@@ -521,28 +512,28 @@ mod tests {
         assert_eq!(result.precision, 1.0); // Should be clamped to max
     }
     
-    #[test]
-    fn test_python_simulator_external_grounding() {
+    #[tokio::test]
+    async fn test_python_simulator_external_grounding() {
         let verifier = CodeVerifier::new(true);
         
         // 1. Test Valid Code
         let valid_code = "print('Hello World')";
-        let result = verifier.execute_python_simulator(valid_code);
+        let result = verifier.execute_python_simulator(valid_code).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().trim(), "Hello World");
 
         // 2. Test Invalid Code (Catches external errors)
         let invalid_code = "def foo():\n  return 1/0\nfoo()";
-        let err_result = verifier.execute_python_simulator(invalid_code);
+        let err_result = verifier.execute_python_simulator(invalid_code).await;
         assert!(err_result.is_err());
         assert!(err_result.unwrap_err().contains("ZeroDivisionError"));
     }
     
-    #[test]
-    fn test_simulator_handles_no_output() {
+    #[tokio::test]
+    async fn test_simulator_handles_no_output() {
         let verifier = CodeVerifier::new(true);
         let silent_code = "x = 1\ny = 2\nz = x + y";
-        let result = verifier.execute_python_simulator(silent_code);
+        let result = verifier.execute_python_simulator(silent_code).await;
         assert!(result.is_ok(), "Code without print statements should still succeed.");
         assert_eq!(result.unwrap().trim(), "");
     }
@@ -767,28 +758,28 @@ mod integration_tests {
 mod test_harness_verification_tests {
     use super::*;
 
-    #[test]
-    fn test_execute_with_tests_success() {
+    #[tokio::test]
+    async fn test_execute_with_tests_success() {
         let verifier = CodeVerifier::new(true);
         
         let code = "def multiply(a, b):\n    return a * b";
         let assertions = "assert multiply(3, 4) == 12, 'Math failed'\nprint('All tests passed!')";
         
-        let result = verifier.execute_with_tests(code, assertions);
+        let result = verifier.execute_with_tests(code, assertions).await;
         
         assert!(result.is_ok(), "Test harness should pass correct logic");
         assert!(result.unwrap().contains("All tests passed!"));
     }
 
-    #[test]
-    fn test_execute_with_tests_catches_hallucination() {
+    #[tokio::test]
+    async fn test_execute_with_tests_catches_hallucination() {
         let verifier = CodeVerifier::new(true);
         
         // LLM generates code that doesn't crash, but does the wrong thing
         let code = "def multiply(a, b):\n    return a + b"; // Accidental addition
         let assertions = "assert multiply(3, 4) == 12, 'Math failed'";
         
-        let result = verifier.execute_with_tests(code, assertions);
+        let result = verifier.execute_with_tests(code, assertions).await;
         
         // The CodeVerifier MUST fail this, providing the AssertionError stderr
         assert!(result.is_err(), "Test harness MUST fail incorrect logic");

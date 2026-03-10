@@ -8,8 +8,10 @@ use hnsw_rs::prelude::*;
 use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
 use anyhow::Result;
+use sqlx::SqlitePool;
 
 use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse};
+use crate::persistence::{PCPersistence, SemanticCacheEntryDB};
 
 /// Semantic cache entry with vector embedding
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +24,7 @@ pub struct SemanticCacheEntry {
     pub last_accessed: u64,
 }
 
-/// High-performance semantic cache with HNSW vector index
+/// High-performance semantic cache with HNSW vector index and SQLite persistence
 pub struct SemanticCache {
     // In-memory cache for fast response retrieval
     cache: Cache<u32, SemanticCacheEntry>,
@@ -38,6 +40,8 @@ pub struct SemanticCache {
     embedding_dim: usize,
     // Similarity threshold
     similarity_threshold: f32,
+    // Optional database connection for persistence
+    db_pool: Option<SqlitePool>,
 }
 
 impl SemanticCache {
@@ -46,6 +50,7 @@ impl SemanticCache {
         max_cache_size: u64,
         embedding_dim: usize,
         similarity_threshold: f32,
+        db_pool: Option<SqlitePool>,
     ) -> Self {
         // Configure HNSW parameters
         let max_nb_connection = 16;
@@ -75,6 +80,7 @@ impl SemanticCache {
             max_cache_size,
             embedding_dim,
             similarity_threshold,
+            db_pool,
         }
     }
     
@@ -144,6 +150,7 @@ impl SemanticCache {
         request: OpenAiRequest,
         response: OpenAiResponse,
         embedding: Vec<f32>,
+        db: Option<&PCPersistence>, // Optional database for persistence
     ) -> Result<()> {
         // Ensure embedding has correct dimension
         if embedding.len() != self.embedding_dim {
@@ -178,6 +185,14 @@ impl SemanticCache {
         self.vector_index.insert((&embedding, id as usize));
         
         debug!("Added new entry to semantic cache with ID: {}", id);
+        
+        // Persist to database if available
+        if let Some(db) = db {
+            if let Err(e) = self.save_entry_to_db(db, id).await {
+                warn!("Failed to persist cache entry {}: {}", id, e);
+            }
+        }
+        
         Ok(())
     }
     
@@ -218,17 +233,117 @@ impl SemanticCache {
         info!("Semantic cache cleared");
     }
     
-    /// Load cache from database (to be implemented with persistence)
-    pub async fn load_from_db(&mut self, _db_path: &str) -> Result<()> {
-        // TODO: Implement loading from SQLite
-        warn!("Loading from database not yet implemented");
+    /// Load cache from database on startup
+    pub async fn load_from_db(&mut self, db: &PCPersistence) -> Result<()> {
+        let Some(pool) = &self.db_pool else {
+            warn!("No database pool configured, skipping load");
+            return Ok(());
+        };
+        
+        let entries = db.load_semantic_cache_entries().await?;
+        let entry_count = entries.len();
+        info!("Loading {} entries from semantic cache DB", entry_count);
+        
+        for db_entry in entries {
+            // Deserialize embedding from bytes
+            let embedding: Vec<f32> = bincode::deserialize(&db_entry.embedding)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize embedding: {}", e))?;
+            
+            // Reconstruct request and response from JSON
+            let request: OpenAiRequest = serde_json::from_str(&db_entry.prompt_text)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+            let response: OpenAiResponse = serde_json::from_str(&db_entry.response_json)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))?;
+            
+            let id = db_entry.id as u32;
+            
+            // Create cache entry
+            let entry = SemanticCacheEntry {
+                id,
+                request,
+                response,
+                embedding: embedding.clone(),
+                access_count: db_entry.access_count as u64,
+                last_accessed: db_entry.last_accessed as u64,
+            };
+            
+            // Insert into Moka cache
+            self.cache.insert(id, entry.clone()).await;
+            
+            // Insert into hash mapping
+            let request_hash = self.generate_request_hash(&entry.request);
+            self.hash_to_id.insert(request_hash, id);
+            
+            // Insert into HNSW vector index
+            self.vector_index.insert((&embedding, id as usize));
+            
+            // Update next_id to avoid collisions
+            if id >= self.next_id {
+                self.next_id = id + 1;
+            }
+        }
+        
+        info!("Loaded {} entries from semantic cache (HNSW: {}, hashmap: {})",
+            entry_count,
+            self.vector_index.get_nb_point(),
+            self.hash_to_id.len());
+        
         Ok(())
     }
     
-    /// Save cache to database (to be implemented with persistence)
-    pub async fn save_to_db(&self, _db_path: &str) -> Result<()> {
-        // TODO: Implement saving to SQLite
-        warn!("Saving to database not yet implemented");
+    /// Save a single cache entry to database (called after add_to_cache)
+    pub async fn save_entry_to_db(&self, db: &PCPersistence, id: u32) -> Result<()> {
+        let Some(entry) = self.cache.get(&id).await else {
+            return Ok(()); // Entry was evicted
+        };
+        
+        // Serialize embedding to bytes
+        let embedding_bytes = bincode::serialize(&entry.embedding)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize embedding: {}", e))?;
+        
+        // Serialize request and response to JSON
+        let request_json = serde_json::to_string(&entry.request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
+        let response_json = serde_json::to_string(&entry.response)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize response: {}", e))?;
+        
+        // Generate prompt hash
+        let prompt_hash = self.generate_request_hash(&entry.request);
+        
+        let db_entry = SemanticCacheEntryDB {
+            id: id as i64,
+            prompt_hash,
+            prompt_text: request_json,
+            response_json: response_json,
+            embedding: embedding_bytes,
+            access_count: entry.access_count as i64,
+            last_accessed: entry.last_accessed as i64,
+        };
+        
+        db.save_semantic_cache_entry(&db_entry).await?;
+        debug!("Saved cache entry {} to database", id);
+        Ok(())
+    }
+    
+    /// Save all cache entries to database (bulk operation)
+    pub async fn save_all_to_db(&self, db: &PCPersistence) -> Result<()> {
+        let Some(_pool) = &self.db_pool else {
+            warn!("No database pool configured, skipping save");
+            return Ok(());
+        };
+        
+        let stats = self.get_stats().await;
+        info!("Saving {} cache entries to database", stats.cache_size);
+        
+        // Iterate through all entries in the cache
+        for (id_arc, entry) in self.cache.iter() {
+            let id = *id_arc;
+            if let Err(e) = self.save_entry_to_db(db, id).await {
+                warn!("Failed to save entry {}: {}", id, e);
+            }
+        }
+        
+        info!("Saved {} cache entries to database", stats.cache_size);
         Ok(())
     }
 }

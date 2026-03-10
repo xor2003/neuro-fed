@@ -20,6 +20,7 @@ pub mod pc_level;
 pub mod pc_decoder;
 pub mod persistence;
 pub mod semantic_cache;
+pub mod sleep_phase;
 pub mod types;
 pub mod pow_verifier;
 
