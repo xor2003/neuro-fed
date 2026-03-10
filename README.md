@@ -2,6 +2,14 @@
 
 **The first living cell of the decentralized, federated Global Brain.**
 
+## Project Status
+
+The repository currently builds as an experimental prototype. The code path that is concretely wired today is:
+
+`main.rs` -> GGUF/tokenizer load in `ml_engine.rs` -> predictive-coding inference in `pc_hierarchy.rs`
+
+Other subsystems such as the async node loop, brain sharing, federation, and proxy routing should be treated as roadmap work unless they are explicitly called out below as implemented. Read the current code as a prototype, not as a finished distributed node.
+
 NeuroFed Node is a biologically plausible, offline-first AI system built on **Pure Hierarchical Predictive Coding (PC)**. It runs locally on your CPU or GPU, continuously learning from your interactions, and federates its knowledge over the Nostr network. 
 
 It is not just another LLM wrapper—it is a continuous-learning cognitive engine that acts as a transparent proxy for your existing AI tools, creating a highly personalized "digital twin" that earns crypto (Zaps) by sharing conceptual breakthroughs with a decentralized network.
@@ -26,6 +34,40 @@ It learns your codebase, your writing style, and your logic—100% privately. Th
 *   **🧠 "I Know Kung Fu" Brain Downloads:** Because NeuroFed separates *language* from *logic*, the logic weights are tiny (~50MB). You can instantly download a fully matured "Senior Rust Developer Brain" or "Medical Diagnostics Brain" shared by the community via Nostr Blossom.
 *   **💸 Earn While You Think:** If your node discovers a highly efficient way to solve a problem, it broadcasts the "Error Delta" to the network. If other nodes find your delta useful, they automatically send Lightning Network micropayments (Zaps) to your wallet.
 *   **🛌 Sleep & Dream Mode:** When you step away from your computer, your node goes to sleep. It replays the day's most surprising interactions, consolidates memories, and mathematically optimizes its worldview (minimizing global free energy).
+
+## Current Architecture Snapshot
+
+- `src/main.rs` is still a smoke-test style executable: it loads a local model, creates a PC hierarchy, runs one sample inference, then waits for `CTRL+C`.
+- `src/ml_engine.rs` is the active frontend of the system. It embeds text by loading GGUF tensors directly and pooling token embeddings.
+- `src/pc_hierarchy.rs`, `src/pc_level.rs`, and `src/pc_types.rs` are the closest thing to the current core.
+- `src/config.rs` contains the main runtime config surface, while `src/types.rs` still carries overlapping legacy/common structs.
+- `src/persistence.rs` and `src/model_manager.rs` contain substantial implementation, but they are not yet fully integrated into the runtime entrypoint.
+
+## Major Architectural Risks
+
+1. Split-brain domain model.
+   `src/config.rs`, `src/types.rs`, and `src/pc_types.rs` define overlapping concepts such as config, errors, and PC-related types. That increases adapter code, silent defaulting, and long-term schema drift.
+
+2. Runtime path is much narrower than the module graph.
+   The current executable does not yet orchestrate the node loop, proxy, federation, persistence, and brain-sharing layers together. That makes architectural assumptions easy to overstate and hard to validate under real load.
+
+3. Shared mutable state will serialize throughput.
+   Core components are wrapped behind `Arc<Mutex<...>>`. That is acceptable for bootstrapping, but once request handling, background learning, and federation run concurrently, those locks become a latency and contention hotspot.
+
+4. Initialization is brittle and side-effect heavy.
+   Model startup depends on hard-coded local paths and may attempt fallback downloads for tokenizer assets. That makes reproducibility, offline behavior, and deployment predictability weaker than the README currently implies.
+
+5. Event orchestration is polling-based and mostly unimplemented.
+   `src/node_loop.rs` has the shape of a runtime loop, but the handlers are stubs and the loop currently polls intervals before awaiting channel receives. That is fine for scaffolding, but it is not yet a strong production concurrency design.
+
+## TODO
+
+- Integrate `src/node_loop.rs` into the runtime and replace its placeholder handlers with real orchestration logic.
+- Integrate `src/brain_manager.rs` end-to-end before presenting brain sharing as an available workflow.
+- Integrate federation and proxy routing into the executable path before documenting them as active runtime features.
+- Collapse duplicated config/type definitions into one canonical source per concept.
+- Make model initialization deterministic and explicitly offline-safe.
+- Add integration tests for the real end-to-end path instead of relying on module presence as evidence of integration.
 
 ### Recent Enhancements
 - **Early Exiting Inference:** PC inference now stops early when free energy drops below a configurable convergence threshold, saving compute time.

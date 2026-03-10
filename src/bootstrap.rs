@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::info;
 use candle_core::Tensor;
 use crate::ml_engine::MLEngine;
@@ -8,18 +8,18 @@ use crate::pc_hierarchy::PredictiveCoding;
 use crate::types::{CognitiveDictionary, ThoughtOp};
 
 pub struct BootstrapManager {
-    ml_engine: Arc<Mutex<MLEngine>>,
-    thought_decoder: Arc<Mutex<ThoughtDecoder>>,
-    dict: Arc<Mutex<CognitiveDictionary>>,
-    pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+    ml_engine: Arc<RwLock<MLEngine>>,
+    thought_decoder: Arc<RwLock<ThoughtDecoder>>,
+    dict: Arc<RwLock<CognitiveDictionary>>,
+    pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
 }
 
 impl BootstrapManager {
     pub fn new(
-        ml_engine: Arc<Mutex<MLEngine>>,
-        thought_decoder: Arc<Mutex<ThoughtDecoder>>,
-        dict: Arc<Mutex<CognitiveDictionary>>,
-        pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+        ml_engine: Arc<RwLock<MLEngine>>,
+        thought_decoder: Arc<RwLock<ThoughtDecoder>>,
+        dict: Arc<RwLock<CognitiveDictionary>>,
+        pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     ) -> Self {
         Self { ml_engine, thought_decoder, dict, pc_hierarchy }
     }
@@ -30,7 +30,7 @@ impl BootstrapManager {
         
         synthetic_data.sort_by_key(|(_, seq)| seq.len());
         
-        let mut decoder = self.thought_decoder.lock().await;
+        let mut decoder = self.thought_decoder.write().await;
 
         for epoch in 0..100 { 
             let mut total_loss = 0.0;
@@ -48,8 +48,8 @@ impl BootstrapManager {
     }
 
     async fn generate_synthetic_dataset(&self) -> Vec<(Tensor, Vec<u32>)> {
-        let engine = self.ml_engine.lock().await;
-        let dict = self.dict.lock().await;
+        let engine = self.ml_engine.read().await;
+        let dict = self.dict.read().await;
 
         let q1 = "Напиши функцию quicksort на Python".to_string();
         let seq1 = vec![
@@ -72,7 +72,7 @@ impl BootstrapManager {
         let q2_emb = engine.process_text(&q2).await.unwrap();
 
         // 🔴 THE FIX: Run inference to get the compressed 512-dim belief
-        let mut pc = self.pc_hierarchy.lock().await;
+        let mut pc = self.pc_hierarchy.write().await;
         
         pc.infer(&q1_emb, 15).unwrap();
         // Flatten the[512, 1] tensor to a 1D tensor [512] for the decoder

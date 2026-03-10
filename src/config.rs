@@ -183,6 +183,9 @@ pub struct PCConfig {
     pub dim_per_level: Vec<usize>,
     pub learning_rate: f32,
     pub mu_pc_scaling: bool,
+    // Inference configuration
+    pub inference_steps: usize,
+    pub selective_update: bool,
     // Precision weighting configuration
     pub enable_precision_weighting: bool,
     pub free_energy_drop_threshold: f32,
@@ -201,6 +204,34 @@ pub struct PCConfig {
     pub hidden_dim_factor: f32,
     /// Threshold for surprise detection based on statistical distribution
     pub surprise_threshold: f32,
+}
+
+impl PCConfig {
+    /// Create a new PCConfig with basic parameters
+    /// This is a convenience constructor for backward compatibility
+    pub fn new(n_levels: usize, dim_per_level: Vec<usize>) -> Self {
+        Self {
+            n_levels,
+            dim_per_level,
+            learning_rate: 0.01,
+            mu_pc_scaling: true,
+            inference_steps: 20,
+            selective_update: true,
+            enable_precision_weighting: false,
+            free_energy_drop_threshold: 0.5,
+            default_precision: 0.3,
+            min_precision: 0.1,
+            max_precision: 1.0,
+            free_energy_history_size: 10,
+            enable_code_verification: false,
+            enable_nostr_zap_tracking: false,
+            min_zaps_for_consensus: 3,
+            persistence_db_path: None,
+            convergence_threshold: 0.01,
+            hidden_dim_factor: 0.5,
+            surprise_threshold: 2.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,32 +279,6 @@ impl std::error::Error for NodeError {}
 impl From<config::ConfigError> for NodeError {
     fn from(err: config::ConfigError) -> Self {
         NodeError::ConfigParseError(err.to_string())
-    }
-}
-
-impl From<crate::config::PCConfig> for crate::pc_hierarchy::PCConfig {
-    fn from(config: crate::config::PCConfig) -> Self {
-        crate::pc_hierarchy::PCConfig {
-            n_levels: config.n_levels,
-            dim_per_level: config.dim_per_level,
-            learning_rate: config.learning_rate,
-            inference_steps: 20, // default value
-            surprise_threshold: config.surprise_threshold,
-            convergence_threshold: config.convergence_threshold,
-            selective_update: true, // default value
-            mu_pc_scaling: config.mu_pc_scaling,
-            enable_precision_weighting: config.enable_precision_weighting,
-            free_energy_drop_threshold: config.free_energy_drop_threshold,
-            default_precision: config.default_precision,
-            min_precision: config.min_precision,
-            max_precision: config.max_precision,
-            free_energy_history_size: config.free_energy_history_size,
-            enable_code_verification: config.enable_code_verification,
-            enable_nostr_zap_tracking: config.enable_nostr_zap_tracking,
-            min_zaps_for_consensus: config.min_zaps_for_consensus,
-            persistence_db_path: config.persistence_db_path,
-            hidden_dim_factor: config.hidden_dim_factor,
-        }
     }
 }
 
@@ -412,6 +417,9 @@ impl Default for PCConfig {
             dim_per_level: vec![2048, 1024, 512],
             learning_rate: 0.01,
             mu_pc_scaling: true,
+            // Inference configuration
+            inference_steps: 20,
+            selective_update: true,
             // Precision weighting defaults
             enable_precision_weighting: false,
             free_energy_drop_threshold: 0.5,

@@ -106,19 +106,29 @@ impl MLEngine {
         let content = candle_core::quantized::gguf_file::Content::read(&mut file)
             .map_err(|e| MLError::ModelLoadError(format!("GGUF Read Error: {}", e)))?;
 
-        // 3. Extract "The Eyes" (Token Embeddings)
-        // In TinyLlama GGUF, this is usually "token_embd.weight"
-        let token_embeddings = content.tensor(&mut file, "token_embd.weight", &device)
-            .map_err(|e| MLError::ModelLoadError(format!("Missing token_embd.weight: {}", e)))?
-            .dequantize(&device)
-            .map_err(|e| MLError::ModelLoadError(format!("Dequantize Error: {}", e)))?;
+        // 🔴 FIX: Robust dynamic probing for Input Embeddings
+        let token_tensor_names = ["token_embd.weight", "model.embed_tokens.weight", "tok_embeddings.weight"];
+        let mut token_embeddings = None;
+        for name in &token_tensor_names {
+            if let Ok(tensor) = content.tensor(&mut file, name, &device) {
+                token_embeddings = Some(tensor.dequantize(&device).map_err(|e| MLError::ModelLoadError(e.to_string()))?);
+                tracing::info!("Found token embeddings at: {}", name);
+                break;
+            }
+        }
+        let token_embeddings = token_embeddings.ok_or_else(|| MLError::ModelLoadError("Could not find input embedding tensor (tried: token_embd.weight, model.embed_tokens.weight, tok_embeddings.weight)".to_string()))?;
 
-        // 4. Extract "The Mouth" (LM Head)
-        // In TinyLlama GGUF, this is usually "output.weight"
-        let lm_head = content.tensor(&mut file, "output.weight", &device)
-            .map_err(|e| MLError::ModelLoadError(format!("Missing output.weight: {}", e)))?
-            .dequantize(&device)
-            .map_err(|e| MLError::ModelLoadError(format!("Dequantize Error: {}", e)))?;
+        // 🔴 FIX: Robust dynamic probing for Output Head
+        let output_tensor_names = ["output.weight", "lm_head.weight"];
+        let mut lm_head = None;
+        for name in &output_tensor_names {
+            if let Ok(tensor) = content.tensor(&mut file, name, &device) {
+                lm_head = Some(tensor.dequantize(&device).map_err(|e| MLError::ModelLoadError(e.to_string()))?);
+                tracing::info!("Found LM head at: {}", name);
+                break;
+            }
+        }
+        let lm_head = lm_head.ok_or_else(|| MLError::ModelLoadError("Could not find LM head tensor (tried: output.weight, lm_head.weight)".to_string()))?;
 
         // 5. Extract embedding dimension from GGUF metadata or tensor shape
         let embedding_dim = Self::extract_embedding_dim(&content, &token_embeddings)
@@ -215,22 +225,33 @@ impl MLEngine {
                 .map_err(|e| MLError::InvalidResponse(format!("Zero tensor creation error: {}", e)));
         }
 
-        // Get embeddings for all tokens
         let mut embeddings = Vec::new();
-        for &id in token_ids {
+        let seq_len = token_ids.len() as f32;
+
+        for (i, &id) in token_ids.iter().enumerate() {
             let emb = self.token_embeddings.get(id as usize)
                 .map_err(|e| MLError::InvalidResponse(format!("Embedding lookup error: {}", e)))?;
-            embeddings.push(emb);
+            
+            // 🔴 SEQUENCE-AWARE POOLING: Apply positional weight to retain order context
+            // Earlier words get slightly different magnitudes than later words.
+            let pos_weight = 1.0 + (i as f32 / seq_len) * 0.5; // Weight grows from 1.0 to 1.5
+            let pos_tensor = Tensor::from_slice(&[pos_weight], (1,), &self.device)
+                .map_err(|e| MLError::InvalidResponse(format!("Pos tensor error: {}", e)))?
+                .broadcast_as(emb.shape())
+                .map_err(|e| MLError::InvalidResponse(format!("Broadcast error: {}", e)))?;
+            
+            let weighted_emb = emb.mul(&pos_tensor)
+                .map_err(|e| MLError::InvalidResponse(format!("Mul error: {}", e)))?;
+            embeddings.push(weighted_emb);
         }
 
-        // Mean pool to get a single "thought vector"
         let stacked = Tensor::stack(&embeddings, 0)
             .map_err(|e| MLError::InvalidResponse(format!("Stack error: {}", e)))?;
         
         let mean_emb = stacked.mean(0)
             .map_err(|e| MLError::InvalidResponse(format!("Mean pool error: {}", e)))?;
 
-        // --- БЕЗОПАСНАЯ L2-НОРМАЛИЗАЦИЯ (Без Tensor Broadcast) ---
+        // --- SAFE L2 NORMALIZATION ---
         let norm_sq = mean_emb.sqr()
             .map_err(|e| MLError::InvalidResponse(format!("Sqr error: {}", e)))?
             .sum_all()
@@ -241,10 +262,8 @@ impl MLEngine {
         let norm = norm_sq.sqrt() as f64;
         let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
 
-        // Умножаем тензор напрямую на число (f64), избегая крашей совместимости форм!
         let normalized = (mean_emb * scale_factor)
             .map_err(|e| MLError::InvalidResponse(format!("Scale error: {}", e)))?;
-        // ----------------------------------------------------------
 
         normalized.reshape((1, self.embedding_dim))
             .map_err(|e| MLError::InvalidResponse(format!("Reshape error: {}", e)))

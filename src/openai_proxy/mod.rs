@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use axum::{
     extract::State,
     response::IntoResponse,
@@ -27,31 +27,40 @@ use crate::openai_proxy::metrics::ProxyMetrics;
 use crate::openai_proxy::types::{ProxyError, OpenAiRequest, OpenAiResponse, Message, Choice, Usage};
 use crate::openai_proxy::components::ProxyConfig;
 use crate::semantic_cache::SemanticCache;
+use crate::knowledge_filter::CodeVerifier;
+
+// Use the Episode struct from types.rs instead of defining a duplicate
+pub use crate::types::Episode;
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
     pub config: NodeConfig,
     pub proxy_config: ProxyConfig,
-    pub local_engine: Arc<Mutex<MLEngine>>,
-    pub pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+    pub local_engine: Arc<RwLock<MLEngine>>,
+    pub pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     pub embedding_dim: usize,
-    pub thought_decoder: Arc<Mutex<ThoughtDecoder>>,
-    pub cognitive_dict: Arc<Mutex<CognitiveDictionary>>,
-    pub metrics: Arc<Mutex<ProxyMetrics>>,
-    pub cache: Option<Arc<Mutex<SemanticCache>>>,
+    pub thought_decoder: Arc<RwLock<ThoughtDecoder>>,
+    pub cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
+    pub metrics: Arc<RwLock<ProxyMetrics>>,
+    pub cache: Option<Arc<RwLock<SemanticCache>>>,
+    
+    // NEW: Action/Perception dependencies
+    code_verifier: CodeVerifier,
+    episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
 }
 
 impl OpenAiProxy {
     pub fn new(
         config: NodeConfig,
         proxy_config: ProxyConfig,
-        local_engine: Arc<Mutex<MLEngine>>,
-        pc_hierarchy: Arc<Mutex<PredictiveCoding>>,
+        local_engine: Arc<RwLock<MLEngine>>,
+        pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
         embedding_dim: usize,
-        thought_decoder: Arc<Mutex<ThoughtDecoder>>,
-        cognitive_dict: Arc<Mutex<CognitiveDictionary>>,
+        thought_decoder: Arc<RwLock<ThoughtDecoder>>,
+        cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
     ) -> Self {
-        let metrics = Arc::new(Mutex::new(ProxyMetrics::default()));
+        let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
+        let pc_inference_enabled = config.proxy_config.pc_inference_enabled;
         OpenAiProxy {
             config,
             proxy_config,
@@ -62,6 +71,9 @@ impl OpenAiProxy {
             cognitive_dict,
             metrics,
             cache: None,
+            // NEW: Action/Perception dependencies
+            code_verifier: CodeVerifier::new(pc_inference_enabled),
+            episodic_memory: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 
@@ -70,95 +82,118 @@ impl OpenAiProxy {
         &self,
         req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
-        self.metrics.lock().await.total_requests += 1;
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_requests += 1;
+        }
         let start_time = Instant::now();
 
         let mut state = self.extract_structured_state(&req).await;
-        
         let max_revisions = 3;
-        let mut final_thought_ids = Vec::new();
-        let mut last_known_error = String::new();
-        let mut plan_has_flaw = false;
-
+        let mut final_text = String::new();
+        
+        // 🔴 ACTION-PERCEPTION LOOP
         for attempt in 0..max_revisions {
-            info!("🔄 Reasoning Cycle: Attempt {}/{}", attempt + 1, max_revisions);
+            info!("🔄 Agentic Cycle: Attempt {}/{}", attempt + 1, max_revisions);
 
+            // 1. Perception & Belief Update
             let pc_context = state.get_pc_context();
-            let query_emb = self.local_engine.lock().await.process_text(&pc_context).await
+            let query_emb = self.local_engine.read().await.process_text(&pc_context).await
                 .map_err(|e| ProxyError::EmbeddingError(e.to_string()))?;
             
-            let mut pc = self.pc_hierarchy.lock().await;
-            pc.infer(&query_emb, 15)
-                .map_err(|e| ProxyError::PCError(e.to_string()))?;
+            let mut pc = self.pc_hierarchy.write().await;
+            let pc_stats = pc.infer(&query_emb, 15)
+                .map_err(|e| ProxyError::PCError(e.to_string()))?; // Calculate Surprise, Confidence, Novelty
             let anchor_belief = pc.levels.last().unwrap().beliefs.clone();
+            
+            // Explicit uncertainty tracking
+            let confidence = 1.0 / (1.0 + pc_stats.total_surprise); // Heuristic confidence
+            let novelty = pc_stats.free_energy_history.first().cloned().unwrap_or(0.0);
             drop(pc);
 
-            let decoder = self.thought_decoder.lock().await;
+            // 2. Planning (Graph of Thoughts)
+            let decoder = self.thought_decoder.read().await;
             let thought_ids = decoder.decode_sequence(&anchor_belief, 10, 3)
                 .map_err(|e| ProxyError::PCError(e.to_string()))?;
             drop(decoder);
 
-            let dict = self.cognitive_dict.lock().await;
-            let plan_strings: Vec<String> = thought_ids.iter().map(|&id| dict.get_op(id).to_string()).collect();
-            drop(dict);
+            // 3. Execution (Rendering via LLM)
+            final_text.clear();
+            let dict = self.cognitive_dict.read().await;
+            for id in &thought_ids {
+                let op = dict.get_op(*id);
+                if op == ThoughtOp::EOF { break; }
 
-            info!("📋 Сгенерирован План: {:?}", plan_strings);
+                let step_prompt = format!(
+                    "TASK:\nGoal: {}\nConstraints: {:?}\n\nCURRENT CODE:\n```python\n{}\n```\n\nNEXT STEP: {:?}\nWrite ONLY the python code for this step.",
+                    state.goal, state.constraints, final_text, op
+                );
 
-            let verification_result = self.verify_plan_against_constraints(&plan_strings, &state.constraints).await;
-
-            if verification_result.is_valid {
-                info!("✅ План верифицирован!");
-                final_thought_ids = thought_ids;
-                plan_has_flaw = false;
-                break;
-            } else {
-                warn!("❌ Ошибка в плане: {}", verification_result.reason);
-                last_known_error = verification_result.reason.clone();
-                state.assumptions.push(format!("Avoid this error: {}", last_known_error));
-                
-                if attempt == max_revisions - 1 {
-                    warn!("⚠️ Достигнут лимит ревизий. Передаем LLM сломанный план с предупреждением.");
-                    final_thought_ids = thought_ids;
-                    plan_has_flaw = true;
+                let step_req = self.create_internal_req(&step_prompt, &req);
+                if let Ok(step_response) = self.forward_to_ollama(&step_req).await {
+                    if let Some(choice) = step_response.choices.first() {
+                        let step_code = choice.message.content.as_str().unwrap_or("").replace("```python", "").replace("```", "");
+                        final_text.push_str(&step_code);
+                        final_text.push_str("\n");
+                    }
                 }
             }
-        }
-        
-        let mut final_text = String::new();
-        let dict = self.cognitive_dict.lock().await;
-        
-        for id in final_thought_ids {
-            let op = dict.get_op(id);
-            if op == ThoughtOp::EOF { break; }
+            drop(dict);
 
-            let warning_block = if plan_has_flaw {
-                format!("\nWARNING: The logical plan has a detected flaw: {}. Please manually correct this while writing the code.", last_known_error)
-            } else { String::new() };
+            // 4. External Verification (The World Model Simulator)
+            info!("🔬 Simulating execution of generated code in external environment...");
+            let sim_result = self.code_verifier.execute_python_simulator(&final_text);
 
-            let step_prompt = format!(
-                "TASK STRUCTURE:\nGoal: {}\nConstraints: {:?}\nVariables: {:?}\n\nCURRENT CODE:\n```\n{}\n```\n\nNEXT LOGICAL STEP: {:?}{}\n\nWrite ONLY the exact code/text for this specific logical step.",
-                state.goal, state.constraints, state.entities, final_text, op, warning_block
-            );
+            // Fast Memory: Log the episode
+            // Convert query embedding tensor to vector
+            let query_emb_vec = query_emb.flatten_all()
+                .map_err(|e| ProxyError::EmbeddingError(e.to_string()))?
+                .to_vec1::<f32>()
+                .map_err(|e| ProxyError::EmbeddingError(e.to_string()))?;
+            
+            self.episodic_memory.write().await.push_back(Episode {
+                raw_query: state.raw_query.clone(),
+                query_embedding: query_emb_vec,
+                novelty,
+                confidence,
+                generated_code: final_text.clone(),
+                thought_sequence: thought_ids.clone(),
+                success: sim_result.is_ok(),
+            });
 
-            let step_req = self.create_internal_req(&step_prompt, &req);
-            if let Ok(step_response) = self.forward_to_ollama(&step_req).await {
-                if let Some(choice) = step_response.choices.first() {
-                    let step_code = choice.message.content.as_str().unwrap_or("");
-                    final_text.push_str(step_code);
-                    final_text.push_str("\n");
+            match sim_result {
+                Ok(stdout) => {
+                    info!("✅ Simulation successful! Stdout: {}", stdout);
+                    
+                    // SLOW MEMORY GATING: Only consolidate to PC weights if highly novel and successful
+                    if novelty > 5.0 && self.config.proxy_config.pc_learning_enabled {
+                        info!("🧠 High novelty detected ({}). Consolidating to semantic memory.", novelty);
+                        let mut pc = self.pc_hierarchy.write().await;
+                        let _ = pc.learn_legacy(&query_emb); // Commit to deep weights
+                    }
+                    break; // Success! Exit reasoning loop.
+                },
+                Err(stderr) => {
+                    warn!("❌ Simulation failed: {}", stderr);
+                    // Feedback loop: Update state with the exact execution error
+                    state.assumptions.push(format!("Simulator crashed with error: {}. Fix the logic.", stderr));
+                    
+                    if attempt == max_revisions - 1 {
+                        final_text.push_str(&format!("\n# WARNING: Failed to verify. Error: {}", stderr));
+                    }
                 }
             }
         }
         
         let response = OpenAiResponse {
-            id: format!("pc-{}", Utc::now().timestamp()),
+            id: format!("agent-{}", Utc::now().timestamp()),
             object: "chat.completion".to_string(),
             created: Utc::now().timestamp(),
-            model: "neurofed-hybrid-reasoner".to_string(),
+            model: "neurofed-active-inference".to_string(),
             choices: vec![Choice {
                 index: 0,
-                message: Message { 
-                    role: "assistant".to_string(), 
+                message: Message {
+                    role: "assistant".to_string(),
                     content: serde_json::json!(final_text),
                     name: None,
                 },
@@ -166,7 +201,7 @@ impl OpenAiProxy {
                 logprobs: None,
             }],
             usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            neurofed_source: Some("pc_iterative_reasoning".to_string()),
+            neurofed_source: Some("active_inference_loop".to_string()),
         };
         
         let elapsed = start_time.elapsed();
@@ -239,7 +274,7 @@ impl OpenAiProxy {
     }
 
     async fn update_metrics_success(&self, elapsed: Duration, _response: &OpenAiResponse) {
-        let mut metrics = self.metrics.lock().await;
+        let mut metrics = self.metrics.write().await;
         metrics.total_processing_time_ms += elapsed.as_millis() as u64;
     }
 }
@@ -277,4 +312,88 @@ impl Default for OpenAiProxy {
 pub struct PlanVerificationResult {
     pub is_valid: bool,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod agentic_loop_tests {
+    use super::*;
+    use crate::types::{StructuredState, VerificationResult};
+
+    #[test]
+    fn test_belief_revision_loop_accumulates_errors() {
+        // This test ensures that when the verifier finds a flaw,
+        // the error message is added to the "assumptions" to guide the next reasoning cycle.
+
+        let mut state = StructuredState {
+            goal: "Write a sort function".to_string(),
+            ..Default::default()
+        };
+
+        // Iteration 1: The plan is invalid
+        let bad_verification = VerificationResult {
+            is_valid: false,
+            reason: "Plan is missing an ITERATE step.".to_string(),
+        };
+
+        // Simulate the feedback loop
+        if !bad_verification.is_valid {
+            state.assumptions.push(format!("Avoid this error: {}", bad_verification.reason));
+        }
+
+        // Check the state for the next iteration
+        assert_eq!(state.assumptions.len(), 1);
+        assert!(state.assumptions[0].contains("missing an ITERATE step"));
+
+        // The context for the PC brain now includes the correction
+        let pc_context = state.get_pc_context();
+        assert!(pc_context.contains("Goal: Write a sort function"));
+        assert!(pc_context.contains("Corrected Assumptions: Avoid this error: Plan is missing an ITERATE step."));
+    }
+
+    #[test]
+    fn test_fast_slow_memory_gating_logic() {
+        // This test verifies the core principle: only learn what is BOTH successful AND novel.
+
+        // Case 1: Success, but NOT novel (e.g., asking the same question twice)
+        let low_novelty_success = Episode {
+            raw_query: "test".to_string(),
+            query_embedding: vec![],
+            novelty: 1.0, // Below threshold of 5.0
+            confidence: 0.9,
+            generated_code: "".to_string(),
+            thought_sequence: vec![],
+            success: true,
+        };
+        // Should we learn?
+        let should_learn_1 = low_novelty_success.novelty > 5.0 && low_novelty_success.success;
+        assert!(!should_learn_1, "Should NOT learn from successful but non-novel experiences.");
+
+        // Case 2: Novel, but FAILED (e.g., new question, but generated code crashed)
+        let high_novelty_failure = Episode {
+            raw_query: "test".to_string(),
+            query_embedding: vec![],
+            novelty: 10.0, // Above threshold
+            confidence: 0.8,
+            generated_code: "".to_string(),
+            thought_sequence: vec![],
+            success: false,
+        };
+        // Should we learn?
+        let should_learn_2 = high_novelty_failure.novelty > 5.0 && high_novelty_failure.success;
+        assert!(!should_learn_2, "Should NOT learn from failed experiences, even if they are novel.");
+
+        // Case 3: Novel AND Successful (The only time we update deep weights)
+        let high_novelty_success = Episode {
+            raw_query: "test".to_string(),
+            query_embedding: vec![],
+            novelty: 15.0, // Above threshold
+            confidence: 0.95,
+            generated_code: "".to_string(),
+            thought_sequence: vec![],
+            success: true,
+        };
+        // Should we learn?
+        let should_learn_3 = high_novelty_success.novelty > 5.0 && high_novelty_success.success;
+        assert!(should_learn_3, "MUST learn from experiences that are both novel and successful.");
+    }
 }

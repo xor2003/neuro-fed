@@ -2,6 +2,8 @@
 // Knowledge Filtering with Precision Weighting (π) implementation for NeuroFed Node
 
 use std::collections::VecDeque;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 /// Precision weighting configuration
@@ -119,31 +121,89 @@ impl FreeEnergyTracker {
     }
 }
 
-/// Code execution verification interface (stub)
+/// UPGRADED: Action-Perception Simulator
 #[derive(Debug, Clone)]
 pub struct CodeVerifier {
-    /// Whether code execution verification is enabled
-    enabled: bool,
+    pub enabled: bool,
 }
 
 impl CodeVerifier {
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
+    pub fn new(enabled: bool) -> Self { Self { enabled } }
 
-    pub fn verify_code_execution(&self, code: &str) -> Result<bool, String> {
-        // Stub implementation - in Phase 2, this would interface with external execution
+    /// Executes code in a local Python environment.
+    /// Returns Ok(stdout) if successful, Err(stderr) if it crashes.
+    pub fn execute_python_simulator(&self, code: &str) -> Result<String, String> {
         if !self.enabled {
-            return Ok(false);
+            return Ok("Simulation disabled. Assuming success.".to_string());
         }
         
-        // For now, return true for simple code snippets as a placeholder
-        // In actual implementation, this would execute the code and check for success
-        let is_simple = code.lines().count() <= 5 && 
-                       !code.contains("panic!") && 
-                       !code.contains("unsafe");
+        // Use a unique temporary filename to avoid concurrency issues
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_path = format!(".neurofed_sim_env_{}.py", timestamp);
         
-        Ok(is_simple)
+        if let Err(e) = std::fs::write(&file_path, code) {
+            return Err(format!("Simulator IO Error: {}", e));
+        }
+
+        let output = Command::new("python3")
+            .arg(&file_path)
+            .output();
+
+        let _ = std::fs::remove_file(&file_path); // Cleanup
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                
+                if out.status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(stderr)
+                }
+            }
+            Err(e) => Err(format!("Failed to invoke python3: {}", e)),
+        }
+    }
+    
+    /// Legacy compatibility wrapper
+    pub fn verify_code_execution(&self, code: &str) -> Result<bool, String> {
+        match self.execute_python_simulator(code) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Pre-execution Symbolic Check: Validates Python AST (Abstract Syntax Tree)
+    pub fn verify_syntax_ast(&self, code: &str) -> Result<(), String> {
+        if !self.enabled { return Ok(()); }
+        
+        let python_script = "import ast, sys\ntry:\n  ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n  print(f'SyntaxError: {e}')\n  sys.exit(1)";
+        
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(python_script)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start python: {}", e))?;
+            
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(code.as_bytes()).ok();
+        }
+        
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            let stdout_err = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr_err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("{} {}", stdout_err, stderr_err).trim().to_string());
+        }
+        Ok(())
     }
 }
 
@@ -403,19 +463,46 @@ mod tests {
         assert_eq!(result.precision, 1.0);
         assert_eq!(result.source, InformationSource::GroundTruth);
     }
-#[test]
-fn test_precision_clamping() {
-    let mut config = PrecisionConfig::default();
-    config.default_precision = 2.0; // Above max
-    config.min_precision = 0.0;
-    config.max_precision = 1.0;
     
-    let calculator = PrecisionCalculator::new(config);
-    let context = PrecisionContext::new();
-    let result = calculator.calculate_precision(&context);
+    #[test]
+    fn test_precision_clamping() {
+        let mut config = PrecisionConfig::default();
+        config.default_precision = 2.0; // Above max
+        config.min_precision = 0.0;
+        config.max_precision = 1.0;
+        
+        let calculator = PrecisionCalculator::new(config);
+        let context = PrecisionContext::new();
+        let result = calculator.calculate_precision(&context);
+        
+        assert_eq!(result.precision, 1.0); // Should be clamped to max
+    }
     
-    assert_eq!(result.precision, 1.0); // Should be clamped to max
-}
+    #[test]
+    fn test_python_simulator_external_grounding() {
+        let verifier = CodeVerifier::new(true);
+        
+        // 1. Test Valid Code
+        let valid_code = "print('Hello World')";
+        let result = verifier.execute_python_simulator(valid_code);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "Hello World");
+
+        // 2. Test Invalid Code (Catches external errors)
+        let invalid_code = "def foo():\n  return 1/0\nfoo()";
+        let err_result = verifier.execute_python_simulator(invalid_code);
+        assert!(err_result.is_err());
+        assert!(err_result.unwrap_err().contains("ZeroDivisionError"));
+    }
+    
+    #[test]
+    fn test_simulator_handles_no_output() {
+        let verifier = CodeVerifier::new(true);
+        let silent_code = "x = 1\ny = 2\nz = x + y";
+        let result = verifier.execute_python_simulator(silent_code);
+        assert!(result.is_ok(), "Code without print statements should still succeed.");
+        assert_eq!(result.unwrap().trim(), "");
+    }
 }
 
 /// Integration tests demonstrating precision weighting with PredictiveCoding

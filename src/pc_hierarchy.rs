@@ -146,6 +146,17 @@ impl PredictiveCoding {
         }
         
         stats.total_surprise = stats.free_energy_history.iter().sum::<f32>();
+        
+        // Compute explicit uncertainty metrics
+        if !stats.free_energy_history.is_empty() {
+            // Novelty: Initial free energy (how unexpected was the input)
+            stats.novelty_score = *stats.free_energy_history.first().unwrap_or(&0.0);
+            
+            // Confidence: Inverse of final free energy (how stable the belief became)
+            let final_fe = *stats.free_energy_history.last().unwrap_or(&0.0);
+            stats.confidence_score = 1.0 / (1.0 + final_fe); // Maps [0, ∞) → (0, 1]
+        }
+        
         Ok(stats)
     }
     

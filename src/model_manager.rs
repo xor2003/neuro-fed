@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -13,8 +13,32 @@ use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn, error};
 
-use crate::types::{AutoModel, AutoTokenizer, AutoConfig, DeviceType};
 use crate::config::NodeConfig;
+use crate::types::DeviceType;
+
+// Local types for model management (not in types.rs to avoid duplication)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoModel {
+    pub name: String,
+    pub version: String,
+    pub parameters: u64,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoTokenizer {
+    pub vocab_size: usize,
+    pub max_length: usize,
+    pub special_tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoConfig {
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
+}
 
 /// Model information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]

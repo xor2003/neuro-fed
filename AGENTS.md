@@ -3,38 +3,35 @@
 ## Project Overview
 NeuroFed (NeuroFed) Node is a decentralized federated AGI system based on pure hierarchical predictive coding. It implements a biologically plausible, fully decentralized, offline-first federated AGI system using Rust, candle framework, and Nostr protocol.
 
+## Current Status
+- Treat the current codebase as an experimental single-process prototype, not a fully integrated node.
+- The authoritative architecture is the code under `src/`, not the aspirational module list below.
+- `cargo check` currently passes, but several top-level modules are only partially wired into the runtime.
+- When reviewing or extending the system, distinguish between:
+  - implemented runtime path: `main.rs` -> `ml_engine.rs` -> `pc_hierarchy.rs`
+  - implemented but not fully composed infrastructure: `persistence.rs`, `model_manager.rs`
+  - compatibility and placeholder surfaces: `types.rs`, some re-exports in `lib.rs`
+
 ## Directory Structure
 ```
 neuro-pc-node/
 ├── src/
-│   ├── main.rs              # Application entry point and main loop
-│   ├── lib.rs               # Public API exports
-│   ├── config.rs            # Configuration management
-│   ├── persistence.rs       # SQLite database and state persistence
-│   ├── node_loop.rs         # Main async processing loop
-│   ├── ml_engine.rs         # ML Engine using candle framework for pure Rust CPU/GPU operations
-│   ├── pc_hierarchy.rs      # Pure Predictive Coding core
-│   ├── bootstrap.rs         # LLM distillation and initialization
-│   ├── nostr_federation.rs  # Nostr protocol integration
-│   ├── openai_proxy.rs      # OpenAI API transparent proxy with local fallback
-│   ├── web_ui/              # Optional web interface (Phase 3)
-│   │   ├── mod.rs
-│   │   └── handlers.rs
-│   ├── installer/           # One-click installer scripts
-│   │   ├── mod.rs
-│   │   └── scripts/
-│   │       ├── install.sh
-│   │       ├── install.ps1
-│   │       └── install.bat
-│   └── tests/
-│       ├── integration.rs
-│       └── unit/
-│           ├── ml_engine_tests.rs
-│           ├── pc_hierarchy_tests.rs
-│           ├── bootstrap_tests.rs
-│           ├── nostr_federation_tests.rs
-│           ├── openai_proxy_tests.rs
-│           └── node_loop_tests.rs
+│   ├── main.rs              # Minimal executable path and smoke-test style startup
+│   ├── lib.rs               # Public module graph and compatibility re-exports
+│   ├── config.rs            # Primary runtime configuration types
+│   ├── types.rs             # Legacy/common DTO-style types; not the single source of truth
+│   ├── persistence.rs       # SQLite persistence for PC weights, peers, cache
+│   ├── node_loop.rs         # Event loop skeleton
+│   ├── ml_engine.rs         # GGUF/tokenizer loading and text embedding pipeline
+│   ├── model_manager.rs     # Model selection and download logic
+│   ├── pc_hierarchy.rs      # Predictive coding orchestration
+│   ├── pc_level.rs          # Per-level PC update logic
+│   ├── pc_types.rs          # Canonical PC config/error/stat types
+│   ├── pc_decoder.rs        # Belief decoding logic
+│   ├── bootstrap.rs         # Synthetic/bootstrap training utilities
+│   ├── brain_manager.rs     # Brain sharing workflow
+│   ├── semantic_cache.rs    # Semantic cache implementation
+│   └── pow_verifier.rs      # PoW verification support
 ├── docs/
 │   ├── architecture.md      # System architecture documentation
 │   ├── equations.md         # Mathematical foundations
@@ -103,13 +100,27 @@ export GPU_MEMORY_FRACTION=0.8
 - **src/main.rs**: Application entry point and main loop
 - **src/lib.rs**: Public API exports
 - **src/config.rs**: Configuration management
+- **src/types.rs**: Legacy/common data types; avoid adding new canonical config here
 - **src/persistence.rs**: SQLite database and state persistence
-- **src/node_loop.rs**: Main async processing loop
+- **src/node_loop.rs**: Async processing loop skeleton
 - **src/ml_engine.rs**: ML Engine using candle framework for pure Rust CPU/GPU operations
 - **src/pc_hierarchy.rs**: Pure Predictive Coding implementation
-- **src/bootstrap.rs**: LLM distillation and initialization
-- **src/nostr_federation.rs**: Nostr protocol integration
-- **src/openai_proxy.rs**: OpenAI API transparent proxy with local fallback
+- **src/model_manager.rs**: Model detection, recommendation, and downloading
+- **src/bootstrap.rs**: Bootstrap and synthetic training utilities
+- **src/brain_manager.rs**: Brain sharing and import/export workflow
+
+### Architectural Risks To Watch
+- **Type drift across modules**: `config.rs`, `types.rs`, and `pc_types.rs` define overlapping concepts. New work should consolidate around one canonical type per concept instead of adding more adapters.
+- **Runtime/documentation drift**: the binary currently exercises only a narrow startup path. Do not document subsystems as production-ready unless they are actually invoked from `main.rs` or an equivalent entrypoint.
+- **Single-process lock contention**: `Arc<Mutex<...>>` around core ML and PC state is acceptable for the prototype, but it will serialize work and limit throughput once proxy and federation paths become active.
+- **Blocking/external side effects during model init**: tokenizer/model fallback logic may trigger filesystem or network-dependent behavior at construction time. Keep initialization deterministic where possible.
+- **Stubbed orchestration**: `node_loop.rs` currently proves lifecycle shape, not business behavior. Avoid building new assumptions on top of its placeholder handlers without implementing them first.
+
+### TODO
+- Integrate `node_loop.rs` into the actual runtime and replace placeholder handlers with real user/file/Nostr processing.
+- Wire `brain_manager.rs` into the executable path and document the operational workflow only after end-to-end integration exists.
+- Reduce compatibility/placeholder reliance in `types.rs` by moving callers to canonical types in `config.rs` and `pc_types.rs`.
+- Promote currently standalone infrastructure such as persistence and model management into tested end-to-end flows.
 
 ### Building the Project
 ```bash
@@ -236,6 +247,12 @@ cargo doc --no-deps
 6. Add integration tests
 7. Use TDD
 8. Make sure high test coverage. Add coverage collection into test process
+
+### Before Extending Architecture
+1. Check whether a concept already exists in `config.rs`, `types.rs`, and `pc_types.rs`
+2. Pick one canonical location for the concept and route callers there
+3. Verify the runtime entrypoint actually composes the new component
+4. Prefer explicit integration tests over adding more placeholder modules
 
 ### Adding Dependencies
 1. Add to `[dependencies]` in Cargo.toml

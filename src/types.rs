@@ -1,5 +1,6 @@
 // src/types.rs
 // Common types used across the NeuroFed Node
+// NOTE: Configuration types (NodeConfig, PCConfig, etc.) are now centralized in config.rs
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -55,6 +56,14 @@ pub struct NodeError {
     pub context: HashMap<String, String>,
 }
 
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NodeError[{}]: {} (type: {:?})", self.id, self.message, self.error_type)
+    }
+}
+
+impl std::error::Error for NodeError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ErrorType {
     ValidationError,
@@ -71,73 +80,6 @@ pub struct NostrEvent {
     pub author: String,
     pub timestamp: SystemTime,
     pub metadata: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub model_path: String,
-    pub device_type: String,
-    pub max_tokens: u32,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub top_k: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeConfig {
-    pub port: u16,
-    pub host: String,
-    pub log_level: String,
-    pub enable_nostr: bool,
-    pub enable_openai_proxy: bool,
-    pub enable_web_ui: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapResult {
-    pub success: bool,
-    pub message: String,
-    pub model_loaded: bool,
-    pub config_loaded: bool,
-    pub timestamp: SystemTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapConfig {
-    pub model_path: String,
-    pub device_type: String,
-    pub config_path: String,
-    pub enable_gpu: bool,
-    pub enable_nostr: bool,
-    pub enable_openai_proxy: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PCConfig {
-    pub learning_rate: f32,
-    pub num_layers: usize,
-    pub hidden_size: usize,
-    pub dropout_rate: f32,
-    pub max_sequence_length: usize,
-    pub batch_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NostrConfig {
-    pub pubkey: String,
-    pub privkey: String,
-    pub relay_urls: Vec<String>,
-    pub enable_relay_discovery: bool,
-    pub max_message_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIProxyConfig {
-    pub port: u16,
-    pub host: String,
-    pub enable_local_fallback: bool,
-    pub local_model_path: String,
-    pub rate_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,56 +103,12 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AxumPath {
-    pub segments: Vec<String>,
-    pub query: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStats {
     pub requests_total: u64,
     pub requests_successful: u64,
     pub requests_failed: u64,
     pub average_response_time: f32,
     pub last_reset: SystemTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tensor {
-    pub data: Vec<f32>,
-    pub shape: Vec<usize>,
-    pub dtype: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoModel {
-    pub name: String,
-    pub version: String,
-    pub parameters: u64,
-    pub capabilities: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoTokenizer {
-    pub vocab_size: usize,
-    pub max_length: usize,
-    pub special_tokens: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoConfig {
-    pub hidden_size: usize,
-    pub num_layers: usize,
-    pub vocab_size: usize,
-    pub max_position_embeddings: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Device {
-    pub device_type: String,
-    pub memory_total: u64,
-    pub memory_available: u64,
-    pub cores: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,69 +119,6 @@ pub struct DeviceType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Linear {
-    pub in_features: usize,
-    pub out_features: usize,
-    pub bias: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Layer {
-    pub name: String,
-    pub layer_type: String,
-    pub parameters: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapError {
-    pub message: String,
-    pub error_type: String,
-    pub context: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PCError {
-    pub message: String,
-    pub error_type: String,
-    pub context: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PredictiveCoding {
-    pub layers: Vec<Layer>,
-    pub weights: Vec<f32>,
-    pub biases: Vec<f32>,
-    pub learning_rate: f32,
-    pub dropout_rate: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NostrFederation {
-    pub config: NostrConfig,
-    pub connected: bool,
-    pub relay_count: usize,
-    pub message_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIProxy {
-    pub config: OpenAIProxyConfig,
-    pub running: bool,
-    pub request_count: u64,
-    pub error_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub node: NodeConfig,
-    pub model: ModelConfig,
-    pub nostr: NostrConfig,
-    pub openai: OpenAIProxyConfig,
-    pub pc: PCConfig,
-}
-
-/// Federation request for wallet/no-wallet modes
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationRequest {
     pub id: String,
     pub request_type: String,
@@ -293,7 +128,6 @@ pub struct FederationRequest {
     pub metadata: HashMap<String, String>,
 }
 
-/// Federation response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationResponse {
     pub id: String,
@@ -303,7 +137,6 @@ pub struct FederationResponse {
     pub metadata: HashMap<String, String>,
 }
 
-/// Payment verification result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentVerification {
     pub verified: bool,
@@ -311,7 +144,6 @@ pub struct PaymentVerification {
     pub reason: Option<String>,
 }
 
-/// Proof-of-work verification result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoWVerification {
     pub verified: bool,
@@ -320,7 +152,6 @@ pub struct PoWVerification {
     pub reason: Option<String>,
 }
 
-/// Federation error types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FederationError {
     PaymentVerificationFailed(String),
@@ -333,20 +164,11 @@ pub enum FederationError {
 
 impl std::fmt::Display for FederationError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            FederationError::PaymentVerificationFailed(msg) => write!(f, "Payment verification failed: {}", msg),
-            FederationError::PoWVerificationFailed(msg) => write!(f, "PoW verification failed: {}", msg),
-            FederationError::Timeout(msg) => write!(f, "Timeout: {}", msg),
-            FederationError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
-            FederationError::NostrError(msg) => write!(f, "Nostr error: {}", msg),
-            FederationError::ConfigError(msg) => write!(f, "Config error: {}", msg),
-        }
+        write!(f, "{:?}", self)
     }
 }
-
 impl std::error::Error for FederationError {}
 
-// Added MLError type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MLError {
     ModelLoadError(String),
@@ -361,60 +183,12 @@ pub enum MLError {
 
 impl std::fmt::Display for MLError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            MLError::ModelLoadError(msg) => write!(f, "ModelLoadError: {}", msg),
-            MLError::RequestError(msg) => write!(f, "RequestError: {}", msg),
-            MLError::SerializationError(msg) => write!(f, "SerializationError: {}", msg),
-            MLError::InvalidResponse(msg) => write!(f, "InvalidResponse: {}", msg),
-            MLError::ConfigurationError(msg) => write!(f, "ConfigurationError: {}", msg),
-            MLError::TokenizationError(msg) => write!(f, "TokenizationError: {}", msg),
-            MLError::TensorError(msg) => write!(f, "TensorError: {}", msg),
-            MLError::FileError(msg) => write!(f, "FileError: {}", msg),
-        }
+        write!(f, "{:?}", self)
     }
 }
-
-/// Privacy network connection information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkConnection {
-    /// Network type (Yggdrasil, Tor, I2P, Direct)
-    pub network_type: String,
-    /// Connection status
-    pub status: String,
-    /// Latency in milliseconds
-    pub latency_ms: u64,
-    /// Bandwidth in bytes per second
-    pub bandwidth_bps: u64,
-    /// Whether the connection is encrypted
-    pub encrypted: bool,
-    /// Connection start time
-    pub connected_since: SystemTime,
-    /// Number of peers connected
-    pub peer_count: usize,
-}
-
-/// Privacy network events
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PrivacyNetworkEvent {
-    /// Network connected successfully
-    Connected { network: String, address: String },
-    /// Network disconnected
-    Disconnected { network: String, reason: String },
-    /// Network switched
-    Switched { from: String, to: String },
-    /// Network error occurred
-    Error { network: String, error: String },
-    /// Network latency update
-    LatencyUpdate { network: String, latency_ms: u64 },
-    /// Bandwidth update
-    BandwidthUpdate { network: String, bandwidth_bps: u64 },
-}
-
 impl std::error::Error for MLError {}
 
-// 🔴 НОВЫЕ СТРУКТУРЫ ДЛЯ НЕЙРОСИМВОЛИЧЕСКОГО ЯДРА 🔴
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ThoughtOp {
     Define,
     Iterate,
@@ -423,7 +197,8 @@ pub enum ThoughtOp {
     Aggregate,
     Return,
     Explain,
-    EOF, // Маркер конца последовательности мыслей
+    EOF,
+    Dynamic(String), // ALLOWS INFINITE NEW CHUNKS (e.g., "Iterate_Check")
 }
 
 impl std::fmt::Display for ThoughtOp {
@@ -437,6 +212,7 @@ impl std::fmt::Display for ThoughtOp {
             ThoughtOp::Return => write!(f, "RETURN_VALUE"),
             ThoughtOp::Explain => write!(f, "EXPLAIN"),
             ThoughtOp::EOF => write!(f, "EOF"),
+            ThoughtOp::Dynamic(s) => write!(f, "{}", s),
         }
     }
 }
@@ -444,28 +220,21 @@ impl std::fmt::Display for ThoughtOp {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkingMemory {
     pub language: String,
-    pub entities: HashMap<String, String>, // "var_name" -> "my_list", "func_name" -> "sort_data"
-    pub constraints: Vec<String>, // Например: "O(n log n)", "no external libs"
+    pub entities: HashMap<String, String>,
+    pub constraints: Vec<String>,
     pub raw_query: String,
 }
 
-/// Structured External Reasoning State (Гибридная память)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StructuredState {
-    /// Семантическая суть задачи (идет в PC-мозг для векторизации)
     pub goal: String,
-    /// Точные сущности (имена переменных, константы)
     pub entities: HashMap<String, String>,
-    /// Строгие ограничения (например: "O(n log n)", "без сторонних библиотек")
     pub constraints: Vec<String>,
-    /// Предположения (Assumptions) - сюда мы будем писать ошибки, чтобы PC "передумал"
     pub assumptions: Vec<String>,
-    /// Оригинальный запрос
     pub raw_query: String,
 }
 
 impl StructuredState {
-    /// Собирает текст для PC-мозга, комбинируя Цель и текущие Предположения (для ревизии)
     pub fn get_pc_context(&self) -> String {
         let mut ctx = format!("Goal: {}", self.goal);
         if !self.assumptions.is_empty() {
@@ -476,11 +245,21 @@ impl StructuredState {
     }
 }
 
-/// Результат верификации плана
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
     pub is_valid: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Episode {
+    pub raw_query: String,
+    pub query_embedding: Vec<f32>, // Used for fast cosine retrieval
+    pub novelty: f32,
+    pub confidence: f32,
+    pub generated_code: String,
+    pub thought_sequence: Vec<u32>,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,7 +294,7 @@ impl CognitiveDictionary {
             return id;
         }
         let id = self.next_id;
-        self.id_to_op.insert(id, op);
+        self.id_to_op.insert(id, op.clone());
         self.op_to_id.insert(op, id);
         self.next_id += 1;
         id
@@ -529,67 +308,81 @@ impl CognitiveDictionary {
         self.id_to_op.len()
     }
 
-    // For backward compatibility with old code expecting concept strings
-    pub fn get_concept(&self, id: u32) -> String {
-        self.get_op(id).to_string()
-    }
+    /// CHUNK DISCOVERY: Finds frequent pairs of thoughts and combines them
+    pub fn discover_chunks(&mut self, episodes: &[Episode]) -> usize {
+        let mut bigrams: HashMap<(u32, u32), usize> = HashMap::new();
+        for ep in episodes {
+            if !ep.success { continue; }
+            for window in ep.thought_sequence.windows(2) {
+                *bigrams.entry((window[0], window[1])).or_insert(0) += 1;
+            }
+        }
 
-    // For backward compatibility
-    pub fn add_concept(&mut self, concept: &str) -> u32 {
-        // Map concept string to ThoughtOp
-        let op = match concept {
-            "DEFINE_FUNCTION" => ThoughtOp::Define,
-            "ITERATE_COLLECTION" => ThoughtOp::Iterate,
-            "CHECK_CONDITION" => ThoughtOp::Check,
-            "COMPUTE_MATH" => ThoughtOp::Compute,
-            "AGGREGATE_RESULTS" => ThoughtOp::Aggregate,
-            "RETURN_VALUE" => ThoughtOp::Return,
-            "EXPLAIN" => ThoughtOp::Explain,
-            "EOF" => ThoughtOp::EOF,
-            _ => ThoughtOp::EOF, // fallback
-        };
-        self.add_op(op)
+        let mut new_chunks = 0;
+        for ((id1, id2), count) in bigrams {
+            if count >= 3 { // Threshold for chunking
+                let name1 = self.get_op(id1).to_string();
+                let name2 = self.get_op(id2).to_string();
+                let new_concept = format!("{}_{}", name1, name2);
+                
+                let dynamic_op = ThoughtOp::Dynamic(new_concept);
+                if !self.op_to_id.contains_key(&dynamic_op) {
+                    tracing::info!("✨ Chunk Discovery: Created new thought pattern: {}", dynamic_op);
+                    self.add_op(dynamic_op);
+                    new_chunks += 1;
+                }
+            }
+        }
+        new_chunks
     }
 }
 
 #[cfg(test)]
-mod cognitive_architecture_tests {
+mod tests {
     use super::*;
 
     #[test]
     fn test_cognitive_dictionary_initialization() {
         let dict = CognitiveDictionary::default();
-        // У нас 7 базовых операций + 1 EOF
-        assert_eq!(dict.len(), 8, "Словарь должен содержать 8 базовых операций");
-        
-        // Проверяем, что ключевые операции на месте
+        assert_eq!(dict.len(), 8, "Dictionary should have 8 core ops");
         assert!(dict.op_to_id.contains_key(&ThoughtOp::Define));
-        assert!(dict.op_to_id.contains_key(&ThoughtOp::EOF));
     }
+}
+
+#[cfg(test)]
+mod cognitive_dictionary_tests {
+    use super::*;
 
     #[test]
-    fn test_dynamic_concept_addition() {
+    fn test_chunk_discovery_creates_new_ops() {
         let mut dict = CognitiveDictionary::default();
-        let initial_len = dict.len();
+        let define_id = dict.op_to_id[&ThoughtOp::Define];
+        let check_id = dict.op_to_id[&ThoughtOp::Check];
 
-        // Добавляем новый концепт (симулируем Chunk Discovery)
-        // В реальности это будет не Enum, а строка, но для теста так проще
-        // let new_op_id = dict.add_op("ITERATE_AND_CHECK");
+        // Create 3 successful episodes with the sequence [Define, Check]
+        let mut episodes = Vec::new();
+        for _ in 0..4 {
+            episodes.push(Episode {
+                raw_query: "test".into(),
+                query_embedding: vec![],
+                novelty: 0.0,
+                confidence: 1.0,
+                generated_code: "".into(),
+                thought_sequence: vec![define_id, check_id, dict.op_to_id[&ThoughtOp::EOF]],
+                success: true,
+            });
+        }
+
+        let initial_len = dict.len();
+        let chunks_added = dict.discover_chunks(&episodes);
         
-        // assert_eq!(dict.len(), initial_len + 1, "Словарь не расширился");
+        // Should discover 2 new chunks: DEFINE_FUNCTION_CHECK_CONDITION and CHECK_CONDITION_EOF
+        assert_eq!(chunks_added, 2, "Should discover 2 new chunks (Define+Check and Check+EOF)");
+        assert_eq!(dict.len(), initial_len + 2);
         
-        // Попытка добавить тот же концепт снова не должна ничего менять
-        // let same_op_id = dict.add_op("ITERATE_AND_CHECK");
-        // assert_eq!(dict.len(), initial_len + 1, "Словарь не должен был измениться при дублировании");
-        // assert_eq!(new_op_id, same_op_id, "ID для существующего концепта должен быть стабильным");
-    }
-    
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-    pub struct StructuredState {
-        pub goal: String,
-        pub entities: HashMap<String, String>,
-        pub constraints: Vec<String>,
-        pub assumptions: Vec<String>,
-        pub raw_query: String,
+        let new_op1 = ThoughtOp::Dynamic("DEFINE_FUNCTION_CHECK_CONDITION".into());
+        let new_op2 = ThoughtOp::Dynamic("CHECK_CONDITION_EOF".into());
+        assert!(dict.op_to_id.contains_key(&new_op1), "The combined chunk must exist in the dictionary");
+        assert!(dict.op_to_id.contains_key(&new_op2), "The second combined chunk must exist in the dictionary");
     }
 }

@@ -1,10 +1,11 @@
 use neuro_fed_node::config::{NodeConfig, BackendConfig};
 use neuro_fed_node::ml_engine::MLEngine;
-use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig, ThoughtDecoder};
+use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
+use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::openai_proxy::OpenAiProxy;
 use neuro_fed_node::types::{DeviceType, CognitiveDictionary};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use std::env;
 
 #[tokio::main]
@@ -34,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     // Create a mock engine
-    let local_engine = Arc::new(Mutex::new(
+    let local_engine = Arc::new(RwLock::new(
         MLEngine::new("models/minimal-model.gguf", device_type.clone())
             .unwrap_or_else(|_| {
                 println!("   Using mock ML Engine (no actual model loaded)");
@@ -50,15 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Predictive Coding hierarchy
     println!("3. Initializing Predictive Coding hierarchy...");
     let pc_config = PCConfig::new(3, vec![512, 256, 128]);
-    let pc_hierarchy = Arc::new(Mutex::new(
+    let pc_hierarchy = Arc::new(RwLock::new(
         PredictiveCoding::new(pc_config)
             .expect("Failed to create Predictive Coding hierarchy")
     ));
 
     // Initialize Cognitive Components
-    let cognitive_dict = Arc::new(Mutex::new(CognitiveDictionary::default()));
-    let vocab_size = cognitive_dict.lock().await.len();
-    let thought_decoder = Arc::new(Mutex::new(
+    let cognitive_dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+    let vocab_size = cognitive_dict.read().await.len();
+    let thought_decoder = Arc::new(RwLock::new(
         ThoughtDecoder::new(512, vocab_size, &candle_core::Device::Cpu)?
     ));
 
