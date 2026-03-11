@@ -463,7 +463,7 @@ impl Default for BootstrapConfig {
         Self {
             embedding_dim: 1024,
             batch_size: 32,
-            max_epochs: 10,
+            max_epochs: 100,  // Increased from 10 to ensure better decoder convergence
             learning_rate: 0.001,
             document_paths: vec!["human-eval/".to_string()],
         }

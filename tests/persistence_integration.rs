@@ -27,19 +27,12 @@ async fn test_persistence_save_load() -> Result<(), Box<dyn Error>> {
     let embedding = fake_embedding(16, 0.5);
     pc.learn(&embedding, None)?;
     
-    // Save weights to database
+    // Save weights to database using the new get_level_weights() method
     let persistence = PCPersistence::new(&db_path).await?;
     
-    // Extract current weights from PC hierarchy
-    let levels_to_save: Vec<_> = pc.levels.iter().enumerate().map(|(idx, level)| {
-        neuro_fed_node::persistence::PCLevelWeights {
-            level_index: idx,
-            input_dim: level.weights.shape().dims2().unwrap().0,
-            output_dim: level.weights.shape().dims2().unwrap().1,
-            weights: level.weights.flatten_all().unwrap().to_vec1().unwrap(),
-            updated_at: chrono::Utc::now().timestamp(),
-        }
-    }).collect();
+    // Extract current weights from PC hierarchy using the new method
+    let levels_to_save = pc.get_level_weights()?;
+    assert!(!levels_to_save.is_empty(), "Should have extracted some levels");
     
     for level in &levels_to_save {
         persistence.save_level_weights(level).await?;
@@ -51,20 +44,10 @@ async fn test_persistence_save_load() -> Result<(), Box<dyn Error>> {
     // Load weights from database
     let loaded_levels = persistence.load_all_levels().await?;
     assert!(!loaded_levels.is_empty(), "Should have loaded some levels");
+    assert_eq!(loaded_levels.len(), levels_to_save.len(), "Should have same number of levels");
     
-    // Apply loaded weights to pc2
-    for saved_level in loaded_levels {
-        let idx = saved_level.level_index;
-        if idx < pc2.levels.len() {
-            let tensor = neuro_fed_node::persistence::vec_to_tensor(
-                saved_level.weights,
-                saved_level.input_dim,
-                saved_level.output_dim,
-                &Device::Cpu
-            )?;
-            pc2.levels[idx].weights = tensor;
-        }
-    }
+    // Apply loaded weights to pc2 using the new load_level_weights() method
+    pc2.load_level_weights(loaded_levels)?;
     
     // Verify that weights are approximately equal (they should be exactly equal)
     for (orig_level, loaded_level) in pc.levels.iter().zip(pc2.levels.iter()) {

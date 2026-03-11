@@ -49,6 +49,7 @@ impl BackendClient {
         let status = response.status();
         let response_text = response.text().await
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read Ollama response: {}", e)))?;
+        let response_text = response_text.trim_start().to_string();
         tracing::debug!("ollama raw response status={} body={}", status, response_text);
         if !status.is_success() {
             let snippet = response_text.chars().take(500).collect::<String>();
@@ -80,6 +81,7 @@ impl BackendClient {
         let status = response.status();
         let response_text = response.text().await
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read fallback response: {}", e)))?;
+        let response_text = response_text.trim_start().to_string();
         tracing::debug!("fallback raw response status={} body={}", status, response_text);
         if !status.is_success() {
             let snippet = response_text.chars().take(500).collect::<String>();

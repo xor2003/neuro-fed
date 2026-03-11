@@ -111,7 +111,7 @@ pub struct ProxyStats {
     pub last_reset: SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeviceType {
     pub name: String,
     pub description: String,

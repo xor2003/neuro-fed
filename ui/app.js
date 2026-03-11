@@ -20,6 +20,29 @@ const mCpu = document.getElementById("m-cpu");
 const mSaved = document.getElementById("m-saved");
 const mSource = document.getElementById("m-source");
 let processingNode = null;
+const STORAGE_KEY = "neurofed_chat_v1";
+let chatHistory = [];
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) {
+      chatHistory = parsed.filter(
+        (item) => item && typeof item.role === "string" && typeof item.content === "string"
+      );
+    }
+  } catch (_) {
+    chatHistory = [];
+  }
+}
+
+function saveHistory() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(chatHistory));
+  } catch (_) {
+  }
+}
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return "0 B";
@@ -33,12 +56,16 @@ function formatBytes(bytes) {
   return `${val.toFixed(1)} ${units[idx]}`;
 }
 
-function appendMessage(role, content) {
+function appendMessage(role, content, persist = true) {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
   div.textContent = content;
   messages.appendChild(div);
   messages.scrollTop = messages.scrollHeight;
+  if (persist) {
+    chatHistory.push({ role, content });
+    saveHistory();
+  }
   return div;
 }
 
@@ -55,7 +82,7 @@ function appendProcessing() {
 async function sendMessage() {
   const text = promptEl.value.trim();
   if (!text) return;
-  appendMessage("user", text);
+  appendMessage("user", text, true);
   promptEl.value = "";
   const node = appendProcessing();
 
@@ -76,10 +103,14 @@ async function sendMessage() {
     node.textContent = reply;
     node.classList.remove("processing");
     if (processingNode === node) processingNode = null;
+    chatHistory.push({ role: "assistant", content: reply });
+    saveHistory();
   } catch (err) {
     node.textContent = `error: ${err}`;
     node.classList.remove("processing");
     if (processingNode === node) processingNode = null;
+    chatHistory.push({ role: "assistant", content: `error: ${err}` });
+    saveHistory();
   }
 }
 
@@ -107,6 +138,14 @@ async function refreshState() {
     (data.steps || []).forEach((step) => {
       const li = document.createElement("li");
       li.textContent = step;
+      // Add color class based on step content
+      if (step.includes("Remote LLM request")) {
+        li.classList.add("step-remote");
+      } else if (step.includes("Local LLM request")) {
+        li.classList.add("step-local");
+      } else if (step.includes("PC reasoning") || step.includes("PC learning")) {
+        li.classList.add("step-pc");
+      }
       stepsEl.appendChild(li);
     });
     if (data.last_updated) {
@@ -167,3 +206,6 @@ setInterval(refreshStats, 2000);
 refreshState();
 refreshMetrics();
 refreshStats();
+
+loadHistory();
+chatHistory.forEach((msg) => appendMessage(msg.role, msg.content, false));

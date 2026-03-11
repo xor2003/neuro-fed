@@ -70,6 +70,36 @@ async fn main() -> Result<()> {
             *dim = (*dim).min(max_dim);
         }
     }
+    
+    // Check database for existing weights and adjust config if needed
+    let db_missing = !std::path::Path::new(config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db")).exists();
+    let has_weights = if !db_missing {
+        persistence.has_any_weights().await.unwrap_or(false)
+    } else {
+        false
+    };
+    
+    if has_weights && !db_missing {
+        match persistence.load_all_levels().await {
+            Ok(saved_weights) => {
+                if !saved_weights.is_empty() {
+                    let saved_levels_count = saved_weights.len();
+                    if saved_levels_count != pc_config.n_levels {
+                        tracing::warn!("DB has {} levels but config has {}. Overriding config to match DB.",
+                            saved_levels_count, pc_config.n_levels);
+                        pc_config.n_levels = saved_levels_count;
+                        // Update dim_per_level accordingly - keep existing dimensions or pad with defaults
+                        while pc_config.dim_per_level.len() < saved_levels_count {
+                            pc_config.dim_per_level.push(512); // default dimension
+                        }
+                        pc_config.dim_per_level.truncate(saved_levels_count);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load weights from database during config check: {}", e),
+        }
+    }
+    
     let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config)?));
 
     let cognitive_dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
@@ -169,14 +199,91 @@ async fn main() -> Result<()> {
     let app = create_router(proxy.clone()).merge(ui::create_router(proxy));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080");
-    let shutdown = async {
+    let db_path = config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db");
+    // Clone for shutdown handler
+    let pc_hierarchy_for_shutdown = pc_hierarchy.clone();
+    let persistence_for_shutdown = persistence.clone();
+    let shutdown = async move {
+        tracing::info!("[DEBUG] Shutdown handler initialized and waiting for Ctrl+C...");
+        
         if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("CTRL+C received, shutting down HTTP server...");
+            tracing::info!("CTRL+C received, starting graceful shutdown...");
+            
+            // Immediate test log
+            tracing::info!("[DEBUG] Ctrl+C handler triggered, starting save operations");
+            
+            // 1. Save PC weights
+            tracing::info!("Saving PC weights...");
+            match pc_hierarchy_for_shutdown.read().await.get_level_weights() {
+                Ok(weights) => {
+                    let total_levels = weights.len();
+                    let mut saved_count = 0;
+                    let mut error_count = 0;
+                    
+                    tracing::info!("Found {} PC levels to save", total_levels);
+                    
+                    for level in weights {
+                        tracing::info!("Saving level {} weights ({}x{} matrix)...",
+                            level.level_index, level.input_dim, level.output_dim);
+                        
+                        if let Err(e) = persistence_for_shutdown.save_level_weights(&level).await {
+                            tracing::error!("Failed to save level {} weights: {}", level.level_index, e);
+                            error_count += 1;
+                        } else {
+                            tracing::info!("Successfully saved level {} weights", level.level_index);
+                            saved_count += 1;
+                        }
+                    }
+                    
+                    if error_count == 0 {
+                        tracing::info!("✅ Successfully saved all {} PC weight levels", saved_count);
+                    } else {
+                        tracing::warn!("⚠️ Saved {}/{} PC weight levels, {} failed", saved_count, total_levels, error_count);
+                    }
+                }
+                Err(e) => tracing::error!("❌ Failed to extract PC weights: {}", e),
+            }
+            
+            // 2. TODO: Save semantic cache if enabled
+            tracing::info!("Semantic cache saving not yet implemented");
+            
+            // 3. TODO: Save trust graph peers
+            tracing::info!("Trust graph peers saving not yet implemented");
+            
+            // 4. TODO: Save delta history
+            tracing::info!("Delta history saving not yet implemented");
+            
+            tracing::info!("Shutdown preparation complete. Terminating process...");
+            
+            // Small delay to ensure logs are flushed
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tracing::info!("[DEBUG] Final log before exit");
+        } else {
+            tracing::warn!("Ctrl+C await returned error");
         }
     };
-    let db_path = config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db");
     let db_missing = !std::path::Path::new(db_path).exists();
     let has_weights = persistence.has_any_weights().await.unwrap_or(false);
+    
+    // Load existing weights if available
+    if has_weights && !db_missing {
+        tracing::info!("Loading existing PC weights from database...");
+        match persistence.load_all_levels().await {
+            Ok(saved_weights) => {
+                if !saved_weights.is_empty() {
+                    let weights_clone = saved_weights.clone();
+                    match pc_hierarchy.write().await.load_level_weights(saved_weights) {
+                        Ok(()) => tracing::info!("Successfully loaded {} level weights from persistence", weights_clone.len()),
+                        Err(e) => tracing::warn!("Failed to load PC weights: {}", e),
+                    }
+                } else {
+                    tracing::info!("No weights found in database (empty result)");
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load weights from database: {}", e),
+        }
+    }
+    
     if config.bootstrap_on_start && (db_missing || !has_weights) {
         let bootstrap = BootstrapManager::new(ml_engine, thought_decoder, cognitive_dict, pc_hierarchy, config.bootstrap_config.clone());
         tokio::spawn(async move {

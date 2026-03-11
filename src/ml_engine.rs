@@ -366,7 +366,8 @@ impl MLEngine {
         mod tests {
             use super::*;
             use candle_core::{Device, Tensor, DType};
-        
+            use anyhow::Result;
+
             #[test]
             fn test_safe_l2_normalization_avoids_broadcast_panic() -> Result<(), Box<dyn std::error::Error>> {
                 let device = Device::Cpu;
@@ -428,6 +429,40 @@ impl MLEngine {
                 
                 Ok(())
             }
+
+            #[test]
+            fn test_decode_belief_with_rms_scaling() -> Result<()> {
+                // This test requires a real model to load the lm_head
+                let config = crate::config::NodeConfig::default();
+                // Ensure you have a model at the default path or update this path
+                if !std::path::Path::new(&config.model_path).exists() {
+                    println!("Skipping test_decode_belief_with_rms_scaling: model file not found at {}", config.model_path);
+                    return Ok(());
+                }
+
+                let device_type = crate::types::DeviceType { name: "cpu".to_string(), description: "".to_string(), supported: true };
+                let engine = MLEngine::new(&config.model_path, device_type).unwrap();
+                let belief_dim = engine.embedding_dim();
+                
+                // Create a normalized belief tensor (length 1.0), which caused the original issue
+                let belief_l2 = Tensor::ones((1, belief_dim), DType::F32, &engine.device)?;
+                // Manual L2 normalization
+                let norm_sq = belief_l2.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                let norm = norm_sq.sqrt();
+                let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
+                let belief_l2 = (belief_l2 * (scale_factor as f64))?;
+
+                let (_word, avg_mag, max_mag) = engine.decode_belief_with_confidence(&belief_l2)?;
+
+                // The original buggy code produced max_mag ~0.03.
+                // With the sqrt(dim) scaling, it should be >> 1.0.
+                // A value > 10 for a simple vector of ones is a very safe bet.
+                assert!(max_mag > 10.0, "Max logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.", max_mag);
+                assert!(avg_mag > 0.5, "Average logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.", avg_mag);
+
+                println!("Logit scaling test passed: max_mag={}, avg_mag={}", max_mag, avg_mag);
+                Ok(())
+            }
         }
 
         // 1. Project belief through LM Head to get Vocab Logits
@@ -451,12 +486,20 @@ impl MLEngine {
             return Err(MLError::InvalidResponse(format!("Unexpected belief tensor shape: {:?}", belief_shape)));
         };
 
+        // 🔴 FIX: Scale belief to approximate missing RMSNorm magnitude
+        // Without this, logits are ~45x too small due to L2 normalization in process_text,
+        // causing flat probability distributions and false "low-confidence" fallbacks.
+        let d_f32 = belief_2d.shape().dims()[1] as f64;
+        let scale_factor = d_f32.sqrt();
+        let scaled_belief = belief_2d.affine(scale_factor, 0.0)
+            .map_err(|e| MLError::InvalidResponse(format!("Failed to scale belief: {}", e)))?;
+
         // Transpose LM Head: (vocab_size, embedding_dim) -> (embedding_dim, vocab_size)
         let lm_head_t = self.lm_head.t()
             .map_err(|e| MLError::InvalidResponse(format!("Failed to transpose LM Head: {}", e)))?;
 
         // Matrix multiply: (1, embedding_dim) * (embedding_dim, vocab_size) = (1, vocab_size)
-        let logits = belief_2d.matmul(&lm_head_t)
+        let logits = scaled_belief.matmul(&lm_head_t)
             .map_err(|e| MLError::InvalidResponse(format!("LM Head projection failed: {}", e)))?;
 
         // 2. Sample the most likely token (Greedy for now)

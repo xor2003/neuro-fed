@@ -248,6 +248,24 @@ button:hover { transform: translateY(-1px) scale(1.01); }
   background: rgba(22, 12, 38, 0.9);
 }
 
+.steps li.step-remote {
+  color: #ff5f8a;
+  border-color: rgba(255, 95, 138, 0.4);
+  background: rgba(255, 95, 138, 0.08);
+}
+
+.steps li.step-local {
+  color: #ffcc00;
+  border-color: rgba(255, 204, 0, 0.4);
+  background: rgba(255, 204, 0, 0.08);
+}
+
+.steps li.step-pc {
+  color: #00ff9d;
+  border-color: rgba(0, 255, 157, 0.4);
+  background: rgba(0, 255, 157, 0.08);
+}
+
 .tray {
   position: fixed;
   right: 24px;

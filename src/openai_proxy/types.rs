@@ -33,21 +33,35 @@ pub enum ProxyError {
 pub struct OpenAiRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    pub max_tokens: Option<usize>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
-    pub stop: Option<Vec<String>>,
-    pub stream: Option<bool>,
-    pub n: Option<usize>,
-    pub echo: Option<bool>,
-    pub logit_bias: Option<HashMap<String, f32>>,
-    pub function_call: Option<FunctionCall>,
-    pub tools: Option<Vec<Tool>>,
-    pub tool_calls: Option<Vec<ToolCall>>,
-    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<HashMap<String, f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<FunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing, skip_deserializing)]
     pub api_key: Option<String>,
 }
 

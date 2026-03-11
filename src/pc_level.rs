@@ -23,11 +23,26 @@ pub struct PCLevel {
 
 impl PCLevel {
     pub fn new(input_dim: usize, output_dim: usize, device: &Device) -> CandleResult<Self> {
+        Self::new_with_weights(input_dim, output_dim, None, device)
+    }
+    
+    /// NEW: Create PCLevel with optional pre-trained weights for knowledge-guided initialization
+    pub fn new_with_weights(
+        input_dim: usize,
+        output_dim: usize,
+        initial_weights: Option<Tensor>,
+        device: &Device
+    ) -> CandleResult<Self> {
+        let weights = match initial_weights {
+            Some(w) => w,
+            None => Tensor::randn(0f32, (1.0 / input_dim as f32).sqrt(), (input_dim, output_dim), device)?,
+        };
+        
         Ok(PCLevel {
             beliefs: Tensor::zeros((input_dim, 1), DType::F32, device)?,
             predictions: Tensor::zeros((input_dim, 1), DType::F32, device)?,
             errors: Tensor::zeros((input_dim, 1), DType::F32, device)?,
-            weights: Tensor::randn(0f32, 0.01f32, (input_dim, output_dim), device)?,
+            weights,
             precision: Tensor::ones((input_dim, 1), DType::F32, device)?,
             prev_beliefs: Tensor::zeros((input_dim, 1), DType::F32, device)?,
             // Initialize temporal weights as identity + noise to encourage stability
@@ -140,6 +155,38 @@ impl PCLevel {
         // Keep memory_buffer for backward compatibility
         // In a full implementation, this would be used for temporal context
         let _ = beliefs;
+    }
+
+    /// Set weights from a flattened vector (row-major)
+    pub fn set_weights_from_vec(&mut self, weights_vec: Vec<f32>) -> CandleResult<()> {
+        let rows = self.weights.dim(0)?;
+        let cols = self.weights.dim(1)?;
+        
+        if weights_vec.len() != rows * cols {
+            return Err(candle_core::Error::Msg(format!(
+                "Weight vector size mismatch: expected {} ({}x{}), got {}",
+                rows * cols, rows, cols, weights_vec.len()
+            )));
+        }
+        
+        self.weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?;
+        Ok(())
+    }
+
+    /// Set temporal weights from a flattened vector (row-major)
+    pub fn set_temporal_weights_from_vec(&mut self, weights_vec: Vec<f32>) -> CandleResult<()> {
+        let rows = self.temporal_weights.dim(0)?;
+        let cols = self.temporal_weights.dim(1)?;
+        
+        if weights_vec.len() != rows * cols {
+            return Err(candle_core::Error::Msg(format!(
+                "Temporal weight vector size mismatch: expected {} ({}x{}), got {}",
+                rows * cols, rows, cols, weights_vec.len()
+            )));
+        }
+        
+        self.temporal_weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?;
+        Ok(())
     }
 }
 

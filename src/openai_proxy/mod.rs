@@ -328,6 +328,36 @@ impl OpenAiProxy {
 
         let verification_result: Result<String, String> = Ok("Verification skipped".to_string());
         let success = !final_text.starts_with("No response");
+
+        if success && self.config.proxy_config.pc_learning_enabled {
+            let learn_text = format!("User: {}\nAssistant: {}", state.raw_query, final_text);
+            match self.local_engine.read().await.process_text_sequence(&learn_text).await {
+                Ok(seq) => {
+                    let mut pc = self.pc_hierarchy.write().await;
+                    match pc.learn_sequence(&seq, None) {
+                        Ok(_) => {
+                            let mut metrics = self.metrics.write().await;
+                            metrics.pc_learning_calls += 1;
+                            let mut ui = self.ui_state.write().await;
+                            ui.steps.push("PC learning from response".to_string());
+                            ui.last_updated = Utc::now().timestamp();
+                        }
+                        Err(e) => {
+                            let msg = format!("PC learning failed: {}", e);
+                            let mut ui = self.ui_state.write().await;
+                            ui.steps.push(msg);
+                            ui.last_updated = Utc::now().timestamp();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("PC learning embedding failed: {}", e);
+                    let mut ui = self.ui_state.write().await;
+                    ui.steps.push(msg);
+                    ui.last_updated = Utc::now().timestamp();
+                }
+            }
+        }
         
         // 5. Update Calibration Database based on true outcome
         self.calibration.write().await.record_outcome(raw_confidence, success);

@@ -7,6 +7,7 @@ pub struct ProxyMetrics {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub pc_inference_calls: u64,
+    pub pc_learning_calls: u64,
     pub thought_decoder_calls: u64,
     pub errors: u64,
 }
