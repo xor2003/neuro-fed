@@ -3,7 +3,6 @@
 // Migrated from ndarray to candle-core for GPU acceleration
 
 use candle_core::{Device, Tensor, DType};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use chrono;
 
@@ -314,7 +313,7 @@ impl PredictiveCoding {
         self.free_energy = stats.free_energy_history.last().unwrap_or(&0.0).clone();
         
         // Broadcast delta updates if free energy dropped significantly (learning occurred)
-        if let Some(sender) = &self.gossip_sender {
+        if let Some(_sender) = &self.gossip_sender {
             if let (Some(initial_fe), Some(final_fe)) = (stats.free_energy_history.first(), stats.free_energy_history.last()) {
                 let drop_pct = (initial_fe - final_fe) / initial_fe.max(1.0);
                 if drop_pct > 0.1 { // 10% drop threshold
@@ -466,11 +465,10 @@ impl PredictiveCoding {
 #[cfg(test)]
 mod sequence_and_calibration_tests {
     use super::*;
-    use candle_core::{Device, Tensor, DType};
+    use candle_core::Tensor;
 
     #[test]
     fn test_modulate_precision_scales_correctly() -> Result<(), PCError> {
-        let device = Device::Cpu;
         let config = PCConfig::new(2, vec![8, 4]);
         let mut pc = PredictiveCoding::new(config)?;
 
@@ -492,7 +490,6 @@ mod sequence_and_calibration_tests {
 
     #[test]
     fn test_modulate_precision_prevents_zero_vanishing_gradient() -> Result<(), PCError> {
-        let device = Device::Cpu;
         let config = PCConfig::new(2, vec![8, 4]);
         let mut pc = PredictiveCoding::new(config)?;
 
@@ -510,7 +507,6 @@ mod sequence_and_calibration_tests {
 
     #[test]
     fn test_infer_sequence_accumulates_stats_and_progresses_time() -> Result<(), PCError> {
-        let device = Device::Cpu;
         let config = PCConfig::new(2, vec![4, 2]);
         let mut pc = PredictiveCoding::new(config)?;
 

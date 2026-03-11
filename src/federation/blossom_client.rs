@@ -56,6 +56,7 @@ pub struct BrainMetadata {
 }
 
 /// Blossom client for uploading/downloading brain files via Nostr.
+#[allow(dead_code)]
 pub struct BlossomClient {
     /// Nostr federation client (to be integrated).
     /// For now, we just store relay URLs.

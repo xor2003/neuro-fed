@@ -19,6 +19,7 @@ const mMem = document.getElementById("m-mem");
 const mCpu = document.getElementById("m-cpu");
 const mSaved = document.getElementById("m-saved");
 const mSource = document.getElementById("m-source");
+let processingNode = null;
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return "0 B";
@@ -44,9 +45,10 @@ function appendMessage(role, content) {
 function appendProcessing() {
   const div = document.createElement("div");
   div.className = "msg assistant processing";
-  div.innerHTML = `<span class="spinner"></span><span>Processing</span>`;
+  div.innerHTML = `<span class="spinner"></span><span class="processing-text">Working…</span>`;
   messages.appendChild(div);
   messages.scrollTop = messages.scrollHeight;
+  processingNode = div;
   return div;
 }
 
@@ -55,7 +57,7 @@ async function sendMessage() {
   if (!text) return;
   appendMessage("user", text);
   promptEl.value = "";
-  const processingNode = appendProcessing();
+  const node = appendProcessing();
 
   const payload = {
     model: "neurofed",
@@ -71,11 +73,13 @@ async function sendMessage() {
 
     const data = await res.json();
     const reply = data?.choices?.[0]?.message?.content ?? "(no response)";
-    processingNode.textContent = reply;
-    processingNode.classList.remove("processing");
+    node.textContent = reply;
+    node.classList.remove("processing");
+    if (processingNode === node) processingNode = null;
   } catch (err) {
-    processingNode.textContent = `error: ${err}`;
-    processingNode.classList.remove("processing");
+    node.textContent = `error: ${err}`;
+    node.classList.remove("processing");
+    if (processingNode === node) processingNode = null;
   }
 }
 
@@ -121,6 +125,14 @@ async function refreshState() {
       const total = data.progress_total ?? 0;
       const current = data.progress_current ?? 0;
       progressText.textContent = total > 0 ? `${current}/${total} (${pct.toFixed(0)}%)` : `${pct.toFixed(0)}%`;
+    }
+    if (processingNode && processingNode.classList.contains("processing")) {
+      const lastStep = (data.steps || []).slice(-1)[0];
+      const label = lastStep || data.status || "Working…";
+      const textEl = processingNode.querySelector(".processing-text");
+      if (textEl) {
+        textEl.textContent = `Working: ${label}`;
+      }
     }
   } catch (_) {
   }

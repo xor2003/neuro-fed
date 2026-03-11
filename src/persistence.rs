@@ -230,6 +230,20 @@ impl PCPersistence {
             None => Ok(None),
         }
     }
+
+    /// Check if any PC weights are stored
+    pub async fn has_any_weights(&self) -> Result<bool, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM pc_level_weights
+            LIMIT 1
+            "#
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
     
     /// Load all levels
     pub async fn load_all_levels(&self) -> Result<Vec<PCLevelWeights>, PersistenceError> {

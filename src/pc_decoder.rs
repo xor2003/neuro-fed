@@ -2,7 +2,6 @@
 use candle_core::{Device, Tensor, Var};
 use candle_nn::ops;
 use crate::pc_types::PCError;
-use crate::types::ThoughtOp;
 
 pub struct ThoughtDecoder {
     pub w_update: Var,

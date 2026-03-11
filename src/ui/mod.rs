@@ -64,7 +64,7 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
     let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
     let mut sys = System::new_all();
-    sys.refresh_processes(ProcessesToUpdate::All);
+    sys.refresh_processes(ProcessesToUpdate::All, true);
     let pid = Pid::from(std::process::id() as usize);
     let (memory_bytes, cpu_usage) = match sys.process(pid) {
         Some(proc_) => {

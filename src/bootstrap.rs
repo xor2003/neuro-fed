@@ -12,6 +12,7 @@ pub struct BootstrapManager {
     thought_decoder: Arc<RwLock<ThoughtDecoder>>,
     dict: Arc<RwLock<CognitiveDictionary>>,
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
+    config: crate::config::BootstrapConfig,
 }
 
 impl BootstrapManager {
@@ -20,8 +21,9 @@ impl BootstrapManager {
         thought_decoder: Arc<RwLock<ThoughtDecoder>>,
         dict: Arc<RwLock<CognitiveDictionary>>,
         pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
+        config: crate::config::BootstrapConfig,
     ) -> Self {
-        Self { ml_engine, thought_decoder, dict, pc_hierarchy }
+        Self { ml_engine, thought_decoder, dict, pc_hierarchy, config }
     }
 
     pub async fn run_synthetic_training(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -32,11 +34,14 @@ impl BootstrapManager {
         
         let mut decoder = self.thought_decoder.write().await;
 
-        for epoch in 0..100 { 
+        let batch_size = self.config.batch_size.max(1);
+        for epoch in 0..self.config.max_epochs {
             let mut total_loss = 0.0;
-            for (belief, seq) in &synthetic_data {
-                let loss = decoder.train_step(belief, seq, 0.01)?;
-                total_loss += loss;
+            for batch in synthetic_data.chunks(batch_size) {
+                for (belief, seq) in batch {
+                    let loss = decoder.train_step(belief, seq, self.config.learning_rate as f64)?;
+                    total_loss += loss;
+                }
             }
             if epoch % 10 == 0 {
                  info!("Эпоха {}: Loss = {:.4}", epoch, total_loss / synthetic_data.len() as f32);
@@ -81,6 +86,19 @@ impl BootstrapManager {
         pc.infer(&q2_emb, 15).unwrap();
         let q2_belief = pc.levels.last().unwrap().beliefs.flatten_all().unwrap();
 
-        vec![(q1_belief, seq1), (q2_belief, seq2)]
+        let mut dataset = vec![(q1_belief, seq1), (q2_belief, seq2)];
+        if !self.config.document_paths.is_empty() {
+            for path in &self.config.document_paths {
+                let query = format!("Summarize: {}", path);
+                if let Ok(emb) = engine.process_text(&query).await {
+                    pc.infer(&emb, 15).ok();
+                    if let Some(top) = pc.levels.last() {
+                        let belief = top.beliefs.flatten_all().unwrap();
+                        dataset.push((belief, vec![dict.op_to_id[&ThoughtOp::Explain], dict.op_to_id[&ThoughtOp::EOF]]));
+                    }
+                }
+            }
+        }
+        dataset
     }
 }

@@ -13,10 +13,8 @@ use tokio::time::interval;
 use crate::types::{UserInput, FileEvent, NodeError, NostrEvent};
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::sleep_phase::SleepManager;
-use crate::pc_decoder::ThoughtDecoder;
-use crate::types::CognitiveDictionary;
-use crate::openai_proxy::calibration::CalibrationStore;
 
+#[allow(dead_code)]
 pub struct NodeLoop {
     rx_user_input: mpsc::Receiver<UserInput>,
     rx_file_events: mpsc::Receiver<FileEvent>,
@@ -229,15 +227,12 @@ mod tests {
     async fn test_node_loop_creation() {
         use super::*;
         use tokio::sync::mpsc;
-        use std::sync::Arc;
-        use std::time::Duration;
-        use std::sync::atomic::Ordering;
         
-        let (tx_user_input, rx_user_input) = mpsc::channel(10);
-        let (tx_file_events, rx_file_events) = mpsc::channel(10);
-        let (tx_nostr_events, rx_nostr_events) = mpsc::channel(10);
+        let (_tx_user_input, rx_user_input) = mpsc::channel(10);
+        let (_tx_file_events, rx_file_events) = mpsc::channel(10);
+        let (_tx_nostr_events, rx_nostr_events) = mpsc::channel(10);
 
-        let node_loop = NodeLoop::new(rx_user_input, rx_file_events, rx_nostr_events);
+        let _node_loop = NodeLoop::new(rx_user_input, rx_file_events, rx_nostr_events);
         // Just verify creation succeeded
         assert!(true);
     }

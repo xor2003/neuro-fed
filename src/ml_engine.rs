@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use candle_core::{Device, Tensor, DType};
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 use std::path::Path;
 use std::sync::Arc;
@@ -129,6 +130,10 @@ impl MLEngine {
             }
         }
         let lm_head = lm_head.ok_or_else(|| MLError::ModelLoadError("Could not find LM head tensor (tried: output.weight, lm_head.weight)".to_string()))?;
+        Self::log_gguf_metadata(&content);
+        Self::log_tensor_stats("token_embeddings", &token_embeddings);
+        Self::log_tensor_stats("lm_head", &lm_head);
+        Self::log_tensor_file_info("gguf_model", model_path);
 
         // 5. Extract embedding dimension from GGUF metadata or tensor shape
         let embedding_dim = Self::extract_embedding_dim(&content, &token_embeddings)
@@ -154,6 +159,81 @@ impl MLEngine {
             embedding_dim,
             model_path: model_path.to_string(),
         })
+    }
+
+    fn log_tensor_stats(name: &str, tensor: &candle_core::Tensor) {
+        let shape = tensor.shape();
+        let dims = shape.dims();
+        let count: usize = dims.iter().product();
+        let stats = match tensor.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+            Ok(values) => {
+                let mut sum = 0.0f64;
+                let mut sum_sq = 0.0f64;
+                let mut min = f32::INFINITY;
+                let mut max = f32::NEG_INFINITY;
+                for v in &values {
+                    let fv = *v;
+                    sum += fv as f64;
+                    sum_sq += (fv as f64) * (fv as f64);
+                    if fv < min { min = fv; }
+                    if fv > max { max = fv; }
+                }
+                let mean = (sum / values.len().max(1) as f64) as f32;
+                let var = (sum_sq / values.len().max(1) as f64) - (mean as f64 * mean as f64);
+                let std = (var.max(0.0) as f32).sqrt();
+                (mean, std, min, max)
+            }
+            Err(_) => (0.0, 0.0, 0.0, 0.0),
+        };
+        tracing::info!(
+            "{}: shape={:?} elems={} mean={:.6} std={:.6} min={:.6} max={:.6}",
+            name,
+            shape,
+            count,
+            stats.0,
+            stats.1,
+            stats.2,
+            stats.3
+        );
+    }
+
+    fn log_tensor_file_info(label: &str, path: &str) {
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let size = meta.len();
+                tracing::info!("{}: path={} size_bytes={}", label, path, size);
+                let bytes = std::fs::read(path).ok();
+                if let Some(buf) = bytes {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&buf);
+                    let hash = hasher.finalize();
+                    tracing::info!("{}: sha256={}", label, hex::encode(hash));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("{}: failed to read file info: {}", label, e);
+            }
+        }
+    }
+
+    fn log_gguf_metadata(content: &candle_core::quantized::gguf_file::Content) {
+        let metadata = &content.metadata;
+        let mut keys: Vec<&String> = metadata.keys().collect();
+        keys.sort();
+        let preview = keys.iter().take(30).map(|k| k.as_str()).collect::<Vec<_>>();
+        tracing::info!("GGUF metadata keys (first {}): {:?}", preview.len(), preview);
+        if let Some(value) = metadata.get("general.name") {
+            tracing::info!("GGUF general.name: {:?}", value);
+        }
+        if let Some(value) = metadata.get("general.architecture") {
+            tracing::info!("GGUF general.architecture: {:?}", value);
+        }
+        if let Some(value) = metadata.get("llama.embedding_length") {
+            tracing::info!("GGUF llama.embedding_length: {:?}", value);
+        }
+        if let Some(value) = metadata.get("llama.vocab_size") {
+            tracing::info!("GGUF llama.vocab_size: {:?}", value);
+        }
     }
 
     /// Extract embedding dimension from GGUF metadata or tensor shape
@@ -265,6 +345,10 @@ impl MLEngine {
 
     /// "The Mouth": Convert a PC Brain "belief" vector back into English tokens
     pub fn decode_belief(&self, belief: &Tensor) -> Result<String, MLError> {
+        Ok(self.decode_belief_with_confidence(belief)?.0)
+    }
+
+    pub fn decode_belief_with_confidence(&self, belief: &Tensor) -> Result<(String, f32, f32), MLError> {
         // Log tensor shapes for debugging
         let belief_shape = belief.shape();
         let lm_head_shape = self.lm_head.shape();
@@ -411,6 +495,27 @@ impl MLEngine {
                 avg_logit_magnitude, max_logit_magnitude);
         }
 
+        // Log top-5 logits for visibility
+        let mut top: Vec<(usize, f32)> = Vec::new();
+        for (i, &val) in logits_vec.iter().enumerate() {
+            if top.len() < 5 {
+                top.push((i, val));
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            } else if let Some(last) = top.last() {
+                if val > last.1 {
+                    top.pop();
+                    top.push((i, val));
+                    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+        }
+        let mut top_tokens = Vec::new();
+        for (idx, val) in top {
+            let token = self.tokenizer.decode(&[idx as u32], true).unwrap_or_else(|_| "<decode_err>".to_string());
+            top_tokens.push(format!("{}:{:.4}:'{}'", idx, val, token));
+        }
+        tracing::info!("LM Head top-5: {}", top_tokens.join(", "));
+
         // Ensure token ID is within vocabulary bounds
         if max_idx >= tokenizer_vocab_size as usize {
             tracing::warn!("Token ID {} exceeds tokenizer vocabulary size {}, clamping to {}",
@@ -423,7 +528,7 @@ impl MLEngine {
             .map_err(|e| MLError::InvalidResponse(format!("Decode error: {}", e)))?;
 
         tracing::info!("decode_belief: decoded token ID {} -> '{}'", max_idx, word);
-        Ok(word)
+        Ok((word, avg_logit_magnitude, max_logit_magnitude))
     }
 
     /// Get the embedding dimension detected from the model

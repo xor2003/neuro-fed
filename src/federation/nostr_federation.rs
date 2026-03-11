@@ -61,6 +61,7 @@ impl std::fmt::Display for NostrError {
 impl std::error::Error for NostrError {}
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct NostrFederation {
     config: NostrConfig,
     relays: Vec<String>,

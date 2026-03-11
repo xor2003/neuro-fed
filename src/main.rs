@@ -15,6 +15,11 @@ use neuro_fed_node::{
     metrics,
     ui,
     bootstrap::BootstrapManager,
+    federation::nostr_federation::NostrFederation,
+    brain_manager::BrainManager,
+    federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy},
+    payment_verifier::PaymentVerifier,
+    pow_verifier::PoWVerifier,
 };
 use std::collections::VecDeque;
 use candle_core::Device;
@@ -33,11 +38,11 @@ fn select_device(config: &NodeConfig) -> Device {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let config = NodeConfig::load_or_default();
+    let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
     tracing::info!("🧠 NeuroFed Node - Final Production Build - Starting...");
-
-    let config = NodeConfig::load_or_default();
     
     // 1. Инициализация Базы Данных и Персистентности
     let persistence = Arc::new(PCPersistence::new(config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db")).await?);
@@ -105,6 +110,7 @@ async fn main() -> Result<()> {
     // 5. Запуск HTTP-сервера (OpenAI Proxy)
     let proxy_config = ProxyConfig {
         openai_api_key: config.proxy_config.openai_api_key.clone(),
+        openai_model: config.proxy_config.openai_model.clone(),
         ollama_url: config.proxy_config.ollama_base_url.clone(),
         fallback_url: config.proxy_config.openai_base_url.clone(),
         enable_cache: config.proxy_config.semantic_cache_enabled,
@@ -114,6 +120,52 @@ async fn main() -> Result<()> {
     let proxy = Arc::new(OpenAiProxy::new(
         config.clone(), proxy_config, ml_engine.clone(), pc_hierarchy.clone(), embedding_dim, thought_decoder.clone(), cognitive_dict.clone(),
     ));
+
+    // Initialize Nostr federation and brain sharing (config-driven)
+    let nostr_federation = Arc::new(NostrFederation::new(config.nostr_config.clone()));
+    let federation_strategy = if config.federation_config.strategy == "wallet" {
+        FederationStrategy::WalletMode {
+            min_sats: config.federation_config.wallet.min_sats,
+            required_confirmations: config.federation_config.wallet.required_confirmations,
+        }
+    } else {
+        FederationStrategy::NoWalletMode {
+            difficulty: config.federation_config.pow.difficulty,
+            timeout_seconds: config.federation_config.pow.timeout_seconds,
+        }
+    };
+    let federation_manager_config = FederationManagerConfig {
+        strategy: federation_strategy,
+        enable_fallback: config.federation_config.enable_fallback,
+        max_retries: config.federation_config.max_retries,
+        request_timeout_seconds: config.federation_config.request_timeout_seconds,
+    };
+    let payment_verifier = Arc::new(PaymentVerifier::new(
+        config.federation_config.wallet.payment_relays.clone(),
+        config.nostr_config.public_key.clone(),
+        Some(config.federation_config.wallet.private_key.clone()),
+    ));
+    let pow_verifier = Arc::new(PoWVerifier::new(
+        config.federation_config.pow.hash_algorithm.clone(),
+        config.federation_config.pow.max_nonce,
+    ));
+    let _federation_manager = FederationManager::new(
+        federation_manager_config,
+        nostr_federation.clone(),
+        Some(payment_verifier),
+        Some(pow_verifier),
+    );
+    let _brain_manager = if config.brain_sharing_config.enabled {
+        match BrainManager::new(config.brain_sharing_config.clone(), nostr_federation.clone()) {
+            Ok(mgr) => Some(mgr),
+            Err(e) => {
+                tracing::warn!("BrainManager init failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let app = create_router(proxy.clone()).merge(ui::create_router(proxy));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080");
@@ -122,13 +174,20 @@ async fn main() -> Result<()> {
             tracing::info!("CTRL+C received, shutting down HTTP server...");
         }
     };
-    if config.bootstrap_on_start {
-        let bootstrap = BootstrapManager::new(ml_engine, thought_decoder, cognitive_dict, pc_hierarchy);
+    let db_path = config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db");
+    let db_missing = !std::path::Path::new(db_path).exists();
+    let has_weights = persistence.has_any_weights().await.unwrap_or(false);
+    if config.bootstrap_on_start && (db_missing || !has_weights) {
+        let bootstrap = BootstrapManager::new(ml_engine, thought_decoder, cognitive_dict, pc_hierarchy, config.bootstrap_config.clone());
         tokio::spawn(async move {
             if let Err(e) = bootstrap.run_synthetic_training().await {
                 tracing::warn!("Bootstrap training failed: {}", e);
             }
         });
+    } else if config.bootstrap_on_start && !db_missing && has_weights {
+        tracing::info!("Bootstrap skipped: existing DB with weights found at {}", db_path);
+    } else if config.bootstrap_on_start && !db_missing && !has_weights {
+        tracing::info!("Bootstrap scheduled: DB exists but contains no weights at {}", db_path);
     }
 
     axum::serve(listener, app)

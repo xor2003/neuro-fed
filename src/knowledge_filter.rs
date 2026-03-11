@@ -4,7 +4,6 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::process::Stdio;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use serde::{Deserialize, Serialize};
 
@@ -243,6 +242,7 @@ impl CodeVerifier {
 
 /// Nostr zap tracking interface (stub)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NostrZapTracker {
     /// Whether zap tracking is enabled
     enabled: bool,

@@ -235,7 +235,7 @@ impl SemanticCache {
     
     /// Load cache from database on startup
     pub async fn load_from_db(&mut self, db: &PCPersistence) -> Result<()> {
-        let Some(pool) = &self.db_pool else {
+        let Some(_pool) = &self.db_pool else {
             warn!("No database pool configured, skipping load");
             return Ok(());
         };
@@ -336,7 +336,7 @@ impl SemanticCache {
         info!("Saving {} cache entries to database", stats.cache_size);
         
         // Iterate through all entries in the cache
-        for (id_arc, entry) in self.cache.iter() {
+        for (id_arc, _entry) in self.cache.iter() {
             let id = *id_arc;
             if let Err(e) = self.save_entry_to_db(db, id).await {
                 warn!("Failed to save entry {}: {}", id, e);

@@ -1,6 +1,5 @@
 // src/openai_proxy/client.rs
 use reqwest::Client;
-use serde_json::Value;
 use std::time::Duration;
 use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse, ProxyError};
 
@@ -14,6 +13,15 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
+    fn build_chat_url(base: &str) -> String {
+        let base = base.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    }
+
     pub fn new(ollama_url: String, fallback_url: String, timeout_seconds: u64, api_key: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
@@ -29,7 +37,7 @@ impl BackendClient {
     }
     
     pub async fn send_to_ollama(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        let url = format!("{}/v1/chat/completions", self.ollama_url);
+        let url = Self::build_chat_url(&self.ollama_url);
         tracing::debug!("sending POST {}", url);
         let response = self.client
             .post(&url)
@@ -43,7 +51,11 @@ impl BackendClient {
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read Ollama response: {}", e)))?;
         tracing::debug!("ollama raw response status={} body={}", status, response_text);
         if !status.is_success() {
-            return Err(ProxyError::BackendError(format!("Ollama returned status: {}", status)));
+            let snippet = response_text.chars().take(500).collect::<String>();
+            return Err(ProxyError::BackendError(format!(
+                "Ollama returned status: {} body={}",
+                status, snippet
+            )));
         }
         let response_body = serde_json::from_str::<OpenAiResponse>(&response_text)
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to parse Ollama response: {}", e)))?;
@@ -52,7 +64,7 @@ impl BackendClient {
     }
     
     pub async fn send_to_fallback(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        let url = format!("{}/v1/chat/completions", self.fallback_url);
+        let url = Self::build_chat_url(&self.fallback_url);
         tracing::debug!("sending POST {}", url);
         let mut builder = self.client
             .post(&url)
@@ -70,7 +82,11 @@ impl BackendClient {
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read fallback response: {}", e)))?;
         tracing::debug!("fallback raw response status={} body={}", status, response_text);
         if !status.is_success() {
-            return Err(ProxyError::BackendError(format!("Fallback returned status: {}", status)));
+            let snippet = response_text.chars().take(500).collect::<String>();
+            return Err(ProxyError::BackendError(format!(
+                "Fallback returned status: {} body={}",
+                status, snippet
+            )));
         }
         let response_body = serde_json::from_str::<OpenAiResponse>(&response_text)
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to parse fallback response: {}", e)))?;

@@ -27,6 +27,7 @@ pub enum PaymentVerifierError {
 }
 
 /// Payment verifier for Nostr zaps
+#[allow(dead_code)]
 pub struct PaymentVerifier {
     /// Nostr relays to query for payment events
     relays: Vec<String>,

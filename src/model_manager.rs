@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -94,6 +94,7 @@ impl std::fmt::Display for ModelManagerError {
 impl std::error::Error for ModelManagerError {}
 
 /// Model Manager implementation
+#[allow(dead_code)]
 pub struct ModelManager {
     models: HashMap<String, ModelInfo>,
     client: Client,

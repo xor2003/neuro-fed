@@ -6,7 +6,6 @@ use axum::extract::State;
 use axum::Json;
 use std::sync::Arc;
 use crate::openai_proxy::OpenAiProxy;
-use crate::openai_proxy::types::OpenAiRequest;
 
 pub fn create_router(state: Arc<OpenAiProxy>) -> Router {
     Router::new()

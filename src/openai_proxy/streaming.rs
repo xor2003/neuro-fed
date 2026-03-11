@@ -1,6 +1,5 @@
 // src/openai_proxy/streaming.rs
 use serde_json::Value;
-use tokio::sync::mpsc;
 use futures::stream::Stream;
 
 /// Streaming response chunk

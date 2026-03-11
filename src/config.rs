@@ -41,6 +41,7 @@ pub struct MLConfig {
 pub struct BackendConfig {
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
+    pub openai_model: String,
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub local_fallback_enabled: bool,
@@ -443,6 +444,7 @@ impl Default for BackendConfig {
         Self {
             openai_api_key: None,
             openai_base_url: "https://api.openai.com/v1".to_string(),
+            openai_model: "gpt-4o-mini".to_string(),
             ollama_base_url: "http://localhost:11434".to_string(),
             ollama_model: "tinyllama".to_string(),
             local_fallback_enabled: true,
