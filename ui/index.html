@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NeuroFed Node — Live Console</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <div class="bg-orbit"></div>
+  <div class="bg-grid"></div>
+
+  <main class="shell">
+    <header class="hero">
+      <div class="brand">
+        <div class="brand-mark">NF</div>
+        <div>
+          <div class="title">NeuroFed Node</div>
+          <div class="subtitle">Predictive Coding • Live Reasoning</div>
+        </div>
+      </div>
+      <div class="status-pill" id="status-pill">idle</div>
+    </header>
+
+    <section class="stage">
+      <div class="panel chat">
+        <div class="panel-head">
+          <h2>Chat</h2>
+          <div class="panel-meta">/v1/chat/completions</div>
+        </div>
+        <div class="messages" id="messages"></div>
+        <div class="composer">
+          <textarea id="prompt" placeholder="Ask the node…"></textarea>
+          <button id="send">Send</button>
+        </div>
+      </div>
+
+      <div class="panel steps">
+        <div class="panel-head">
+          <h2>Current Steps</h2>
+          <div class="panel-meta" id="last-updated">—</div>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-bar" id="progress-bar"></div>
+          <div class="progress-text" id="progress-text">0%</div>
+        </div>
+        <ol class="step-list" id="step-list"></ol>
+      </div>
+    </section>
+  </main>
+
+  <aside class="tray" id="tray">
+    <div class="tray-head">
+      <span>Telemetry</span>
+      <button id="tray-toggle" class="tray-toggle" title="Toggle telemetry">Hide</button>
+    </div>
+    <div class="tray-grid" id="tray-grid">
+      <div class="metric">
+        <div class="label">Requests</div>
+        <div class="value" id="m-requests">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Latency (ms)</div>
+        <div class="value" id="m-latency">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Cache Hits</div>
+        <div class="value" id="m-cache">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">PC Calls</div>
+        <div class="value" id="m-pc">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">DB Size</div>
+        <div class="value" id="m-db">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Process RAM (RSS)</div>
+        <div class="value" id="m-mem">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Process CPU (%)</div>
+        <div class="value" id="m-cpu">0%</div>
+      </div>
+      <div class="metric">
+        <div class="label">Saved (USD)</div>
+        <div class="value" id="m-saved">$0.00</div>
+      </div>
+      <div class="metric">
+        <div class="label">Source</div>
+        <div class="value" id="m-source">local_llm</div>
+      </div>
+    </div>
+    <div class="tray-footer">Tap to pin • Live</div>
+  </aside>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

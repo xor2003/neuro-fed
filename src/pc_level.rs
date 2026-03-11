@@ -16,6 +16,9 @@ pub struct PCLevel {
     // NEW: Rollback buffers
     pub backup_weights: Option<Tensor>,
     pub backup_temporal: Option<Tensor>,
+    // Cached learning-rate tensors to reduce per-step allocations
+    pub cached_spatial_eta: Option<(f32, Tensor)>,
+    pub cached_temporal_eta: Option<(f32, Tensor)>,
 }
 
 impl PCLevel {
@@ -34,6 +37,8 @@ impl PCLevel {
             device: device.clone(),
             backup_weights: None,
             backup_temporal: None,
+            cached_spatial_eta: None,
+            cached_temporal_eta: None,
         })
     }
 
@@ -89,9 +94,16 @@ impl PCLevel {
         let (input_dim, _) = self.weights.shape().dims2()?;
         let effective_lr = if mu_pc_scaling { eta / (input_dim as f32).sqrt() } else { eta };
         
-        // Create eta tensor for spatial weights update
-        let eta_tensor_spatial = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
-            .broadcast_as(matmul_result.shape())?;
+        // Create eta tensor for spatial weights update (cached)
+        let eta_tensor_spatial = match &self.cached_spatial_eta {
+            Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => cached_tensor.clone(),
+            _ => {
+                let t = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
+                    .broadcast_as(matmul_result.shape())?;
+                self.cached_spatial_eta = Some((effective_lr, t.clone()));
+                t
+            }
+        };
         let mut delta_weights = matmul_result.mul(&eta_tensor_spatial)?;
         
         if let Some(precision_matrix) = precision {
@@ -107,9 +119,16 @@ impl PCLevel {
         // NEW: Also update temporal causal weights using Hebbian learning on prev_beliefs
         let prev_t = self.prev_beliefs.t()?;
         let temporal_matmul = self.errors.matmul(&prev_t)?;
-        // Create separate eta tensor for temporal update with correct shape
-        let eta_tensor_temporal = Tensor::from_slice(&[effective_lr], (1, 1), &temporal_matmul.device())?
-            .broadcast_as(temporal_matmul.shape())?;
+        // Create separate eta tensor for temporal update with correct shape (cached)
+        let eta_tensor_temporal = match &self.cached_temporal_eta {
+            Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => cached_tensor.clone(),
+            _ => {
+                let t = Tensor::from_slice(&[effective_lr], (1, 1), &temporal_matmul.device())?
+                    .broadcast_as(temporal_matmul.shape())?;
+                self.cached_temporal_eta = Some((effective_lr, t.clone()));
+                t
+            }
+        };
         let temporal_update = temporal_matmul.mul(&eta_tensor_temporal)?;
         let decayed_temporal = (&self.temporal_weights * (1.0 - weight_decay))?;
         self.temporal_weights = decayed_temporal.broadcast_add(&temporal_update)?;

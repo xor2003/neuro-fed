@@ -21,8 +21,11 @@ pub mod pc_decoder;
 pub mod persistence;
 pub mod semantic_cache;
 pub mod sleep_phase;
+pub mod metrics;
 pub mod types;
 pub mod pow_verifier;
+pub mod chat;
+pub mod ui;
 
 // Backward compatibility aliases for moved modules
 pub use federation::blossom_client as blossom_client;

@@ -1,6 +1,6 @@
 // src/openai_proxy/metrics.rs
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProxyMetrics {
     pub total_requests: u64,
     pub total_processing_time_ms: u64,

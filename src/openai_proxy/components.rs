@@ -23,6 +23,7 @@ impl SemanticCache {
 /// Configuration for the OpenAI proxy
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProxyConfig {
+    pub openai_api_key: Option<String>,
     pub ollama_url: String,
     pub fallback_url: String,
     pub enable_cache: bool,
@@ -33,6 +34,7 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            openai_api_key: None,
             ollama_url: "http://localhost:11434".to_string(),
             fallback_url: "https://api.openai.com".to_string(),
             enable_cache: true,

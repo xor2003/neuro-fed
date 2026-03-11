@@ -1,7 +1,7 @@
 // src/chat/mod.rs
 pub mod handlers;
 
-use ax_router::{routing, Router};
+use axum::{routing, Router};
 use axum::extract::State;
 use axum::Json;
 use std::sync::Arc;

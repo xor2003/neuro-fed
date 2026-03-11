@@ -224,29 +224,8 @@ impl MLEngine {
             return Tensor::zeros((1, self.embedding_dim), DType::F32, &self.device)
                 .map_err(|e| MLError::InvalidResponse(format!("Zero tensor creation error: {}", e)));
         }
-
-        let mut embeddings = Vec::new();
-        let seq_len = token_ids.len() as f32;
-
-        for (i, &id) in token_ids.iter().enumerate() {
-            let emb = self.token_embeddings.get(id as usize)
-                .map_err(|e| MLError::InvalidResponse(format!("Embedding lookup error: {}", e)))?;
-            
-            // 🔴 SEQUENCE-AWARE POOLING: Apply positional weight to retain order context
-            // Earlier words get slightly different magnitudes than later words.
-            let pos_weight = 1.0 + (i as f32 / seq_len) * 0.5; // Weight grows from 1.0 to 1.5
-            let pos_tensor = Tensor::from_slice(&[pos_weight], (1,), &self.device)
-                .map_err(|e| MLError::InvalidResponse(format!("Pos tensor error: {}", e)))?
-                .broadcast_as(emb.shape())
-                .map_err(|e| MLError::InvalidResponse(format!("Broadcast error: {}", e)))?;
-            
-            let weighted_emb = emb.mul(&pos_tensor)
-                .map_err(|e| MLError::InvalidResponse(format!("Mul error: {}", e)))?;
-            embeddings.push(weighted_emb);
-        }
-
-        let stacked = Tensor::stack(&embeddings, 0)
-            .map_err(|e| MLError::InvalidResponse(format!("Stack error: {}", e)))?;
+        
+        let stacked = self.build_batched_embeddings(token_ids, true)?;
         
         let mean_emb = stacked.mean(0)
             .map_err(|e| MLError::InvalidResponse(format!("Mean pool error: {}", e)))?;
@@ -279,17 +258,8 @@ impl MLEngine {
             return Tensor::zeros((1, self.embedding_dim), DType::F32, &self.device)
                 .map_err(|e| MLError::InvalidResponse(format!("Zero tensor creation error: {}", e)));
         }
-
-        let mut embeddings = Vec::new();
-        for &id in token_ids.iter() {
-            let emb = self.token_embeddings.get(id as usize)
-                .map_err(|e| MLError::InvalidResponse(format!("Embedding lookup error: {}", e)))?;
-            embeddings.push(emb);
-        }
-
-        let stacked = Tensor::stack(&embeddings, 0)
-            .map_err(|e| MLError::InvalidResponse(format!("Stack error: {}", e)))?;
-            
+        
+        let stacked = self.build_batched_embeddings(token_ids, false)?;
         Ok(stacked) // Returns[seq_len, embedding_dim]
     }
 
@@ -708,4 +678,33 @@ impl MLEngine {
     }
 
     pub fn clear_cache(&self) {}
+
+    fn build_batched_embeddings(&self, token_ids: &[u32], apply_positional: bool) -> Result<Tensor, MLError> {
+        let mut embeddings = Vec::with_capacity(token_ids.len());
+        for &id in token_ids.iter() {
+            let emb = self.token_embeddings.get(id as usize)
+                .map_err(|e| MLError::InvalidResponse(format!("Embedding lookup error: {}", e)))?;
+            embeddings.push(emb);
+        }
+
+        let stacked = Tensor::stack(&embeddings, 0)
+            .map_err(|e| MLError::InvalidResponse(format!("Stack error: {}", e)))?;
+
+        if !apply_positional {
+            return Ok(stacked);
+        }
+
+        let seq_len = token_ids.len() as f32;
+        let pos_weights: Vec<f32> = (0..token_ids.len())
+            .map(|i| 1.0 + (i as f32 / seq_len) * 0.5)
+            .collect();
+        let pos_tensor = Tensor::from_vec(pos_weights, (token_ids.len(), 1), &self.device)
+            .map_err(|e| MLError::InvalidResponse(format!("Pos tensor error: {}", e)))?
+            .broadcast_as(stacked.shape())
+            .map_err(|e| MLError::InvalidResponse(format!("Broadcast error: {}", e)))?;
+        let stacked = stacked.mul(&pos_tensor)
+            .map_err(|e| MLError::InvalidResponse(format!("Mul error: {}", e)))?;
+
+        Ok(stacked)
+    }
 }

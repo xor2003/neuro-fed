@@ -22,6 +22,10 @@ pub struct PredictiveCoding {
     pub belief_history: Vec<Vec<Tensor>>,
     /// Optional channel for broadcasting delta updates to federation network
     pub gossip_sender: Option<mpsc::Sender<crate::persistence::DeltaHistory>>,
+    // Cached learning-rate tensors to reduce per-step allocations
+    cached_lr_errors: Vec<Tensor>,
+    cached_lr_up: Vec<Tensor>,
+    cached_lr_value: f32,
 }
 
 impl PredictiveCoding {
@@ -61,7 +65,11 @@ impl PredictiveCoding {
         } else {
             None
         };
+
+        // Precompute LR tensors for inference updates
+        let (cached_lr_errors, cached_lr_up) = Self::build_lr_cache(&levels, config.learning_rate, &device)?;
         
+        let cached_lr_value = config.learning_rate;
         Ok(PredictiveCoding {
             levels,
             config,
@@ -70,10 +78,45 @@ impl PredictiveCoding {
             free_energy: 0.0,
             belief_history: Vec::new(),
             gossip_sender: None,
+            cached_lr_errors,
+            cached_lr_up,
+            cached_lr_value,
         })
+    }
+
+    fn build_lr_cache(levels: &[PCLevel], lr: f32, device: &Device) -> Result<(Vec<Tensor>, Vec<Tensor>), PCError> {
+        let mut cached_lr_errors = Vec::with_capacity(levels.len());
+        let mut cached_lr_up = Vec::with_capacity(levels.len());
+        for i in 0..levels.len() {
+            let err_shape = levels[i].errors.shape();
+            let lr_err = Tensor::from_slice(&[lr], (1, 1), device)?
+                .broadcast_as(err_shape)?;
+            cached_lr_errors.push(lr_err);
+
+            let up_shape = if i + 1 < levels.len() {
+                levels[i + 1].beliefs.shape()
+            } else {
+                levels[i].beliefs.shape()
+            };
+            let lr_up = Tensor::from_slice(&[lr], (1, 1), device)?
+                .broadcast_as(up_shape)?;
+            cached_lr_up.push(lr_up);
+        }
+        Ok((cached_lr_errors, cached_lr_up))
+    }
+
+    fn ensure_lr_cache(&mut self) -> Result<(), PCError> {
+        if (self.cached_lr_value - self.config.learning_rate).abs() > 1e-9 {
+            let (errs, ups) = Self::build_lr_cache(&self.levels, self.config.learning_rate, &self.device)?;
+            self.cached_lr_errors = errs;
+            self.cached_lr_up = ups;
+            self.cached_lr_value = self.config.learning_rate;
+        }
+        Ok(())
     }
     
     pub fn infer(&mut self, input: &Tensor, steps: usize) -> Result<SurpriseStats, PCError> {
+        self.ensure_lr_cache()?;
         // Auto-align input tensor shape: PC expects (embedding_dim, 1)
         // If input is (1, embedding_dim), transpose it
         let input = if input.shape().dims()[0] == 1 && input.shape().dims()[1] == self.config.dim_per_level[0] {
@@ -117,9 +160,7 @@ impl PredictiveCoding {
             // Downward pass: update beliefs based on errors
             for l in (0..self.levels.len() - 1).rev() {
                 // Belief update: r_l = r_l - eta * epsilon_l (MUST BE MINUS to minimize free energy)
-                let lr_tensor = Tensor::from_slice(&[self.config.learning_rate], (1, 1), &self.levels[l].errors.device())?
-                    .broadcast_as(self.levels[l].errors.shape())?;
-                let update = self.levels[l].errors.mul(&lr_tensor)?;
+                let update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
                 
                 // 🔴 BUG FIX: Changed + to -
                 self.levels[l].beliefs = (&self.levels[l].beliefs - &update)?;
@@ -129,9 +170,8 @@ impl PredictiveCoding {
                 if l + 1 < self.levels.len() {
                     let weight_transpose = self.levels[l].weights.t()?;
                     let matmul_result = weight_transpose.matmul(&self.levels[l].errors)?;
-                    let lr_tensor2 = Tensor::from_slice(&[self.config.learning_rate], (1, 1), &matmul_result.device())?
-                        .broadcast_as(matmul_result.shape())?;
-                    let belief_update = matmul_result.mul(&lr_tensor2)?;
+                    // cached_lr_up is sized to match next-level beliefs shape
+                    let belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
                     // NOTE: Upward propagation stays PLUS (Mathematically correct: r_{l+1} = r_{l+1} - eta * dF/dr_{l+1})
                     self.levels[l+1].beliefs = (&self.levels[l+1].beliefs + &belief_update)?;
                 }
@@ -529,4 +569,3 @@ mod gossip_federation_tests {
         Ok(())
     }
 }
-

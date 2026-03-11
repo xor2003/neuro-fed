@@ -23,6 +23,7 @@ pub mod types;
 pub mod components;
 pub mod client;
 pub mod calibration;
+pub mod streaming;
 
 use crate::ml_engine::MLEngine;
 use crate::pc_hierarchy::PredictiveCoding;
@@ -52,6 +53,9 @@ lazy_static::lazy_static! {
     };
 }
 
+const REMOTE_PRICE_PER_1K_TOKENS_USD: f64 = 0.002;
+const LOCAL_PRICE_PER_1K_TOKENS_USD: f64 = 0.0;
+
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
     pub config: NodeConfig,
@@ -68,6 +72,22 @@ pub struct OpenAiProxy {
     code_verifier: CodeVerifier,
     episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
+    pub ui_state: Arc<RwLock<UiState>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UiState {
+    pub status: String,
+    pub steps: Vec<String>,
+    pub last_response: Option<String>,
+    pub last_source: Option<String>,
+    pub estimated_remote_cost_usd: f64,
+    pub last_saved_usd: f64,
+    pub saved_total_usd: f64,
+    pub progress_current: u32,
+    pub progress_total: u32,
+    pub progress_percent: f32,
+    pub last_updated: i64,
 }
 
 impl OpenAiProxy {
@@ -95,6 +115,7 @@ impl OpenAiProxy {
             code_verifier: CodeVerifier::new(pc_inference_enabled),
             episodic_memory: Arc::new(RwLock::new(VecDeque::new())),
             calibration: Arc::new(RwLock::new(CalibrationStore::default())),
+            ui_state: Arc::new(RwLock::new(UiState::default())),
         }
     }
 
@@ -103,6 +124,16 @@ impl OpenAiProxy {
         &self,
         req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
+        let estimated_prompt_tokens = estimate_tokens_from_messages(&req.messages);
+        {
+            let mut ui = self.ui_state.write().await;
+            ui.status = "processing".to_string();
+            ui.steps.clear();
+            ui.progress_current = 0;
+            ui.progress_total = 0;
+            ui.progress_percent = 0.0;
+            ui.last_updated = Utc::now().timestamp();
+        }
         {
             let mut metrics = self.metrics.write().await;
             metrics.total_requests += 1;
@@ -120,9 +151,20 @@ impl OpenAiProxy {
         let mut sequence_tensors_vec = Vec::new();
         let mut initial_novelty = 0.0;
         let mut raw_confidence = 0.0;
+        let mut used_backend = false;
+        let mut used_direct_backend_reply = false;
+        let mut has_backend_response = false;
         
         while attempt < max_steps {
             info!("🔄 Agentic Cycle: Attempt {}/{}", attempt + 1, max_steps);
+            {
+                let mut ui = self.ui_state.write().await;
+                ui.steps.push(format!("Cycle {}: perception → inference", attempt + 1));
+                ui.progress_total = max_steps as u32;
+                ui.progress_current = (attempt + 1) as u32;
+                ui.progress_percent = (ui.progress_current as f32 / ui.progress_total.max(1) as f32) * 100.0;
+                ui.last_updated = Utc::now().timestamp();
+            }
 
             // Perception: Temporal Sequence Inference
             let query_seq = self.local_engine.read().await.process_text_sequence(&pc_context).await
@@ -171,13 +213,33 @@ impl OpenAiProxy {
             let step_req = self.create_internal_req(&step_prompt, &req);
             
             if let Ok(step_response) = self.forward_to_ollama(&step_req).await {
+                used_backend = true;
                 if let Some(choice) = step_response.choices.first() {
-                    let step_code = choice.message.content.as_str().unwrap_or("")
-                        .replace("```python", "").replace("```", "");
+                    let raw_content = if let Some(s) = choice.message.content.as_str() {
+                        s.to_string()
+                    } else {
+                        choice.message.content.to_string()
+                    };
+                    let step_code = raw_content.replace("```python", "").replace("```", "");
                     
-                    final_text.push_str(&step_code);
-                    final_text.push_str("\n");
-                    pc_context = format!("{}\nExecuted: {:?}\nResult:\n{}", pc_context, op, step_code);
+                    if step_code.trim().is_empty() {
+                        tracing::warn!("Backend returned empty content for step {:?}", op);
+                    } else {
+                        final_text.push_str(&step_code);
+                        final_text.push_str("\n");
+                        pc_context = format!("{}\nExecuted: {:?}\nResult:\n{}", pc_context, op, step_code);
+                        has_backend_response = true;
+                    }
+                    {
+                        let mut ui = self.ui_state.write().await;
+                        ui.steps.push(format!("Cycle {}: backend step → {:?}", attempt + 1, op));
+                        ui.progress_total = max_steps as u32;
+                        ui.progress_current = (attempt + 1) as u32;
+                        ui.progress_percent = (ui.progress_current as f32 / ui.progress_total.max(1) as f32) * 100.0;
+                        ui.last_updated = Utc::now().timestamp();
+                    }
+                } else {
+                    tracing::warn!("Backend returned no choices for step {:?}", op);
                 }
             } else {
                 warn!("Backend Ollama execution failed. Retrying...");
@@ -185,8 +247,45 @@ impl OpenAiProxy {
             attempt += 1;
         }
 
+        // If the agentic loop produced nothing, fall back to a direct backend reply.
+        if final_text.trim().is_empty() {
+            match self.forward_to_ollama(&req).await {
+                Ok(resp) => {
+                    if let Some(choice) = resp.choices.first() {
+                        let raw = if let Some(s) = choice.message.content.as_str() {
+                            s.to_string()
+                        } else {
+                            choice.message.content.to_string()
+                        };
+                        tracing::debug!("direct fallback content len={}", raw.len());
+                        if !raw.trim().is_empty() {
+                            final_text = raw;
+                            used_backend = true;
+                            used_direct_backend_reply = true;
+                            has_backend_response = true;
+                            let mut ui = self.ui_state.write().await;
+                            let src = if is_local_url(&self.proxy_config.ollama_url) { "local LLM" } else { "remote LLM" };
+                            ui.steps.push(format!("Direct backend reply — {} (agentic steps produced no output)", src));
+                            ui.last_updated = Utc::now().timestamp();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Direct backend fallback failed: {}", e);
+                }
+            }
+        }
+
         // 4. Ground-Truth Verification (Unit Test Harness) - ASYNC with timeout
-        let verification_result = self.code_verifier.execute_with_tests(&final_text, &state.tests).await;
+        if final_text.trim().is_empty() {
+            final_text = "No backend response. Check Ollama or backend connectivity.".to_string();
+        }
+
+        let verification_result = if has_backend_response && !used_direct_backend_reply {
+            self.code_verifier.execute_with_tests(&final_text, &state.tests).await
+        } else {
+            Ok("Verification skipped".to_string())
+        };
         let success = verification_result.is_ok();
         
         // 5. Update Calibration Database based on true outcome
@@ -208,6 +307,47 @@ impl OpenAiProxy {
                 warn!("❌ Verification failed: {}", stderr);
                 final_text.push_str(&format!("\n# Execution Failed. Error:\n# {}", stderr));
             }
+        }
+
+        let estimated_completion_tokens = estimate_tokens_from_text(&final_text);
+        let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
+        let estimated_remote_cost = (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD;
+        let is_local = is_local_url(&self.proxy_config.ollama_url);
+        let last_source = if !used_backend {
+            "local_pc"
+        } else if is_local {
+            "local_llm"
+        } else {
+            "remote_llm"
+        };
+        let actual_cost = if last_source == "remote_llm" {
+            (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
+        } else if last_source == "local_llm" {
+            (total_tokens as f64 / 1000.0) * LOCAL_PRICE_PER_1K_TOKENS_USD
+        } else {
+            0.0
+        };
+        let saved = (estimated_remote_cost - actual_cost).max(0.0);
+
+        let final_status = if success && !final_text.starts_with("No backend response") {
+            "done"
+        } else if final_text.starts_with("No backend response") {
+            "error"
+        } else {
+            "error"
+        };
+        {
+            let mut ui = self.ui_state.write().await;
+            ui.status = final_status.to_string();
+            ui.last_response = Some(final_text.clone());
+            ui.last_source = Some(last_source.to_string());
+            ui.estimated_remote_cost_usd = estimated_remote_cost;
+            ui.last_saved_usd = saved;
+            ui.saved_total_usd += saved;
+            ui.progress_total = max_steps as u32;
+            ui.progress_current = max_steps as u32;
+            ui.progress_percent = 100.0;
+            ui.last_updated = Utc::now().timestamp();
         }
 
         let response = OpenAiResponse {
@@ -265,12 +405,42 @@ impl OpenAiProxy {
     }
 
     async fn forward_to_ollama(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
+        let mut req = req.clone();
+        if !self.config.proxy_config.ollama_model.is_empty() {
+            req.model = self.config.proxy_config.ollama_model.clone();
+        }
+        tracing::debug!(
+            "ollama request: model={}, messages={}, max_tokens={:?}, temperature={:?}",
+            req.model,
+            req.messages.len(),
+            req.max_tokens,
+            req.temperature
+        );
         let client = BackendClient::new(
             self.proxy_config.ollama_url.clone(),
             self.proxy_config.fallback_url.clone(),
-            self.proxy_config.timeout_seconds
+            self.proxy_config.timeout_seconds,
+            self.proxy_config.openai_api_key.clone()
         );
-        client.send_to_ollama(req).await
+        let response = client.send_to_ollama(&req).await;
+        match &response {
+            Ok(resp) => {
+                let snippet = resp.choices.first()
+                    .map(|c| c.message.content.to_string())
+                    .unwrap_or_else(|| "<no choices>".to_string());
+                tracing::debug!(
+                    "ollama response: choices={}, snippet={}",
+                    resp.choices.len(),
+                    snippet
+                );
+            }
+            Err(e) => tracing::debug!("ollama error: {}", e),
+        }
+        if response.is_err() && self.config.proxy_config.local_fallback_enabled {
+            tracing::warn!("ollama failed, trying fallback backend");
+            return client.send_to_fallback(&req).await;
+        }
+        response
     }
 
     async fn update_metrics_success(&self, elapsed: Duration, _response: &OpenAiResponse) {
@@ -302,6 +472,26 @@ impl Default for OpenAiProxy {
     fn default() -> Self {
         panic!("OpenAiProxy cannot be default-initialized")
     }
+}
+
+fn estimate_tokens_from_messages(messages: &[Message]) -> usize {
+    let mut chars = 0usize;
+    for msg in messages {
+        if let Some(s) = msg.content.as_str() {
+            chars += s.chars().count();
+        } else {
+            chars += msg.content.to_string().chars().count();
+        }
+    }
+    (chars / 4).max(1)
+}
+
+fn estimate_tokens_from_text(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
+fn is_local_url(url: &str) -> bool {
+    url.contains("localhost") || url.contains("127.0.0.1")
 }
 
 #[cfg(test)]
