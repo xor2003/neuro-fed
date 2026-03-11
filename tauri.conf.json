@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NeuroFed Node",
+  "version": "0.1.0",
+  "identifier": "com.neurofed.node",
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "icon": [
+      "ui/tray_green.png"
+    ]
+  }
+}
