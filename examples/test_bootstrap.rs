@@ -1,4 +1,5 @@
 use neuro_fed_node::bootstrap::BootstrapManager;
+use neuro_fed_node::config::BootstrapConfig;
 use neuro_fed_node::ml_engine::MLEngine;
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
@@ -34,12 +35,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ThoughtDecoder::new(belief_dim, vocab_size, &Device::Cpu)?
     ));
     
+    // Create BootstrapConfig
+    let bootstrap_config = BootstrapConfig::new(
+        512,  // embedding_dim
+        32,   // batch_size
+        100,  // max_epochs
+        0.01, // learning_rate
+        vec![], // document_paths (empty for synthetic training)
+    );
+    
     // Create BootstrapManager
     let bootstrapper = BootstrapManager::new(
         ml_engine,
         thought_decoder,
         dict,
         pc_hierarchy,
+        bootstrap_config,
     );
     
     println!("Running bootstrap synthetic training...");

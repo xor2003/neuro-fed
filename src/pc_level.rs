@@ -60,12 +60,15 @@ impl PCLevel {
     /// NEW: Causal Transition Model. Predictions come from BOTH top-down spatial weights AND lateral temporal weights.
     /// ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
     pub fn predict(&mut self, beliefs_next: &Tensor) -> CandleResult<()> {
-        let spatial_pred = self.weights.matmul(beliefs_next)?;
+        // 🔴 FIX: Ensure inputs are contiguous to trigger the optimized CPU matmul kernels
+        let beliefs_next_cont = beliefs_next.contiguous()?;
+        let spatial_pred = self.weights.matmul(&beliefs_next_cont)?;
         
         // ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
         let prev_beliefs_sum = self.prev_beliefs.sum_all()?.to_scalar::<f32>()?;
         if prev_beliefs_sum.abs() > 1e-6 {
-            let temporal_pred = self.temporal_weights.matmul(&self.prev_beliefs)?;
+            let prev_beliefs_cont = self.prev_beliefs.contiguous()?;
+            let temporal_pred = self.temporal_weights.matmul(&prev_beliefs_cont)?;
             self.predictions = spatial_pred.broadcast_add(&temporal_pred)?;
         } else {
             self.predictions = spatial_pred;
@@ -169,7 +172,8 @@ impl PCLevel {
             )));
         }
         
-        self.weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?;
+        // 🔴 FIX: Bake contiguity into the weights immediately on load
+        self.weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?.contiguous()?;
         Ok(())
     }
 

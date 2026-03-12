@@ -29,6 +29,7 @@ impl From<candle_core::Error> for PCError {
 #[derive(Debug, Clone, Default)]
 pub struct SurpriseStats {
     pub total_surprise: f32,
+    pub level_surprises: Vec<f32>, // Track which level is struggling
     pub free_energy_history: Vec<f32>,
     pub high_surprise_indices: Vec<usize>,
     

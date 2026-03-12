@@ -169,6 +169,19 @@ impl PCPersistence {
         .execute(&pool)
         .await?;
         
+        // NEW: Table to track which documents have been studied to prevent re-learning
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS studied_documents (
+                path TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                last_studied INTEGER NOT NULL
+            )
+            "#
+        )
+        .execute(&pool)
+        .await?;
+        
         info!("PC persistence database initialized at {} with WAL mode", db_path);
         Ok(Self { pool })
     }
@@ -594,6 +607,36 @@ impl PCPersistence {
             .await?;
         
         info!("Cleared all semantic cache entries");
+        Ok(())
+    }
+
+    // --- Studied Document Tracking ---
+
+    /// Check if a file has been studied and if its content is unchanged
+    pub async fn is_document_studied(&self, path: &str, content_hash: &str) -> Result<bool, PersistenceError> {
+        let row = sqlx::query("SELECT content_hash FROM studied_documents WHERE path = ?")
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        if let Some(r) = row {
+            // File path exists, check if hash matches
+            let stored_hash: String = r.get("content_hash");
+            Ok(stored_hash == content_hash)
+        } else {
+            // File path does not exist
+            Ok(false)
+        }
+    }
+
+    /// Mark a document as studied
+    pub async fn mark_document_as_studied(&self, path: &str, content_hash: &str) -> Result<(), PersistenceError> {
+        sqlx::query("INSERT OR REPLACE INTO studied_documents (path, content_hash, last_studied) VALUES (?, ?, ?)")
+            .bind(path)
+            .bind(content_hash)
+            .bind(chrono::Utc::now().timestamp())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

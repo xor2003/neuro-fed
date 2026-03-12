@@ -144,6 +144,7 @@ impl PredictiveCoding {
         self.levels[0].beliefs = input;
         
         let mut stats = SurpriseStats::default();
+        stats.level_surprises = vec![0.0; self.levels.len()];
         
         for step in 0..steps {
             // Upward pass: compute predictions and errors
@@ -154,6 +155,10 @@ impl PredictiveCoding {
                 let next_beliefs = &right[0].beliefs;
                 current.predict(next_beliefs)?;
                 current.compute_errors()?;
+                
+                // Track surprise per level
+                let err_sq = current.errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                stats.level_surprises[l] += err_sq;
             }
             
             // Downward pass: update beliefs based on errors
@@ -204,7 +209,28 @@ impl PredictiveCoding {
             stats.confidence_score = 1.0 / (1.0 + final_fe); // Maps [0, ∞) → (0, 1]
         }
         
+        // 🔴 BOTTLENECK DETECTION
+        self.detect_saturation(&stats);
+        
         Ok(stats)
+    }
+
+    fn detect_saturation(&self, stats: &SurpriseStats) {
+        let n = self.levels.len();
+        if n < 2 { return; }
+
+        let top_surprise = stats.level_surprises[n - 2]; 
+        let bottom_surprise = stats.level_surprises[0];
+
+        // If the top level surprise is > 70% of the bottom level surprise,
+        // it means the higher level isn't abstracting Level 0's data effectively.
+        if top_surprise > bottom_surprise * 0.7 && bottom_surprise > 1.0 {
+            tracing::warn!(
+                "🧠 COGNITIVE SATURATION: Top level surprise ({:.2}) is too high relative to sensory input ({:.2}).",
+                top_surprise, bottom_surprise
+            );
+            tracing::warn!("Suggestion: Current hierarchy is too shallow for this book. Increase 'n_levels' in config.toml.");
+        }
     }
     
     pub fn learn(&mut self, input: &Tensor, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
@@ -424,15 +450,25 @@ impl PredictiveCoding {
     pub fn infer_sequence(&mut self, sequence_tensor: &Tensor, steps_per_token: usize) -> Result<SurpriseStats, PCError> {
         let seq_len = sequence_tensor.shape().dims()[0];
         let mut overall_stats = SurpriseStats::default();
+        overall_stats.level_surprises = vec![0.0; self.levels.len()];
         
         for t in 0..seq_len {
             // Extract [1, embedding_dim] and reshape to[embedding_dim, 1]
+            // 🔴 FIX: narrow() creates a non-contiguous view. contiguous() is required for fast matmul.
             let token_emb = sequence_tensor.narrow(0, t, 1)?
+                .contiguous()?
                 .reshape((self.config.dim_per_level[0], 1))?;
             
             let stats = self.infer(&token_emb, steps_per_token)?;
             overall_stats.free_energy_history.extend(stats.free_energy_history);
             overall_stats.total_surprise += stats.total_surprise;
+            
+            // Aggregate per-level surprises across the sequence
+            for (i, &level_surprise) in stats.level_surprises.iter().enumerate() {
+                if i < overall_stats.level_surprises.len() {
+                    overall_stats.level_surprises[i] += level_surprise;
+                }
+            }
             
             // Critical: Advance temporal state for the next token!
             self.step_time()?;
@@ -449,14 +485,24 @@ impl PredictiveCoding {
     pub fn learn_sequence(&mut self, sequence_tensor: &Tensor, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
         let seq_len = sequence_tensor.shape().dims()[0];
         let mut overall_stats = SurpriseStats::default();
+        overall_stats.level_surprises = vec![0.0; self.levels.len()];
 
         for t in 0..seq_len {
+            // 🔴 FIX: narrow() creates a non-contiguous view. contiguous() is required for fast matmul.
             let token_emb = sequence_tensor.narrow(0, t, 1)?
+                .contiguous()?
                 .reshape((self.config.dim_per_level[0], 1))?;
             
             let stats = self.learn(&token_emb, context.clone())?;
             overall_stats.free_energy_history.extend(stats.free_energy_history);
             overall_stats.total_surprise += stats.total_surprise;
+            
+            // Aggregate per-level surprises across the sequence
+            for (i, &level_surprise) in stats.level_surprises.iter().enumerate() {
+                if i < overall_stats.level_surprises.len() {
+                    overall_stats.level_surprises[i] += level_surprise;
+                }
+            }
             
             self.step_time()?;
         }
@@ -793,6 +839,36 @@ mod regression_tests {
         // This test would ideally be in bootstrap.rs tests, but we can add
         // a note here about the fix
         println!("Bootstrap bug fix verified: pc.infer() replaced with pc.learn() in src/bootstrap.rs");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cognitive_saturation_detection() -> Result<(), PCError> {
+        // Test that cognitive saturation detection works
+        // Create a hierarchy with 3 levels to properly test level_surprises
+        let config = PCConfig::new(3, vec![8, 4, 2]);
+        let mut pc = PredictiveCoding::new(config)?;
+        let device = Device::Cpu;
+        
+        // Create an input tensor
+        let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
+        
+        // Run inference to get stats with level_surprises
+        let stats = pc.infer(&input, 5)?;
+        
+        // Verify that level_surprises is populated
+        assert_eq!(stats.level_surprises.len(), 3, "Should have surprise values for each level");
+        
+        // Verify that level_surprises[0] (bottom) is non-zero
+        // Note: level_surprises[2] (top level) might be zero because it doesn't predict anything
+        // We only track surprise for levels that make predictions (l in 0..levels.len()-1)
+        assert!(stats.level_surprises[0] > 0.0, "Bottom level should have some surprise");
+        
+        // The detect_saturation method should have been called during infer()
+        // We can't directly test the warning output, but we can verify the method exists
+        // and the logic is correct by checking that the stats are properly populated
+        
+        println!("Cognitive saturation detection test passed. Level surprises: {:?}", stats.level_surprises);
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use anyhow::Result;
 use neuro_fed_node::{
-    config::NodeConfig, ml_engine::MLEngine, pc_hierarchy::PredictiveCoding,
+    config::{self, NodeConfig}, ml_engine::MLEngine, pc_hierarchy::PredictiveCoding,
     types::{DeviceType, Episode},
     persistence::PCPersistence,
     sleep_phase::SleepManager,
@@ -23,6 +23,9 @@ use neuro_fed_node::{
 };
 use std::collections::VecDeque;
 use candle_core::Device;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::mpsc::channel;
+use std::time::Duration;
 
 /// Динамический выбор устройства на основе конфигурации
 fn select_device(config: &NodeConfig) -> Device {
@@ -100,7 +103,26 @@ async fn main() -> Result<()> {
         }
     }
     
-    let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config)?));
+    let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config.clone())?));
+    
+    // 🧬 KNOWLEDGE INJECTION: If starting fresh, steal intelligence from the LLM
+    if db_missing || !has_weights {
+        tracing::info!("🧬 Attempting to inject pre-trained LLM genetics into PC Level 0...");
+        let engine = ml_engine.read().await;
+        
+        let target_rows = pc_config.dim_per_level[0];
+        let target_cols = if pc_config.n_levels > 1 { pc_config.dim_per_level[1] } else { target_rows };
+        
+        // Extract weights from an early feed-forward block to act as the primary feature extractor
+        if let Ok(knowledge) = engine.extract_pretrained_weights("blk.0.ffn_down.weight", target_rows, target_cols) {
+            if let Ok(knowledge_dev) = knowledge.to_device(&device) {
+                pc_hierarchy.write().await.levels[0].weights = knowledge_dev;
+                tracing::info!("✅ Successfully injected LLM knowledge matrix into PC Memory!");
+            }
+        } else {
+            tracing::info!("⚠️ Could not inject LLM weights, starting Tabula Rasa.");
+        }
+    }
 
     let cognitive_dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
     let top_belief_dim = *pc_hierarchy.read().await.config.dim_per_level.last().unwrap_or(&embedding_dim);
@@ -285,9 +307,15 @@ async fn main() -> Result<()> {
     }
     
     if config.bootstrap_on_start && (db_missing || !has_weights) {
-        let bootstrap = BootstrapManager::new(ml_engine, thought_decoder, cognitive_dict, pc_hierarchy, config.bootstrap_config.clone());
+        let bootstrap = BootstrapManager::new(
+            ml_engine.clone(),
+            thought_decoder.clone(),
+            cognitive_dict.clone(),
+            pc_hierarchy.clone(),
+            config.bootstrap_config.clone(),
+        );
         tokio::spawn(async move {
-            if let Err(e) = bootstrap.run_synthetic_training().await {
+            if let Err(e) = bootstrap.run_full_bootstrap().await {
                 tracing::warn!("Bootstrap training failed: {}", e);
             }
         });
@@ -297,9 +325,165 @@ async fn main() -> Result<()> {
         tracing::info!("Bootstrap scheduled: DB exists but contains no weights at {}", db_path);
     }
 
+    // Start persistent event-driven study system with notify watcher
+    if !config.bootstrap_config.document_paths.is_empty() {
+        let watch_path = config.bootstrap_config.document_paths[0].clone();
+        let watch_path_for_log = watch_path.clone();
+        let persistence_clone = persistence.clone();
+        let ml_engine_clone = ml_engine.clone();
+        let thought_decoder_clone = thought_decoder.clone();
+        let cognitive_dict_clone = cognitive_dict.clone();
+        let pc_hierarchy_clone = pc_hierarchy.clone();
+        let bootstrap_config_clone = config.bootstrap_config.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = start_file_watcher(
+                watch_path,
+                persistence_clone,
+                ml_engine_clone,
+                thought_decoder_clone,
+                cognitive_dict_clone,
+                pc_hierarchy_clone,
+                bootstrap_config_clone,
+            ).await {
+                tracing::error!("File watcher failed: {}", e);
+            }
+        });
+        tracing::info!("📁 Started persistent event-driven study system watching: {}", watch_path_for_log);
+    } else {
+        tracing::info!("📁 No document paths configured for persistent study system");
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
 
     Ok(())
+}
+
+/// Starts a persistent file watcher that monitors the study directory for new or modified files
+async fn start_file_watcher(
+    watch_path: String,
+    persistence: Arc<PCPersistence>,
+    ml_engine: Arc<RwLock<MLEngine>>,
+    thought_decoder: Arc<RwLock<ThoughtDecoder>>,
+    cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
+    pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
+    bootstrap_config: config::BootstrapConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use notify::event::{CreateKind, ModifyKind, EventKind};
+    use std::path::Path;
+    
+    let (tx, mut rx) = channel(100);
+    
+    // Create watcher
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            if let Ok(event) = res {
+                let _ = tx.blocking_send(event);
+            }
+        },
+        notify::Config::default(),
+    )?;
+    
+    let path = Path::new(&watch_path);
+    if !path.exists() {
+        tracing::warn!("Watch path does not exist, creating: {}", watch_path);
+        std::fs::create_dir_all(path)?;
+    }
+    
+    watcher.watch(path, RecursiveMode::Recursive)?;
+    tracing::info!("🔍 File watcher started for: {}", watch_path);
+    
+    // Create bootstrap manager for processing files
+    let bootstrap = BootstrapManager::new(
+        ml_engine,
+        thought_decoder,
+        cognitive_dict,
+        pc_hierarchy,
+        bootstrap_config,
+    );
+    
+    // Process existing files first
+    tracing::info!("📚 Processing existing files in study directory...");
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            if file_path.is_file() {
+                tracing::debug!("Processing existing file: {:?}", file_path);
+                if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&file_path, &persistence).await {
+                    if let Err(e) = bootstrap.study_file_chunks(chunks).await {
+                        tracing::warn!("Failed to study file {:?}: {}", file_path, e);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Watch for new events
+    while let Some(event) = rx.recv().await {
+        match event.kind {
+            EventKind::Create(CreateKind::File) |
+            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_)) => {
+                for path in event.paths {
+                    if path.is_file() {
+                        tracing::info!("📄 Detected new/modified file: {:?}", path);
+                        
+                        // Small delay to ensure file is fully written
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        
+                        if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&path, &persistence).await {
+                            if let Err(e) = bootstrap.study_file_chunks(chunks).await {
+                                tracing::warn!("Failed to study file {:?}: {}", path, e);
+                            } else {
+                                tracing::info!("✅ Successfully studied file: {:?}", path);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(())
+}
+
+#[cfg(test)]
+mod main_architecture_tests {
+    use super::*;
+    use neuro_fed_node::config::NodeConfig;
+    use neuro_fed_node::types::DeviceType;
+    
+    #[tokio::test]
+    async fn test_knowledge_injection_compatibility() -> anyhow::Result<()> {
+        let config = NodeConfig::default();
+        if !std::path::Path::new(&config.model_path).exists() {
+            println!("Skipping injection test: model file missing.");
+            return Ok(());
+        }
+        
+        let device = Device::Cpu;
+        let device_type = DeviceType { name: "cpu".into(), ..Default::default() };
+        let engine = MLEngine::new(&config.model_path, device_type)?;
+        
+        // Emulate config creation
+        let pc_config = neuro_fed_node::config::PCConfig::new(2, vec![2048, 1024]);
+        let mut pc = PredictiveCoding::new(pc_config)?;
+        
+        let initial_weights = pc.levels[0].weights.to_vec2::<f32>()?;
+        
+        // Perform Injection
+        let knowledge = engine.extract_pretrained_weights("blk.0.ffn_down.weight", 2048, 1024)?;
+        pc.levels[0].weights = knowledge.to_device(&device)?;
+        
+        let injected_weights = pc.levels[0].weights.to_vec2::<f32>()?;
+        
+        // Ensure weights actually changed and dimensions were respected
+        assert_ne!(initial_weights, injected_weights, "Knowledge injection failed to overwrite random weights");
+        assert_eq!(injected_weights.len(), 2048);
+        assert_eq!(injected_weights[0].len(), 1024);
+        
+        Ok(())
+    }
 }
