@@ -24,7 +24,6 @@ candle-nn = { version = "0.9" }
 candle-transformers = { version = "0.9" }
 anyhow = "1.0"
 notify = "8.2"
-automerge = "0.7"
 ring = "0.17"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "stream"] }
@@ -46,18 +45,15 @@ rand = "0.10"
 
 config = "0.15"
 toml = "0.9"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+redb = "3.0"  # Pure Rust database replacement for sqlx
 
 # Utilities
 
 chrono = "0.4"
 uuid = { version = "1.22", features = ["v4"] }
 log = "0.4"
-simplelog = "0.12"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
-rustyline = "17.0"
-rustyline-async = "0.4"
 walkdir = "2.5" # Fast directory traversal for bootstrap
 tempfile = "3.27"
 
@@ -80,10 +76,10 @@ tokenizers = "0.22"
 hf-hub = "0.5"
 
 # Document parsing for book study
-pdf-extract = "0.10"
+lopdf = "0.39"  # Pure Rust PDF parsing replacement for pdf-extract
 epub = "2.1"
 indicatif = "0.18"
-parquet = "54.0"
+parquet = "58.0"
 
 # Privacy networks (optional, placeholder versions for simulation)
 
@@ -92,9 +88,6 @@ base64 = "0.22"
 
 rand_distr = "0.6"
 rayon = "1.10"
-
-# LRU cache for efficient eviction
-lru = "0.16"
 
 # High-performance async cache for semantic cache
 moka = { version = "0.12", features = ["future"] }
@@ -105,12 +98,6 @@ hnsw_rs = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 lazy_static = "1.5"
-
-# Serialization for ndarray and DateTime
-
-ndarray = "0.17"
-ndarray-rand = "0.16"
-serde_with = "3.8"
 
 # Tracing for logging
 
@@ -128,7 +115,6 @@ axum-server = "0.8"
 # Optional for web UI (Phase 3)
 
 tauri = { version = "2.10", optional = true, features = ["tray-icon", "image-png"] }
-sysinfo = "0.38"
 
 [build-dependencies]
 tauri-build = { version = "2.5" }

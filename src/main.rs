@@ -41,6 +41,22 @@ fn select_device(config: &NodeConfig) -> Device {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 1. Logic for n-1 CPU usage
+    let total_cpus = std::thread::available_parallelism()?.get();
+    let target_cpus = if total_cpus > 1 {
+        total_cpus - 1
+    } else {
+        1 // Fallback if we only have 1 core
+    };
+
+    // Configure the global thread pool for candle and other parallel tasks
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(target_cpus)
+        .build_global()
+        .unwrap();
+
+    tracing::info!("🧠 Brain scaling: Using {} out of {} CPU cores.", target_cpus, total_cpus);
+
     let config = NodeConfig::load_or_default();
     let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
     tracing_subscriber::fmt().with_env_filter(filter).init();

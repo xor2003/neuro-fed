@@ -1,3 +1,4 @@
+use std::process::Command;
 use std::sync::Arc;
 
 use axum::{
@@ -9,7 +10,6 @@ use axum::{
 };
 
 use crate::openai_proxy::{OpenAiProxy, UiState};
-use sysinfo::{System, Pid, ProcessesToUpdate};
 
 const INDEX_HTML: &str = include_str!("../../ui/index.html");
 const APP_JS: &str = include_str!("../../ui/app.js");
@@ -63,17 +63,26 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
         .unwrap_or_else(|| "./neurofed.db".to_string());
     let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
-    let mut sys = System::new_all();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-    let pid = Pid::from(std::process::id() as usize);
-    let (memory_bytes, cpu_usage) = match sys.process(pid) {
-        Some(proc_) => {
-            let mem = proc_.memory();
-            // sysinfo 0.31 reports memory in bytes; keep as-is to avoid inflated values.
-            (mem, proc_.cpu_usage())
+    // Get memory usage using `free` command (simplified approach)
+    let memory_bytes = match Command::new("free").arg("-b").output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse the "used" memory from the first line after "Mem:"
+            stdout
+                .lines()
+                .find(|line| line.starts_with("Mem:"))
+                .and_then(|line| {
+                    line.split_whitespace()
+                        .nth(2) // used memory is the 3rd field
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
         }
-        None => (0, 0.0),
+        Err(_) => 0,
     };
+
+    // CPU usage is complex to get without sysinfo; return 0.0 as placeholder
+    let cpu_usage = 0.0;
 
     Json(UiStats {
         db_size_bytes,

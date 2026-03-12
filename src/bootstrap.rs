@@ -81,7 +81,12 @@ impl BootstrapManager {
             // Handle different file types
             let text_chunks: Vec<String> = match ext {
                 "parquet" => extract_rows_from_parquet(&file_path),
-                "pdf" => extract_text_from_pdf(&file_path).map(|s| vec![s]).unwrap_or_default(),
+                "pdf" => {
+                    match std::fs::read(&file_path) {
+                        Ok(bytes) => extract_text_from_pdf(&bytes).map(|s| vec![s]).unwrap_or_default(),
+                        Err(_) => vec![],
+                    }
+                }
                 "epub" => extract_text_from_epub(&file_path).map(|s| vec![s]).unwrap_or_default(),
                 "txt" | "md" | "jsonl" => {
                     std::fs::read_to_string(&file_path)
@@ -218,25 +223,11 @@ impl BootstrapManager {
                 }
             }
             "pdf" => {
-                // For PDF files, write to temp file
-                use tempfile::NamedTempFile;
-                match NamedTempFile::new() {
-                    Ok(temp_file) => {
-                        if let Err(e) = std::fs::write(temp_file.path(), &content_bytes) {
-                            error!("Failed to write PDF to temp file: {}", e);
-                            vec![]
-                        } else {
-                            match extract_text_from_pdf(temp_file.path()) {
-                                Ok(text) => vec![text],
-                                Err(e) => {
-                                    error!("Failed to extract text from PDF: {}", e);
-                                    vec![]
-                                }
-                            }
-                        }
-                    }
+                // Extract text directly from bytes
+                match extract_text_from_pdf(&content_bytes) {
+                    Ok(text) => vec![text],
                     Err(e) => {
-                        error!("Failed to create temp file for PDF: {}", e);
+                        error!("Failed to extract text from PDF: {}", e);
                         vec![]
                     }
                 }
@@ -331,8 +322,22 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
     results
 }
 
-fn extract_text_from_pdf(path: &Path) -> Result<String, String> {
-    pdf_extract::extract_text(path).map_err(|e| e.to_string())
+fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
+    let doc = lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    let mut full_text = String::new();
+    
+    let pages = doc.get_pages();
+    for (page_num, _) in pages.into_iter() {
+        if let Ok(text) = doc.extract_text(&[page_num]) {
+            full_text.push_str(&text);
+            full_text.push('\n');
+        }
+    }
+    
+    if full_text.trim().is_empty() {
+        return Err("No text found in PDF".to_string());
+    }
+    Ok(full_text)
 }
 
 fn extract_text_from_epub(_path: &Path) -> Result<String, String> {

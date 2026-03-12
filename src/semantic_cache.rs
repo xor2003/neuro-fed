@@ -2,13 +2,13 @@
 // High-performance semantic cache with HNSW vector index and Moka cache
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use moka::future::Cache;
 use hnsw_rs::prelude::*;
 use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
 use anyhow::Result;
-use sqlx::SqlitePool;
 
 use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse};
 use crate::persistence::{PCPersistence, SemanticCacheEntryDB};
@@ -41,7 +41,7 @@ pub struct SemanticCache {
     // Similarity threshold
     similarity_threshold: f32,
     // Optional database connection for persistence
-    db_pool: Option<SqlitePool>,
+    db: Option<Arc<PCPersistence>>,
 }
 
 impl SemanticCache {
@@ -50,7 +50,7 @@ impl SemanticCache {
         max_cache_size: u64,
         embedding_dim: usize,
         similarity_threshold: f32,
-        db_pool: Option<SqlitePool>,
+        db: Option<Arc<PCPersistence>>,
     ) -> Self {
         // Configure HNSW parameters
         let max_nb_connection = 16;
@@ -80,7 +80,7 @@ impl SemanticCache {
             max_cache_size,
             embedding_dim,
             similarity_threshold,
-            db_pool,
+            db,
         }
     }
     
@@ -235,7 +235,7 @@ impl SemanticCache {
     
     /// Load cache from database on startup
     pub async fn load_from_db(&mut self, db: &PCPersistence) -> Result<()> {
-        let Some(_pool) = &self.db_pool else {
+        let Some(_pool) = &self.db else {
             warn!("No database pool configured, skipping load");
             return Ok(());
         };
@@ -327,7 +327,7 @@ impl SemanticCache {
     
     /// Save all cache entries to database (bulk operation)
     pub async fn save_all_to_db(&self, db: &PCPersistence) -> Result<()> {
-        let Some(_pool) = &self.db_pool else {
+        let Some(_pool) = &self.db else {
             warn!("No database pool configured, skipping save");
             return Ok(());
         };
