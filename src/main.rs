@@ -1,5 +1,6 @@
 // src/main.rs
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, RwLock};
 use anyhow::Result;
 use neuro_fed_node::{
@@ -57,11 +58,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("🧠 Brain scaling: Using {} out of {} CPU cores.", target_cpus, total_cpus);
 
-    let config = NodeConfig::load_or_default();
+    let mut config = NodeConfig::load_or_default(); // <-- Make it mutable
     let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
     tracing::info!("🧠 NeuroFed Node - Final Production Build - Starting...");
+    
+    // Create global shutdown signal for graceful termination
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
     
     // 1. Инициализация Базы Данных и Персистентности
     let persistence = Arc::new(PCPersistence::new(config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db")).await?);
@@ -80,9 +85,31 @@ async fn main() -> Result<()> {
     let embedding_dim = ml_engine.read().await.embedding_dim();
 
     let mut pc_config = config.pc_config.clone();
+    
+    // --- 🔴 NEW: Configuration Sanitizing Logic ---
+    // Ensure dim_per_level array matches n_levels to prevent crashes
+    let n_levels = pc_config.n_levels;
+    let dims_len = pc_config.dim_per_level.len();
+    
+    if dims_len < n_levels {
+        tracing::warn!(
+            "PC config mismatch: n_levels is {} but only {} dimensions are specified. Padding with default values.",
+            n_levels, dims_len
+        );
+        let last_dim = *pc_config.dim_per_level.last().unwrap_or(&512);
+        pc_config.dim_per_level.resize(n_levels, last_dim);
+    } else if dims_len > n_levels {
+        tracing::warn!(
+            "PC config mismatch: n_levels is {} but {} dimensions are specified. Truncating.",
+            n_levels, dims_len
+        );
+        pc_config.dim_per_level.truncate(n_levels);
+    }
+    
     // Ограничение роста уровней (Capping) для стабильности памяти
     let max_dim = 4096; // Жесткий предел
     if !pc_config.dim_per_level.is_empty() {
+        // Make sure the first level dimension matches the ML engine's embedding dimension
         pc_config.dim_per_level[0] = embedding_dim.min(max_dim);
         // Применяем лимит ко всем уровням
         for dim in pc_config.dim_per_level.iter_mut() {
@@ -131,7 +158,29 @@ async fn main() -> Result<()> {
         
         // Extract weights from an early feed-forward block to act as the primary feature extractor
         if let Ok(knowledge) = engine.extract_pretrained_weights("blk.0.ffn_down.weight", target_rows, target_cols) {
-            if let Ok(knowledge_dev) = knowledge.to_device(&device) {
+            if let Ok(mut knowledge_dev) = knowledge.to_device(&device) {
+                // 🔴 FIX: Make contiguous and Scale weights to prevent Gradient Explosion!
+                knowledge_dev = knowledge_dev.contiguous().unwrap_or(knowledge_dev);
+                
+                if let Ok(sqr) = knowledge_dev.sqr() {
+                    if let Ok(sum_t) = sqr.sum_all() {
+                        if let Ok(sum_sq) = sum_t.to_scalar::<f32>() {
+                            let elements = (target_rows * target_cols) as f32;
+                            let rms = (sum_sq / elements).sqrt();
+                            let target_rms = (1.0 / target_rows as f32).sqrt();
+                            
+                            // Scale the variance so it safely fits what the Predictive Coding layer expects
+                            if rms > 0.0 {
+                                let scale = (target_rms / rms) as f64;
+                                if let Ok(scaled) = knowledge_dev.affine(scale, 0.0) {
+                                    knowledge_dev = scaled;
+                                    tracing::info!("⚖️ Scaled injected weights by {:.4} to match PC initialization variance (preventing explosion)", scale);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 pc_hierarchy.write().await.levels[0].weights = knowledge_dev;
                 tracing::info!("✅ Successfully injected LLM knowledge matrix into PC Memory!");
             }
@@ -241,11 +290,13 @@ async fn main() -> Result<()> {
     // Clone for shutdown handler
     let pc_hierarchy_for_shutdown = pc_hierarchy.clone();
     let persistence_for_shutdown = persistence.clone();
+    let stop_signal_for_shutdown = stop_signal.clone(); // <--- Capture for shutdown handler
     let shutdown = async move {
         tracing::info!("[DEBUG] Shutdown handler initialized and waiting for Ctrl+C...");
         
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("CTRL+C received, starting graceful shutdown...");
+            stop_signal_for_shutdown.store(true, Ordering::SeqCst); // <--- TRIGGER IT
             
             // Immediate test log
             tracing::info!("[DEBUG] Ctrl+C handler triggered, starting save operations");
@@ -323,16 +374,19 @@ async fn main() -> Result<()> {
     }
     
     if config.bootstrap_on_start && (db_missing || !has_weights) {
-        let bootstrap = BootstrapManager::new(
+        let mut bootstrap = BootstrapManager::new(
             ml_engine.clone(),
             thought_decoder.clone(),
             cognitive_dict.clone(),
             pc_hierarchy.clone(),
             config.bootstrap_config.clone(),
         );
+        bootstrap.shutdown_signal = stop_signal_for_bootstrap; // <--- WIRE IT UP
+
         tokio::spawn(async move {
-            if let Err(e) = bootstrap.run_full_bootstrap().await {
-                tracing::warn!("Bootstrap training failed: {}", e);
+            tracing::info!("🚀 Running synthetic bootstrap training...");
+            if let Err(e) = bootstrap.run_synthetic_training().await {
+                tracing::warn!("Bootstrap synthetic training failed: {}", e);
             }
         });
     } else if config.bootstrap_on_start && !db_missing && has_weights {

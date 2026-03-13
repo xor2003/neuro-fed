@@ -1,6 +1,8 @@
 use std::fs::File;
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use candle_core::Tensor;
 use sha2::{Digest, Sha256};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,6 +25,7 @@ pub struct BootstrapManager {
     dict: Arc<RwLock<CognitiveDictionary>>,
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     config: crate::config::BootstrapConfig,
+    pub shutdown_signal: Arc<AtomicBool>, // <--- NEW
 }
 
 impl BootstrapManager {
@@ -33,7 +36,14 @@ impl BootstrapManager {
         pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
         config: crate::config::BootstrapConfig,
     ) -> Self {
-        Self { ml_engine, thought_decoder, dict, pc_hierarchy, config }
+        Self {
+            ml_engine,
+            thought_decoder,
+            dict,
+            pc_hierarchy,
+            config,
+            shutdown_signal: Arc::new(AtomicBool::new(false)), // <--- NEW
+        }
     }
 
     pub async fn run_full_bootstrap(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -88,11 +98,12 @@ impl BootstrapManager {
                     }
                 }
                 "epub" => extract_text_from_epub(&file_path).map(|s| vec![s]).unwrap_or_default(),
-                "txt" | "md" | "jsonl" => {
+                "txt" | "md" => {
                     std::fs::read_to_string(&file_path)
                         .map(|s| vec![s])
                         .unwrap_or_default()
                 }
+                "jsonl" => extract_lines_from_jsonl(&file_path),
                 _ => {
                     warn!("Unsupported file type: {}. Skipping.", ext);
                     vec![]
@@ -155,7 +166,14 @@ impl BootstrapManager {
         let mut decoder = self.thought_decoder.write().await;
 
         let max_epochs = self.config.max_epochs.max(100);
-        let lr = self.config.learning_rate.max(0.01) as f64;
+        let mut lr = self.config.learning_rate.max(0.01) as f64;
+        
+        // 🚀 FIX #11: Adaptive Learning Rate
+        let mut best_loss = f32::INFINITY;
+        let mut patience = 0;
+        const PATIENCE_LIMIT: usize = 10;
+        const LR_DECAY_FACTOR: f64 = 0.5;
+        const MIN_LR: f64 = 1e-5;
         
         for epoch in 0..max_epochs {
             let mut total_loss = 0.0;
@@ -163,8 +181,25 @@ impl BootstrapManager {
                 let loss = decoder.train_step(belief, seq, lr)?;
                 total_loss += loss;
             }
+            let avg_loss = total_loss / synthetic_data.len() as f32;
+            
+            // Adaptive learning rate logic
+            if avg_loss < best_loss - 1e-4 {
+                // Improvement
+                best_loss = avg_loss;
+                patience = 0;
+            } else {
+                patience += 1;
+                if patience >= PATIENCE_LIMIT && lr > MIN_LR {
+                    // Reduce learning rate
+                    lr = (lr * LR_DECAY_FACTOR).max(MIN_LR);
+                    info!("📉 Loss plateaued at epoch {}, reducing learning rate to {:.6}", epoch, lr);
+                    patience = 0; // reset patience after LR reduction
+                }
+            }
+            
             if epoch % 20 == 0 {
-                 info!("Epoch {}: Loss = {:.4}", epoch, total_loss / synthetic_data.len() as f32);
+                 info!("Epoch {}: Loss = {:.4}, LR = {:.6}", epoch, avg_loss, lr);
             }
         }
         Ok(())
@@ -198,10 +233,11 @@ impl BootstrapManager {
         hasher.update(&content_bytes);
         let content_hash = format!("{:x}", hasher.finalize());
         
-        if persistence.is_document_studied(&file_path.to_string_lossy(), &content_hash).await? {
-            tracing::debug!("Skipping already studied file: {:?}", file_path);
-            return Ok(None);
-        }
+        // Comment out this check temporarily for debugging
+        // if persistence.is_document_studied(&file_path.to_string_lossy(), &content_hash).await? {
+        //     tracing::debug!("Skipping already studied file: {:?}", file_path);
+        //     return Ok(None);
+        // }
         
         let text_chunks: Vec<String> = match ext {
             "parquet" => {
@@ -257,9 +293,21 @@ impl BootstrapManager {
         let mut pc = self.pc_hierarchy.write().await;
 
         for raw_text in text_chunks {
+            // CHECK FOR SHUTDOWN
+            if self.shutdown_signal.load(Ordering::Relaxed) {
+                info!("🛑 Study interrupted by shutdown signal.");
+                return Ok(());
+            }
+
             let paragraphs = chunk_text(&raw_text);
             
             for chunk in paragraphs {
+                // ... (inside the inner loop as well)
+                if self.shutdown_signal.load(Ordering::Relaxed) {
+                    info!("🛑 Study interrupted by shutdown signal.");
+                    return Ok(());
+                }
+                
                 if chunk.len() > 50 {
                     let sequence_tensor = engine.process_text_sequence(&chunk).await?;
                     
@@ -305,10 +353,15 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
         Err(e) => { error!("Failed to read parquet metadata: {}", e); return vec![]; }
     };
 
+    // Get total row count from metadata
+    let metadata = reader.metadata();
+    let total_rows = metadata.file_metadata().num_rows();
+    tracing::info!("📊 Parquet file {} has {} total rows", path.display(), total_rows);
+
     let mut results = Vec::new();
     let iter = reader.get_row_iter(None).unwrap();
 
-    for row in iter {
+    for (row_idx, row) in iter.enumerate() {
         if let Ok(r) = row {
             // GSM8K Standard: Question is col 0, Answer is col 1
             let question = r.get_string(0).map(|s| s.as_str()).unwrap_or("");
@@ -317,9 +370,48 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
             if !question.is_empty() {
                 results.push(format!("Question: {}\nAnswer: {}", question, answer));
             }
+            
+            // Log progress every 100 rows
+            if row_idx % 100 == 0 {
+                tracing::debug!("📊 Processing parquet row {} / {}", row_idx + 1, total_rows);
+            }
         }
     }
+    
+    tracing::info!("📊 Finished processing {} rows from {}", results.len(), path.display());
     results
+}
+
+fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => { error!("Failed to open JSONL: {}", e); return vec![]; }
+    };
+    
+    let mut lines = Vec::new();
+    let reader = std::io::BufReader::new(file);
+    
+    // Count total lines first
+    let mut line_count = 0;
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                lines.push(l);
+                line_count += 1;
+                
+                // Log progress every 100 lines
+                if line_count % 100 == 0 {
+                    tracing::debug!("📝 Processing JSONL line {}", line_count);
+                }
+            }
+            Err(e) => {
+                error!("Error reading JSONL line: {}", e);
+            }
+        }
+    }
+    
+    tracing::info!("📝 JSONL file {} has {} total lines", path.display(), line_count);
+    lines
 }
 
 fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
@@ -327,10 +419,18 @@ fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
     let mut full_text = String::new();
     
     let pages = doc.get_pages();
+    let total_pages = pages.len();
+    tracing::info!("📄 PDF has {} total pages", total_pages);
+    
     for (page_num, _) in pages.into_iter() {
         if let Ok(text) = doc.extract_text(&[page_num]) {
             full_text.push_str(&text);
             full_text.push('\n');
+            
+            // Log progress every 10 pages
+            if page_num % 10 == 0 {
+                tracing::debug!("📄 Processing PDF page {} / {}", page_num + 1, total_pages);
+            }
         }
     }
     
@@ -340,10 +440,48 @@ fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
     Ok(full_text)
 }
 
-fn extract_text_from_epub(_path: &Path) -> Result<String, String> {
-    // Simple epub extraction - for now, just return empty string
-    // TODO: Implement proper epub parsing
-    Ok("".to_string())
+fn strip_html_tags(html: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => (),
+        }
+    }
+    text
+}
+
+fn extract_text_from_epub(path: &Path) -> Result<String, String> {
+    // Read the EPUB file into bytes
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut doc = epub::doc::EpubDoc::from_reader(cursor).map_err(|e| e.to_string())?;
+    let mut content = String::new();
+
+    // Iterate through all chapters
+    let total_pages = doc.get_num_pages();
+    for page_num in 0..total_pages {
+        if let Some((curr_content, _)) = doc.get_current_str() {
+            content.push_str(&strip_html_tags(&curr_content));
+            content.push('\n');
+            
+            // Log progress every 10 pages
+            if page_num % 10 == 0 {
+                tracing::debug!("📖 Processing EPUB page {}/{}", page_num + 1, total_pages);
+            }
+        }
+        doc.go_next();
+    }
+    
+    if content.trim().is_empty() {
+        return Err("No text content found in EPUB".to_string());
+    }
+    
+    tracing::info!("📖 EPUB file {} processed ({} pages)", path.display(), total_pages);
+    Ok(content)
 }
 
 fn chunk_text(text: &str) -> Vec<String> {

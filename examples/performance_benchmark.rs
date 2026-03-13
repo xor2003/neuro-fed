@@ -3,93 +3,56 @@
 //! to tensor operations in the PC hierarchy.
 
 use neuro_fed_node::{
-    bootstrap::BootstrapManager,
-    config::{BootstrapConfig, NodeConfig},
-    ml_engine::MLEngine,
     pc_hierarchy::{PredictiveCoding, PCConfig},
-    persistence::PCPersistence,
-    types::DeviceType,
 };
+use candle_core::{Device, Tensor};
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Performance Benchmark for Contiguous Tensor Optimizations ===");
-    println!("Testing study session speed improvements...");
+    println!("Testing inference speed improvements...");
     
-    // Create a minimal configuration
-    let config = NodeConfig::default();
+    // Create PC hierarchy with 2 levels (small for fast testing)
+    let pc_config = PCConfig::new(2, vec![64, 32]);
+    let device = Device::Cpu;
+    let mut pc = PredictiveCoding::new_with_device(pc_config, device)?;
     
-    // Create ML engine with dummy model path
-    let ml_engine = MLEngine::new_with_tokenizer(
-        "models/tinyllama.Q2_K.gguf",  // model path
-        "models/tinyllama_tokenizer.json",  // tokenizer path
-        DeviceType {
-            name: "CPU".to_string(),
-            description: "CPU device".to_string(),
-            supported: true,
-        },
-    )?;
+    // Create a random input tensor
+    let input_values: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+    let input = Tensor::from_vec(input_values, (64, 1), &Device::Cpu)?;
     
-    // Create PC hierarchy with 3 levels
-    let pc_config = PCConfig::default();
-    let mut pc = PredictiveCoding::new(pc_config)?;
-    
-    // Create bootstrap manager
-    let bootstrap_config = BootstrapConfig {
-        embedding_dim: 512,
-        batch_size: 8,
-        max_epochs: 10,
-        learning_rate: 0.01,
-        document_paths: vec!["study/books/Using Asyncio in Python Full.pdf".to_string()],
-    };
-    
-    let bootstrap_manager = BootstrapManager::new(
-        bootstrap_config,
-        ml_engine,
-        pc,
-    );
-    
-    // Create persistence
-    let persistence = PCPersistence::new(":memory:").await?;
-    
-    // Benchmark 1: Study a single file chunk
-    println!("\n--- Benchmark 1: Study single file chunk ---");
-    let test_chunks = vec![
-        "This is a test chunk to measure performance of the study system. ".repeat(10),
-        "Another test chunk with different content to ensure caching doesn't affect results. ".repeat(10),
-    ];
-    
+    // Benchmark 1: Inference (multiple steps)
+    println!("\n--- Benchmark 1: Inference (20 steps) ---");
     let start = Instant::now();
-    bootstrap_manager.study_file_chunks(test_chunks).await?;
+    for _ in 0..10 {
+        pc.infer(&input, 20)?;
+    }
     let duration = start.elapsed();
-    println!("Study duration: {:?}", duration);
+    println!("10 inference calls duration: {:?}", duration);
+    println!("Average per inference: {:?}", duration / 10);
     
-    // Benchmark 2: Process and check file (includes hash computation)
-    println!("\n--- Benchmark 2: Process and check file ---");
-    let test_path = std::path::Path::new("study/books/Using Asyncio in Python Full.pdf");
-    
+    // Benchmark 2: Learning
+    println!("\n--- Benchmark 2: Learning ---");
     let start = Instant::now();
-    let result = bootstrap_manager.process_and_check_file(test_path, &persistence).await?;
+    for _ in 0..10 {
+        pc.learn(&input, None)?;
+    }
     let duration = start.elapsed();
-    println!("File processing duration: {:?}", duration);
-    println!("Result: {:?}", result.is_some());
+    println!("10 learning calls duration: {:?}", duration);
+    println!("Average per learning: {:?}", duration / 10);
     
-    // Benchmark 3: Synthetic training (PC learning)
-    println!("\n--- Benchmark 3: Synthetic training (PC learning) ---");
+    // Benchmark 3: Combined inference + learning
+    println!("\n--- Benchmark 3: Combined inference + learning ---");
     let start = Instant::now();
-    bootstrap_manager.run_synthetic_training().await?;
+    for _ in 0..5 {
+        pc.infer(&input, 20)?;
+        pc.learn(&input, None)?;
+    }
     let duration = start.elapsed();
-    println!("Synthetic training duration: {:?}", duration);
+    println!("5 combined calls duration: {:?}", duration);
+    println!("Average per combined: {:?}", duration / 5);
     
-    // Summary
-    println!("\n=== Performance Summary ===");
-    println!("All benchmarks completed successfully.");
-    println!("The contiguous tensor optimizations should provide:");
-    println!("1. Faster matmul operations in PC hierarchy");
-    println!("2. Better CPU cache utilization");
-    println!("3. SIMD activation for tensor operations");
-    println!("4. Overall study session speed improvement");
-    
+    println!("\n=== Benchmark complete ===");
     Ok(())
 }
