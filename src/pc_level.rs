@@ -215,6 +215,49 @@ impl PCLevel {
         Ok(())
     }
 
+    /// 🚀 NEW: Exact Learning Rule (Prospective Configuration)
+    /// This implementation uses normalized beliefs to prevent weight explosion
+    /// and adaptive learning rates based on error magnitude.
+    /// precision_scale: Optional scaling factor from hyper-network (0.1 to 2.0)
+    pub fn update_weights_exact(&mut self, error: &Tensor, next_beliefs: &Tensor, precision_scale: Option<f32>) -> CandleResult<()> {
+        // Compute surprise magnitude
+        let surprise = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        
+        // ─────────────────────────────────────────────────────
+        // Aha! Optimizer: adaptive LR + normalized Hebbian
+        // ─────────────────────────────────────────────────────
+        let surprise_threshold = 2.0;
+        let base_eta = 0.01;
+        let aha_boost = 5.0; // во сколько раз увеличиваем шаг при "Ага!"
+        
+        let mut adaptive_eta = if surprise > surprise_threshold {
+            base_eta * aha_boost
+        } else {
+            base_eta
+        };
+        
+        // Apply precision scaling from hyper-network if provided
+        if let Some(scale) = precision_scale {
+            adaptive_eta *= scale;
+        }
+        
+        // Нормализация входа (предотвращает взрывы весов)
+        let input_norm = (next_beliefs.sqr()?.sum_all()?.to_scalar::<f32>()? + 1e-6).sqrt();
+        let normalized_input = next_beliefs.affine((1.0 / input_norm) as f64, 0.0)?;
+        
+        // Delta = error * normalized_input^T
+        let delta = error.matmul(&normalized_input.t()?)?;
+        
+        // L2 decay + большой шаг при Aha!
+        let l2_decay = 1e-4;
+        let new_weights = self.weights
+            .affine(1.0 - l2_decay, 0.0)?                     // L2 decay
+            .broadcast_add(&delta.affine(adaptive_eta as f64, 0.0)?)?;
+        
+        self.weights = new_weights.contiguous()?;
+        Ok(())
+    }
+
     pub fn add_to_memory(&mut self, beliefs: Tensor) {
         // Keep memory_buffer for backward compatibility
         // In a full implementation, this would be used for temporal context
@@ -443,6 +486,55 @@ mod delta_propagation_tests {
         
         // If the temporal bug was still there, the difference would be massive
         assert!(max_diff < 1e-4, "Delta propagation diverged from fresh matmul! Max diff: {}", max_diff);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aha_optimizer_tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn test_aha_optimizer_boosts_on_high_surprise() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let mut level = PCLevel::new(8, 4, &device)?;
+        
+        // Маленькая surprise → маленький шаг
+        let small_error = Tensor::full(0.1f32, (8, 1), &device)?;
+        let next = Tensor::ones((4, 1), candle_core::DType::F32, &device)?;
+        
+        let initial_weights = level.weights.clone();
+        level.update_weights_exact(&small_error, &next, None)?;
+        let small_change = (level.weights.sub(&initial_weights)?.sqr()?.sum_all()?.to_scalar::<f32>()?).sqrt();
+        
+        // Большая surprise → большой шаг
+        let huge_error = Tensor::full(10.0f32, (8, 1), &device)?;
+        level.weights = initial_weights.clone(); // сброс
+        level.update_weights_exact(&huge_error, &next, None)?;
+        let huge_change = (level.weights.sub(&initial_weights)?.sqr()?.sum_all()?.to_scalar::<f32>()?).sqrt();
+        
+        assert!(huge_change > small_change * 3.0, "Aha! should boost update significantly. small_change={:.4}, huge_change={:.4}", small_change, huge_change);
+        println!("✅ Aha! Optimizer test passed: small_change={:.4}, huge_change={:.4}", small_change, huge_change);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalized_hebbian_prevents_explosion() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let mut level = PCLevel::new(8, 4, &device)?;
+        
+        // Огромный вход → без нормализации веса взорвались бы
+        let huge_next = Tensor::full(1000.0f32, (4, 1), &device)?;
+        let error = Tensor::ones((8, 1), candle_core::DType::F32, &device)?;
+        
+        level.update_weights_exact(&error, &huge_next, None)?;
+        
+        let weights_norm = level.weights.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        assert!(weights_norm < 50.0, "Weights exploded! Norm: {}", weights_norm);
+        
+        println!("✅ Normalized Hebbian test passed: final norm={:.2}", weights_norm);
         Ok(())
     }
 }

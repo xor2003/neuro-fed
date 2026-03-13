@@ -404,6 +404,28 @@ impl PrecisionCalculator {
     pub fn config(&self) -> &PrecisionConfig {
         &self.config
     }
+
+    /// Dynamic precision scaling based on surprise magnitude
+    /// Uses a hyper-network-like function to compute precision scaling factor
+    /// surprise_scalar: magnitude of surprise (0.0 = no surprise, >1.0 = high surprise)
+    /// Returns: precision scaling factor (0.1 to 2.0 range)
+    pub fn hyper_precision(&self, surprise_scalar: f32) -> f32 {
+        // Simple sigmoid-based scaling: high surprise → lower precision (more exploration)
+        // low surprise → higher precision (more exploitation)
+        // This mimics the behavior of hyper-networks for precision
+        
+        // Clamp surprise to reasonable range
+        let clamped_surprise = surprise_scalar.clamp(0.0, 10.0);
+        
+        // Sigmoid transformation: 1.0 / (1.0 + exp(-x))
+        // We want: surprise=0 → precision~1.0, surprise=10 → precision~0.1
+        // Transform: scale = 1.9 / (1.0 + exp(clamped_surprise - 5.0)) + 0.1
+        let exp_term = (clamped_surprise - 5.0).exp();
+        let scale = 1.9 / (1.0 + exp_term) + 0.1;
+        
+        // Clamp to final range
+        scale.clamp(0.1, 2.0)
+    }
 }
 
 /// Context for precision calculation

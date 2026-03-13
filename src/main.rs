@@ -38,14 +38,6 @@ fn select_device(config: &NodeConfig) -> Device {
         if let Ok(dev) = Device::new_cuda(0) {
             return dev;
         }
-        
-        // 2. Try AMD (HIP) 🔴 NEW SUPPORT
-        #[cfg(feature = "hip")]
-        {
-            if let Ok(dev) = Device::new_hip(0) {
-                return dev;
-            }
-        }
 
         // 3. Try Apple Silicon (Metal)
         if let Ok(dev) = Device::new_metal(0) {

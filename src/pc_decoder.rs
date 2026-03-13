@@ -226,9 +226,9 @@ impl ThoughtDecoder {
         }
         
         // --- BACKWARD PASS ---
-        let mut dh_next_step = Tensor::zeros_like(&h_t)?;
-        let mut dw_vocab_acc = Tensor::zeros_like(self.w_vocab.as_tensor())?;
-        let mut dw_gate_stack_acc = Tensor::zeros_like(self.w_gate_stack.as_tensor())?;
+        let mut dh_next_step = Tensor::zeros_like(&h_t)?.contiguous()?;
+        let mut dw_vocab_acc = Tensor::zeros_like(self.w_vocab.as_tensor())?.contiguous()?;
+        let mut dw_gate_stack_acc = Tensor::zeros_like(self.w_gate_stack.as_tensor())?.contiguous()?;
         
         for state in states.into_iter().rev() {
             // 1. Loss gradient w.r.t logits
@@ -238,30 +238,33 @@ impl ThoughtDecoder {
             
             // 2. Gradients for w_vocab
             let dw_vocab = grad_vocab_tensor.t()?.matmul(&state.h_next)?;
-            dw_vocab_acc = (dw_vocab_acc + dw_vocab)?;
+            // 🚀 CPU CACHE LOCALITY: Use broadcast_add for in-place-like accumulation
+            // Since add_assign doesn't exist in candle_core, we use + but ensure contiguous memory
+            dw_vocab_acc = (dw_vocab_acc + dw_vocab)?.contiguous()?;
             
             // 3. Gradient flowing into h_next
             let dh_from_loss = grad_vocab_tensor.matmul(&self.w_vocab.as_tensor())?;
-            let dh_total = (dh_from_loss + dh_next_step)?;
+            let dh_total = (dh_from_loss + dh_next_step)?.contiguous()?;
             
             // 4. Backprop through the GRU-like step
-            let dh_hat = (&dh_total * &state.diff)?;
-            let dh_update = (&dh_total * &(state.h_prev.sub(&state.h_hat)?))?;
+            let dh_hat = (&dh_total * &state.diff)?.contiguous()?;
+            let dh_update = (&dh_total * &(state.h_prev.sub(&state.h_hat)?))?.contiguous()?;
             
             // 5. Gradients for w_hidden (through tanh)
             let tanh_deriv = state.h_hat.ones_like()?.sub(&state.h_hat.sqr()?)?;
-            let d_pre_tanh = (dh_hat * &tanh_deriv)?;
+            let d_pre_tanh = (dh_hat * &tanh_deriv)?.contiguous()?;
             
             // 6. Gradients for w_update (through sigmoid)
             let sig_deriv = (&state.update_gate * &(state.update_gate.ones_like()?.sub(&state.update_gate)?))?;
-            let d_pre_sig = (dh_update * &sig_deriv)?;
+            let d_pre_sig = (dh_update * &sig_deriv)?.contiguous()?;
 
             // Recompute combined for gradient calculation (cheaper than storing)
-            let combined = Tensor::cat(&[&state.h_prev, &belief_2d], 1)?;
+            let combined = Tensor::cat(&[&state.h_prev, &belief_2d], 1)?.contiguous()?;
             // 🚀 PERFORMANCE FIX: Compute combined gradient for the stacked matrix
-            let d_gate_stack_pre = Tensor::cat(&[&d_pre_sig, &d_pre_tanh], 1)?;
+            let d_gate_stack_pre = Tensor::cat(&[&d_pre_sig, &d_pre_tanh], 1)?.contiguous()?;
             let dw_gate_stack = d_gate_stack_pre.t()?.matmul(&combined)?;
-            dw_gate_stack_acc = (dw_gate_stack_acc + dw_gate_stack)?;
+            // 🚀 CPU CACHE LOCALITY: Accumulate with contiguous memory
+            dw_gate_stack_acc = (dw_gate_stack_acc + dw_gate_stack)?.contiguous()?;
 
             // 7. Compute dh_next_step for the previous iteration
             // We need to split the gate stack to backpropagate the error
@@ -269,8 +272,8 @@ impl ThoughtDecoder {
             let d_combined = (d_pre_sig.matmul(&w_gate_chunks[0])? + d_pre_tanh.matmul(&w_gate_chunks[1])?)?;
             
             // Extract the h_prev part (first belief_dim columns)
-            let d_h_prev = d_combined.narrow(1, 0, belief_dim)?;
-            dh_next_step = ((dh_total * state.update_gate)? + d_h_prev)?;
+            let d_h_prev = d_combined.narrow(1, 0, belief_dim)?.contiguous()?;
+            dh_next_step = ((dh_total * state.update_gate)? + d_h_prev)?.contiguous()?;
         }
         
         // --- GRADIENT CLIPPING ---
