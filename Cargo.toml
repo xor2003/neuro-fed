@@ -45,7 +45,7 @@ rand = "0.10"
 
 config = "0.15"
 toml = "0.9"
-redb = "3.0"  # Pure Rust database replacement for sqlx
+redb = "3.1" 
 
 # Utilities
 
@@ -54,7 +54,7 @@ uuid = { version = "1.22", features = ["v4"] }
 log = "0.4"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
-walkdir = "2.5" # Fast directory traversal for bootstrap
+walkdir = "2.2.5" # Fast directory traversal for bootstrap
 tempfile = "3.27"
 
 # PC Hierarchy specific dependencies
@@ -115,6 +115,7 @@ axum-server = "0.8"
 # Optional for web UI (Phase 3)
 
 tauri = { version = "2.10", optional = true, features = ["tray-icon", "image-png"] }
+thread-priority = "3.0.0"
 
 [build-dependencies]
 tauri-build = { version = "2.5" }

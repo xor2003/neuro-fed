@@ -1,31 +1,26 @@
 // src/brain_manager.rs
-// Brain manager for uploading/downloading PC-brains via Nostr Blossom protocol.
+// Brain manager for exporting, importing, and merging PC-brains (Federated Averaging).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::blossom_client::{BlossomClient, BlossomError, BrainMetadata};
-use crate::nostr_federation::{NostrFederation, NostrError};
+use crate::pc_hierarchy::PredictiveCoding;
+use crate::persistence::PCLevelWeights;
 
 /// Errors that can occur in brain management.
 #[derive(Debug, thiserror::Error)]
 pub enum BrainManagerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Blossom client error: {0}")]
-    Blossom(#[from] BlossomError),
-    #[error("Nostr federation error: {0}")]
-    Nostr(#[from] NostrError),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("Safetensors error: {0}")]
-    Safetensors(String),
+    Serialization(String),
     #[error("Invalid brain: {0}")]
     InvalidBrain(String),
     #[error("Base model mismatch: expected {expected}, got {actual}")]
@@ -34,315 +29,208 @@ pub enum BrainManagerError {
     BrainNotFound(String),
 }
 
-/// Configuration for brain sharing (imported from config module).
 use crate::config::BrainSharingConfig;
 
-/// Tracks a downloaded/uploaded brain.
+/// A bundled export of a brain's weights and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrainRecord {
-    /// Brain ID (SHA256 of weights).
+pub struct BrainBundle {
     pub brain_id: String,
-    /// Base model ID.
     pub base_model_id: String,
-    /// Local path to the brain file (safetensors).
-    pub local_path: PathBuf,
-    /// Metadata.
-    pub metadata: BrainMetadata,
-    /// Timestamp of when this brain was added.
-    pub added_at: u64,
-    /// Whether this brain is currently loaded in the PC hierarchy.
-    pub loaded: bool,
+    pub embedding_dim: usize,
+    pub n_levels: usize,
+    pub levels: Vec<PCLevelWeights>,
+    pub created_at: u64,
 }
 
-/// Manages brain sharing and compatibility.
+/// Manages brain sharing and compatibility via standard files.
 pub struct BrainManager {
     config: BrainSharingConfig,
-    blossom_client: BlossomClient,
-    nostr_federation: Arc<NostrFederation>,
-    /// Map from brain ID to BrainRecord.
-    brains: HashMap<String, BrainRecord>,
-    /// Current loaded brain ID (if any).
-    loaded_brain_id: Option<String>,
+    /// Map from brain ID to local path.
+    pub brains: HashMap<String, PathBuf>,
 }
 
 impl BrainManager {
     /// Create a new BrainManager.
-    pub fn new(
-        config: BrainSharingConfig,
-        nostr_federation: Arc<NostrFederation>,
-    ) -> Result<Self, BrainManagerError> {
-        // Ensure directories exist.
-        std::fs::create_dir_all(&config.brain_storage_dir)
-            .map_err(|e| BrainManagerError::Io(e))?;
-        std::fs::create_dir_all(&config.cache_dir)
-            .map_err(|e| BrainManagerError::Io(e))?;
-
-        let blossom_client = BlossomClient::new(config.relay_urls.clone(), &config.cache_dir);
-
-        let manager = Self {
+    pub fn new(config: BrainSharingConfig, _nostr: Arc<crate::nostr_federation::NostrFederation>) -> Result<Self, BrainManagerError> {
+        std::fs::create_dir_all(&config.brain_storage_dir)?;
+        Ok(Self {
             config,
-            blossom_client,
-            nostr_federation,
             brains: HashMap::new(),
-            loaded_brain_id: None,
-        };
-
-        // Load existing brain records from disk (if any).
-        // For simplicity, we skip for now.
-        Ok(manager)
+        })
     }
 
-    /// Save the current PC‑brain to a safetensors file.
-    /// Returns the brain ID (hash) and the local path.
-    pub async fn save_brain(
-        &self,
-        weights: &HashMap<String, Vec<f32>>, // placeholder for actual weights
+    /// 🔴 EXPORT: Save the current PC‑brain to a `.neurobrain` file.
+    pub async fn export_local_brain(
+        &mut self,
+        pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
         description: &str,
-        tags: Vec<String>,
-    ) -> Result<(String, PathBuf), BrainManagerError> {
-        info!("Saving brain with description: {}", description);
+    ) -> Result<PathBuf, BrainManagerError> {
+        info!("Exporting brain: {}", description);
 
-        // 1. Serialize weights to safetensors.
-        // This is a placeholder; we need to integrate with candle tensors.
-        let serialized = self.serialize_weights_to_safetensors(weights)?;
+        let pc = pc_hierarchy.read().await;
+        let levels = pc.get_level_weights().map_err(|e| BrainManagerError::InvalidBrain(e.to_string()))?;
+        let embedding_dim = pc.config.dim_per_level.first().cloned().unwrap_or(0);
+        let n_levels = pc.config.n_levels;
+        drop(pc);
 
-        // 2. Compute SHA256 hash.
-        let brain_id = BlossomClient::compute_file_hash_from_bytes(&serialized)?;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let brain_id = format!("brain_{}", timestamp);
 
-        // 3. Save to local storage.
-        let filename = format!("{}.safetensors", brain_id);
-        let local_path = self.config.brain_storage_dir.join(&filename);
-        std::fs::write(&local_path, &serialized)
-            .map_err(|e| BrainManagerError::Io(e))?;
-
-        // 4. Create metadata.
-        let metadata = BrainMetadata {
+        let bundle = BrainBundle {
             brain_id: brain_id.clone(),
             base_model_id: self.config.base_model_id.clone(),
-            version: "0.1.0".to_string(),
-            description: description.to_string(),
-            size: serialized.len() as u64,
-            sha256: brain_id.clone(),
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            tags,
-            license: Some("MIT".to_string()),
-            author: "unknown".to_string(), // TODO: get from Nostr identity
+            embedding_dim,
+            n_levels,
+            levels,
+            created_at: timestamp,
         };
 
-        // 5. Store metadata as JSON sidecar.
-        let metadata_path = local_path.with_extension("json");
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
-        std::fs::write(metadata_path, metadata_json)
-            .map_err(BrainManagerError::Io)?;
+        let serialized = bincode::serialize(&bundle).map_err(|e| BrainManagerError::Serialization(e.to_string()))?;
 
-        info!("Brain saved: {}", brain_id);
-        Ok((brain_id, local_path))
+        let filename = format!("{}.neurobrain", brain_id);
+        let local_path = self.config.brain_storage_dir.join(&filename);
+        
+        std::fs::write(&local_path, &serialized)?;
+        self.brains.insert(brain_id.clone(), local_path.clone());
+
+        info!("✅ Brain successfully exported to: {:?}", local_path);
+        Ok(local_path)
     }
 
-    /// Load a brain from a local file into the PC hierarchy.
-    /// Returns the raw bytes of the brain file.
-    pub async fn load_brain(
-        &mut self,
-        brain_id: &str,
-    ) -> Result<Vec<u8>, BrainManagerError> {
-        info!("Loading brain {}", brain_id);
+    /// 🔴 IMPORT & MERGE (Federated Averaging): Averages an external brain into yours.
+    pub async fn import_and_merge_brain(
+        &self,
+        pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
+        import_path: &PathBuf,
+    ) -> Result<(), BrainManagerError> {
+        info!("Importing brain from {:?}", import_path);
 
-        let record = self
-            .brains
-            .get(brain_id)
-            .ok_or_else(|| BrainManagerError::BrainNotFound(brain_id.to_string()))?;
+        let bytes = std::fs::read(import_path)?;
+        let bundle: BrainBundle = bincode::deserialize(&bytes)
+            .map_err(|e| BrainManagerError::Serialization(e.to_string()))?;
 
-        // Validate base model compatibility.
-        if record.base_model_id != self.config.base_model_id {
+        let mut pc = pc_hierarchy.write().await;
+
+        // 1. Compatibility Checks!
+        let local_dim = *pc.config.dim_per_level.first().unwrap_or(&0);
+        if bundle.embedding_dim != local_dim {
             return Err(BrainManagerError::BaseModelMismatch {
-                expected: self.config.base_model_id.clone(),
-                actual: record.base_model_id.clone(),
+                expected: format!("dim {}", local_dim),
+                actual: format!("dim {}", bundle.embedding_dim),
             });
         }
-
-        // Load safetensors bytes.
-        let brain_bytes = BlossomClient::load_brain(&record.local_path, Some(brain_id)).await?;
-
-        // Update loaded brain ID.
-        self.loaded_brain_id = Some(brain_id.to_string());
-
-        // TODO: Integrate with PredictiveCoding hierarchy (pass weights).
-        info!("Brain loaded successfully.");
-        Ok(brain_bytes)
-    }
-
-    /// Share (upload) a brain to the Nostr network.
-    pub async fn share_brain(&self, brain_id: &str) -> Result<String, BrainManagerError> {
-        info!("Sharing brain {}", brain_id);
-
-        let record = self
-            .brains
-            .get(brain_id)
-            .ok_or_else(|| BrainManagerError::BrainNotFound(brain_id.to_string()))?;
-
-        // Upload via Blossom client.
-        let (_uploaded_brain_id, _event_id) = self
-            .blossom_client
-            .upload_brain(&record.local_path, record.metadata.clone())
-            .await?;
-
-        // Publish NIP‑94 event.
-        let metadata_json = serde_json::to_string(&record.metadata)?;
-        let file_url = format!("https://example.com/brains/{}.safetensors", brain_id); // placeholder
-        let published_event_id = self
-            .nostr_federation
-            .publish_brain_event(brain_id, &metadata_json, &file_url)
-            .await?;
-
-        info!("Brain shared, event ID: {}", published_event_id);
-        Ok(published_event_id)
-    }
-
-    /// Import a brain from the Nostr network (download and add to local storage).
-    pub async fn import_brain(
-        &mut self,
-        brain_id: &str,
-        expected_base_model: Option<&str>,
-    ) -> Result<BrainRecord, BrainManagerError> {
-        info!("Importing brain {}", brain_id);
-
-        // Download via Blossom client.
-        let downloaded_path = self
-            .blossom_client
-            .download_brain(brain_id, expected_base_model)
-            .await?;
-
-        // Compute hash to verify.
-        let computed_hash_result = BlossomClient::compute_file_hash(&downloaded_path).await;
-        let computed_hash = computed_hash_result?;
-        if computed_hash != brain_id {
+        
+        if bundle.n_levels != pc.config.n_levels {
             return Err(BrainManagerError::InvalidBrain(format!(
-                "Hash mismatch: expected {}, got {}",
-                brain_id, computed_hash
+                "Level mismatch: local has {} levels, imported has {}.", pc.config.n_levels, bundle.n_levels
             )));
         }
 
-        // Load metadata (should be sidecar or embedded in NIP‑94 event).
-        // For now, we create a minimal metadata.
-        let metadata = BrainMetadata {
-            brain_id: brain_id.to_string(),
-            base_model_id: expected_base_model
-                .unwrap_or(&self.config.base_model_id)
-                .to_string(),
-            version: "unknown".to_string(),
-            description: "Imported brain".to_string(),
-            size: std::fs::metadata(&downloaded_path)
-                .map_err(BrainManagerError::Io)?
-                .len(),
-            sha256: brain_id.to_string(),
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            tags: vec!["imported".to_string()],
-            license: None,
-            author: "unknown".to_string(),
-        };
+        // 2. Federated Averaging (Merge)
+        let local_weights = pc.get_level_weights().map_err(|e| BrainManagerError::InvalidBrain(e.to_string()))?;
 
-        // Move to brain storage directory.
-        let dest_path = self
-            .config
-            .brain_storage_dir
-            .join(format!("{}.safetensors", brain_id));
-        if dest_path != downloaded_path {
-            std::fs::copy(&downloaded_path, &dest_path).map_err(BrainManagerError::Io)?;
+        for (l, imported_level) in bundle.levels.iter().enumerate() {
+            if let Some(local_level) = local_weights.get(l) {
+                // Ensure matrix sizes actually match
+                if local_level.weights.len() != imported_level.weights.len() {
+                    return Err(BrainManagerError::InvalidBrain("Weight matrix size mismatch inside level".to_string()));
+                }
+
+                let mut merged_weights = vec![0.0; local_level.weights.len()];
+                for i in 0..local_level.weights.len() {
+                    // Mathematic average of the two brains
+                    merged_weights[i] = (local_level.weights[i] + imported_level.weights[i]) / 2.0;
+                }
+                
+                // Write the merged knowledge back into the live network
+                pc.levels[l].set_weights_from_vec(merged_weights)
+                    .map_err(|e| BrainManagerError::InvalidBrain(e.to_string()))?;
+            }
         }
 
-        let record = BrainRecord {
-            brain_id: brain_id.to_string(),
-            base_model_id: metadata.base_model_id.clone(),
-            local_path: dest_path,
-            metadata,
-            added_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            loaded: false,
-        };
-
-        self.brains.insert(brain_id.to_string(), record.clone());
-        info!("Brain imported successfully.");
-        Ok(record)
-    }
-
-    /// List all brains known to this manager.
-    pub fn list_brains(&self) -> Vec<BrainRecord> {
-        self.brains.values().cloned().collect()
-    }
-
-    /// Get the currently loaded brain ID.
-    pub fn loaded_brain_id(&self) -> Option<&str> {
-        self.loaded_brain_id.as_deref()
-    }
-
-    /// Check compatibility of a brain with this node's base model.
-    pub fn check_compatibility(&self, brain_id: &str) -> Result<bool, BrainManagerError> {
-        let record = self
-            .brains
-            .get(brain_id)
-            .ok_or_else(|| BrainManagerError::BrainNotFound(brain_id.to_string()))?;
-        Ok(record.base_model_id == self.config.base_model_id)
-    }
-
-    /// Remove a brain from local storage.
-    pub fn remove_brain(&mut self, brain_id: &str) -> Result<(), BrainManagerError> {
-        let record = self
-            .brains
-            .get(brain_id)
-            .ok_or_else(|| BrainManagerError::BrainNotFound(brain_id.to_string()))?;
-
-        // Delete the brain file.
-        std::fs::remove_file(&record.local_path).map_err(BrainManagerError::Io)?;
-
-        // Delete metadata sidecar if exists.
-        let metadata_path = record.local_path.with_extension("json");
-        let _ = std::fs::remove_file(metadata_path);
-
-        self.brains.remove(brain_id);
-        if self.loaded_brain_id.as_deref() == Some(brain_id) {
-            self.loaded_brain_id = None;
-        }
-
-        info!("Brain removed: {}", brain_id);
+        info!("✅ Successfully merged external brain into local hierarchy!");
         Ok(())
-    }
-
-    /// Placeholder: serialize weights to safetensors.
-    fn serialize_weights_to_safetensors(
-        &self,
-        _weights: &HashMap<String, Vec<f32>>,
-    ) -> Result<Vec<u8>, BrainManagerError> {
-        // TODO: Implement using safetensors crate.
-        // For now, return dummy bytes.
-        Ok(vec![0u8; 1024])
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod brain_sharing_tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::pc_hierarchy::{PCConfig, PredictiveCoding};
+    use crate::config::NostrConfig;
+    use candle_core::Device;
 
     #[tokio::test]
-    async fn test_brain_manager_creation() {
+    async fn test_brain_export_and_federated_merge() -> Result<(), Box<dyn std::error::Error>> {
         let config = BrainSharingConfig::default();
-        let nostr_config = crate::config::NostrConfig::default();
-        let nostr_federation = Arc::new(crate::nostr_federation::NostrFederation::new(nostr_config));
-        let manager = BrainManager::new(config, nostr_federation);
-        assert!(manager.is_ok());
+        let nostr = Arc::new(crate::nostr_federation::NostrFederation::new(NostrConfig::default()));
+        let mut manager = BrainManager::new(config.clone(), nostr)?;
+
+        let pc_config = PCConfig::new(2, vec![4, 2]);
+        let device = Device::Cpu;
+        
+        // Brain A (Our Local Brain)
+        let pc_a = PredictiveCoding::new_with_device(pc_config.clone(), device.clone())?;
+        let arc_a = Arc::new(RwLock::new(pc_a));
+
+        // Brain B (Another person's brain)
+        let mut pc_b = PredictiveCoding::new_with_device(pc_config.clone(), device.clone())?;
+        
+        // Modify Brain B so we can track the merge mathematically
+        let modified_weights = vec![10.0; 8]; // 4x2 matrix
+        pc_b.levels[0].set_weights_from_vec(modified_weights.clone())?;
+        let arc_b = Arc::new(RwLock::new(pc_b));
+
+        // 1. Export Brain B to a file
+        let export_path = manager.export_local_brain(arc_b.clone(), "test_brain").await?;
+
+        // Capture Brain A's original weights for comparison
+        let orig_a = arc_a.read().await.levels[0].weights.to_vec2::<f32>()?[0][0];
+
+        // 2. Import Brain B and merge into Brain A
+        manager.import_and_merge_brain(arc_a.clone(), &export_path).await?;
+
+        // 3. Verify Federated Averaging Math
+        let new_a = arc_a.read().await.levels[0].weights.to_vec2::<f32>()?[0][0];
+        
+        // The new weight should be exactly the average of (orig_a + 10.0) / 2.0
+        let expected = (orig_a + 10.0) / 2.0;
+        assert!((new_a - expected).abs() < 0.001, "Merge failed! Expected {}, got {}", expected, new_a);
+
+        // Cleanup
+        let _ = std::fs::remove_file(export_path);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_save_and_load_brain() {
-        // This is a placeholder test; real implementation would need actual weights.
-        assert!(true);
+    async fn test_brain_rejects_incompatible_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+        let config = BrainSharingConfig::default();
+        let nostr = Arc::new(crate::nostr_federation::NostrFederation::new(NostrConfig::default()));
+        let mut manager = BrainManager::new(config.clone(), nostr)?;
+
+        // Brain A uses Llama (2048 dim)
+        let pc_a = PredictiveCoding::new_with_device(PCConfig::new(2, vec![2048, 1024]), Device::Cpu)?;
+        // Brain B uses Mistral (4096 dim)
+        let pc_b = PredictiveCoding::new_with_device(PCConfig::new(2, vec![4096, 1024]), Device::Cpu)?;
+
+        let arc_a = Arc::new(RwLock::new(pc_a));
+        let arc_b = Arc::new(RwLock::new(pc_b));
+
+        // 1. Export Brain B to a file
+        let export_path = manager.export_local_brain(arc_b, "bad_brain").await?;
+
+        // Attempting to merge a 4096 brain into a 2048 node MUST fail safely
+        let result = manager.import_and_merge_brain(arc_a, &export_path).await;
+        
+        assert!(result.is_err(), "Manager allowed merging incompatible dimensions!");
+        if let Err(BrainManagerError::BaseModelMismatch { expected, actual }) = result {
+            assert!(expected.contains("2048"));
+            assert!(actual.contains("4096"));
+        } else {
+            panic!("Wrong error type returned.");
+        }
+
+        let _ = std::fs::remove_file(export_path);
+        Ok(())
     }
 }

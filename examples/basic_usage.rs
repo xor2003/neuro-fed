@@ -183,43 +183,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(mut brain_manager) => {
             println!("   Brain manager created successfully");
             
-            // Create dummy weights for demonstration
-            let mut dummy_weights = std::collections::HashMap::new();
-            dummy_weights.insert("layer1".to_string(), vec![0.1, 0.2, 0.3]);
-            dummy_weights.insert("layer2".to_string(), vec![0.4, 0.5, 0.6]);
+            // Note: The new brain manager API requires a PredictiveCoding instance for export
+            // and a PathBuf for import. Since we don't have a PC instance in this example,
+            // we'll just demonstrate the API structure.
+            println!("   Brain manager API updated:");
+            println!("     - export_local_brain(pc_hierarchy, description) -> PathBuf");
+            println!("     - import_and_merge_brain(pc_hierarchy, import_path) -> Result<()>");
+            println!("   (Skipping actual calls as they require PredictiveCoding instance)");
             
-            // Try to save a brain
-            match brain_manager.save_brain(&dummy_weights, "Test brain", vec!["test".to_string()]).await {
-                Ok((brain_id, path)) => {
-                    println!("   Brain saved successfully:");
-                    println!("     Brain ID: {}", brain_id);
-                    println!("     Path: {:?}", path);
-                    
-                    // Try to share the brain
-                    match brain_manager.share_brain(&brain_id).await {
-                        Ok(event_id) => {
-                            println!("   Brain shared successfully:");
-                            println!("     Event ID: {}", event_id);
-                        }
-                        Err(e) => {
-                            println!("   Brain sharing failed (expected for demo): {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("   Brain saving failed (expected for demo): {}", e);
-                }
-            }
-            
-            // Try to import a brain (this will fail since we don't have real brains)
-            match brain_manager.import_brain("dummy_brain_id", Some("llama-3-8b-instruct")).await {
-                Ok(path) => {
-                    println!("   Brain imported successfully: {:?}", path);
-                }
-                Err(e) => {
-                    println!("   Brain import failed (expected): {}", e);
-                }
-            }
+            // Show that brain storage directory was created
+            println!("   Brain storage directory: ./brains");
         }
         Err(e) => {
             println!("   Brain manager creation failed: {}", e);

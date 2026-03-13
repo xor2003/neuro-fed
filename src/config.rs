@@ -35,6 +35,9 @@ pub struct MLConfig {
     pub max_batch_size: usize,
     pub embedding_dim: usize,
     pub use_gpu: bool,
+    // --- 🔴 NEW: CPU and Priority Controls ---
+    pub reserved_cores: usize,
+    pub low_priority_learning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -395,6 +398,9 @@ impl Default for MLConfig {
             max_batch_size: 32,
             embedding_dim: 768,
             use_gpu: true,
+            // --- 🔴 NEW: Defaults ---
+            reserved_cores: 1, // Always leave 1 core free for the OS
+            low_priority_learning: true, // Run learning in the background
         }
     }
 }

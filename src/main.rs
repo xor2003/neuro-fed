@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, RwLock};
 use anyhow::Result;
+use thread_priority::*; // <--- NEW IMPORT
 use neuro_fed_node::{
     config::{self, NodeConfig}, ml_engine::MLEngine, pc_hierarchy::PredictiveCoding,
     types::{DeviceType, Episode},
@@ -27,6 +28,7 @@ use candle_core::Device;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::channel;
 use std::time::Duration;
+use walkdir::WalkDir;
 
 /// Динамический выбор устройства на основе конфигурации
 fn select_device(config: &NodeConfig) -> Device {
@@ -42,27 +44,41 @@ fn select_device(config: &NodeConfig) -> Device {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Logic for n-1 CPU usage
-    let total_cpus = std::thread::available_parallelism()?.get();
-    let target_cpus = if total_cpus > 1 {
-        total_cpus - 1
-    } else {
-        1 // Fallback if we only have 1 core
-    };
-
-    // Configure the global thread pool for candle and other parallel tasks
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(target_cpus)
-        .build_global()
-        .unwrap();
-
-    tracing::info!("🧠 Brain scaling: Using {} out of {} CPU cores.", target_cpus, total_cpus);
-
-    let mut config = NodeConfig::load_or_default(); // <-- Make it mutable
+    let mut config = NodeConfig::load_or_default();
     let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
     tracing::info!("🧠 NeuroFed Node - Final Production Build - Starting...");
+
+    // --- 🔴 NEW: Smart N-1 CPU Allocation and Priority ---
+    let total_cpus = std::thread::available_parallelism()?.get();
+    
+    // Calculate N - reserved cores (ensure we have at least 1)
+    let target_cpus = total_cpus.saturating_sub(config.ml_config.reserved_cores).max(1);
+    let low_priority = config.ml_config.low_priority_learning;
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(target_cpus)
+        .start_handler(move |_thread_idx| {
+            // Drop OS thread priority to lowest so it doesn't lag the user's PC
+            if low_priority {
+                if let Err(e) = set_current_thread_priority(ThreadPriority::Min) {
+                    tracing::debug!("Could not set minimum thread priority: {:?}", e);
+                }
+            }
+        })
+        .build_global()
+        .unwrap();
+
+    tracing::info!(
+        "🧠 Brain scaling: Using {} out of {} CPU cores (Reserved: {}, Low Priority: {}).",
+        target_cpus, total_cpus, config.ml_config.reserved_cores, low_priority
+    );
+    // -----------------------------------------------------
+
+    // Create global shutdown signal for graceful termination
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
     
     // Create global shutdown signal for graceful termination
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -475,11 +491,13 @@ async fn start_file_watcher(
     );
     
     // Process existing files first
-    tracing::info!("📚 Processing existing files in study directory...");
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let file_path = entry.path();
-            if file_path.is_file() {
+    tracing::info!("📚 Processing existing files in study directory (recursively)...");
+    
+    // --- 🔴 MODIFIED BLOCK START ---
+    if path.is_dir() {
+        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                let file_path = entry.path();
                 tracing::debug!("Processing existing file: {:?}", file_path);
                 if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&file_path, &persistence).await {
                     if let Err(e) = bootstrap.study_file_chunks(chunks).await {
@@ -489,6 +507,7 @@ async fn start_file_watcher(
             }
         }
     }
+    // --- 🔴 MODIFIED BLOCK END ---
     
     // Watch for new events
     while let Some(event) = rx.recv().await {

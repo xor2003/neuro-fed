@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
+use walkdir::WalkDir;
 use crate::ml_engine::MLEngine;
 use crate::pc_decoder::ThoughtDecoder;
 use crate::pc_hierarchy::PredictiveCoding;
@@ -17,6 +18,7 @@ use crate::types::{CognitiveDictionary, ThoughtOp};
 // NEW: For Parquet support
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
+
 
 
 pub struct BootstrapManager {
@@ -61,15 +63,20 @@ impl BootstrapManager {
         let mut all_files = Vec::new();
         for path_str in &self.config.document_paths {
             let path = Path::new(path_str);
+            
+            // --- 🔴 MODIFIED BLOCK START ---
             if path.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
-                    let file_path = entry.path();
-                    if file_path.is_file() { all_files.push(file_path); }
+                // Use WalkDir to find all files recursively
+                for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_file() {
+                        all_files.push(entry.path().to_path_buf());
+                    }
                 }
             } else if path.is_file() {
+                // Keep the logic to handle single file paths
                 all_files.push(path.to_path_buf());
             }
+            // --- 🔴 MODIFIED BLOCK END ---
         }
 
         let bar = ProgressBar::new(all_files.len() as u64);
@@ -113,6 +120,25 @@ impl BootstrapManager {
             tracing::debug!("📖 Extracted {} text chunks from {}", text_chunks.len(), file_name);
             
             for (idx, raw_text) in text_chunks.iter().enumerate() {
+                // Log position information based on file type
+                match ext {
+                    "jsonl" => {
+                        tracing::info!("📝 Studying JSONL line {}", idx + 1);
+                    }
+                    "pdf" => {
+                        tracing::info!("📄 Studying PDF page {}", idx + 1);
+                    }
+                    "epub" => {
+                        tracing::info!("📖 Studying EPUB page {}", idx + 1);
+                    }
+                    "parquet" => {
+                        tracing::info!("📊 Studying Parquet row {}", idx + 1);
+                    }
+                    _ => {
+                        tracing::info!("📄 Studying text chunk {}", idx + 1);
+                    }
+                }
+                
                 let paragraphs = chunk_text(&raw_text);
                 tracing::debug!("📖 Chunk {} has {} paragraphs", idx, paragraphs.len());
                 
@@ -289,52 +315,107 @@ impl BootstrapManager {
     }
 
     pub async fn study_file_chunks(&self, text_chunks: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let engine = self.ml_engine.read().await;
-        let mut pc = self.pc_hierarchy.write().await;
+        let engine_lock = self.ml_engine.clone();
+        let main_pc_lock = self.pc_hierarchy.clone();
+        let shutdown = self.shutdown_signal.clone();
 
-        for raw_text in text_chunks {
-            // CHECK FOR SHUTDOWN
-            if self.shutdown_signal.load(Ordering::Relaxed) {
-                info!("🛑 Study interrupted by shutdown signal.");
-                return Ok(());
-            }
+        // 1. Get base configuration and initial weights to clone
+        let base_weights = main_pc_lock.read().await.get_level_weights()?;
+        let pc_config = main_pc_lock.read().await.config.clone();
+        let device = main_pc_lock.read().await.device.clone();
 
-            let paragraphs = chunk_text(&raw_text);
-            
-            for chunk in paragraphs {
-                // ... (inside the inner loop as well)
-                if self.shutdown_signal.load(Ordering::Relaxed) {
-                    info!("🛑 Study interrupted by shutdown signal.");
-                    return Ok(());
-                }
+        // 2. Determine how many pieces to split the book into (based on actual Rayon threads)
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (text_chunks.len() / num_threads).max(1);
+        
+        tracing::info!("📚 Splitting document into {} parallel segments across {} CPU cores...",
+            (text_chunks.len() as f32 / chunk_size as f32).ceil(), num_threads);
+
+        let segments: Vec<Vec<String>> = text_chunks.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+        // 3. 🔴 ESCAPE TOKIO: Move CPU-heavy math into Rayon threads
+        // We use spawn_blocking so Tokio doesn't freeze while Rayon does the math.
+        let shutdown_clone = shutdown.clone();
+        let all_learned_weights = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+
+            segments.into_par_iter().filter_map(|segment| {
+                if shutdown_clone.load(Ordering::Relaxed) { return None; }
+
+                // We need a tiny local async runtime to call process_text_sequence
+                // because we are currently inside a synchronous Rayon thread.
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 
-                if chunk.len() > 50 {
-                    let sequence_tensor = engine.process_text_sequence(&chunk).await?;
+                // Create an isolated clone of the PC Brain for this specific CPU core
+                let mut local_pc = PredictiveCoding::new_with_device(pc_config.clone(), device.clone()).ok()?;
+                local_pc.load_level_weights(base_weights.clone()).ok()?;
+
+                for raw_text in segment {
+                    if shutdown_clone.load(Ordering::Relaxed) { return None; }
+                    let paragraphs = chunk_text(&raw_text);
                     
-                    // Clear temporal state between chunks to prevent "thought bleeding"
-                    for level in pc.levels.iter_mut() {
-                        level.beliefs = level.beliefs.zeros_like()?;
-                        level.prev_beliefs = level.prev_beliefs.zeros_like()?;
-                    }
-                    
-                    if let Ok(stats) = pc.learn_sequence(&sequence_tensor, None) {
-                        // Calculate study efficiency: How much Level 0 noise was converted into higher-level concepts
-                        let n_levels = stats.level_surprises.len();
-                        if n_levels >= 2 {
-                            let top_l = n_levels.saturating_sub(2);
-                            let abstraction_ratio = 1.0 - (stats.level_surprises[top_l] / stats.level_surprises[0].max(1.0));
+                    for p in paragraphs {
+                        if p.len() > 50 {
+                            // Run the async embedder inside our tiny sync runtime
+                            let sequence_tensor = rt.block_on(async {
+                                engine_lock.read().await.process_text_sequence(&p).await
+                            }).ok()?;
                             
-                            // Efficiency: How much Level 0 noise was converted into Level 2 concepts
-                            if abstraction_ratio < 0.2 {
-                                warn!("📉 Low Study Efficiency ({:.1}%). Ideas are too complex for {} layers.", abstraction_ratio * 100.0, n_levels);
-                            } else {
-                                tracing::debug!("📊 Study Efficiency: {:.1}% (abstraction ratio)", abstraction_ratio * 100.0);
+                            // Reset temporal state for new paragraph
+                            for level in local_pc.levels.iter_mut() {
+                                level.beliefs = level.beliefs.zeros_like().ok()?;
+                                level.prev_beliefs = level.prev_beliefs.zeros_like().ok()?;
                             }
+                            
+                            let _ = local_pc.learn_sequence(&sequence_tensor, None);
                         }
                     }
                 }
-            }
+                
+                // Return the brain weights that THIS specific core learned
+                local_pc.get_level_weights().ok()
+            }).collect::<Vec<_>>()
+        }).await?;
+
+        if shutdown.load(Ordering::Relaxed) {
+            info!("🛑 Study interrupted by shutdown signal. Discarding parallel weights.");
+            return Ok(());
         }
+
+        // 4. 🔴 KNOWLEDGE MERGE: Federated Averaging
+        // We take the brains from all CPU cores and mathematically average them.
+        tracing::info!("🧠 Merging learned knowledge from {} parallel cores...", all_learned_weights.len());
+        let mut main_pc = main_pc_lock.write().await;
+        
+        if !all_learned_weights.is_empty() {
+            let num_models = all_learned_weights.len() as f32;
+            let n_levels = main_pc.levels.len();
+
+            for l in 0..n_levels {
+                // Get the total number of elements in this level's weight matrix
+                let elem_count = main_pc.levels[l].weights.flatten_all()?.elem_count();
+                let mut avg_weights_l: Vec<f32> = vec![0.0; elem_count];
+                
+                // Sum all weights from all parallel threads
+                for model_weights in &all_learned_weights {
+                    if let Some(level_weights) = model_weights.get(l) {
+                        for (avg_w, new_w) in avg_weights_l.iter_mut().zip(level_weights.weights.iter()) {
+                            *avg_w += *new_w;
+                        }
+                    }
+                }
+
+                // Divide by N to get the true mathematical average
+                for avg_w in &mut avg_weights_l {
+                    *avg_w /= num_models;
+                }
+
+                // Apply the averaged knowledge back to the main Brain
+                main_pc.levels[l].set_weights_from_vec(avg_weights_l)?;
+            }
+            tracing::info!("✅ Parallel knowledge merged successfully.");
+        }
+        
         Ok(())
     }
 }
@@ -369,11 +450,12 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
             
             if !question.is_empty() {
                 results.push(format!("Question: {}\nAnswer: {}", question, answer));
-            }
-            
-            // Log progress every 100 rows
-            if row_idx % 100 == 0 {
-                tracing::debug!("📊 Processing parquet row {} / {}", row_idx + 1, total_rows);
+                
+                // Log progress every 100 rows
+                if row_idx % 100 == 0 {
+                    tracing::debug!("📊 Processing parquet row {} / {}", row_idx + 1, total_rows);
+                    tracing::info!("📊 Studying Parquet row {}", row_idx + 1);
+                }
             }
         }
     }
@@ -402,6 +484,7 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
                 // Log progress every 100 lines
                 if line_count % 100 == 0 {
                     tracing::debug!("📝 Processing JSONL line {}", line_count);
+                    tracing::info!("📝 Studying JSONL line {}", line_count);
                 }
             }
             Err(e) => {
@@ -430,6 +513,7 @@ fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
             // Log progress every 10 pages
             if page_num % 10 == 0 {
                 tracing::debug!("📄 Processing PDF page {} / {}", page_num + 1, total_pages);
+                tracing::info!("📄 Studying PDF page {}", page_num + 1);
             }
         }
     }
@@ -471,6 +555,7 @@ fn extract_text_from_epub(path: &Path) -> Result<String, String> {
             // Log progress every 10 pages
             if page_num % 10 == 0 {
                 tracing::debug!("📖 Processing EPUB page {}/{}", page_num + 1, total_pages);
+                tracing::info!("📖 Studying EPUB page {}", page_num + 1);
             }
         }
         doc.go_next();
