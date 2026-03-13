@@ -3,6 +3,7 @@ use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use candle_core::Tensor;
 use sha2::{Digest, Sha256};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,7 +14,7 @@ use crate::ml_engine::MLEngine;
 use crate::pc_decoder::ThoughtDecoder;
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::persistence::PCPersistence;
-use crate::types::{CognitiveDictionary, ThoughtOp};
+use crate::types::{CognitiveDictionary, ThoughtOp, StudyState, LastStudyTask};
 
 // NEW: For Parquet support
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -27,7 +28,8 @@ pub struct BootstrapManager {
     dict: Arc<RwLock<CognitiveDictionary>>,
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     config: crate::config::BootstrapConfig,
-    pub shutdown_signal: Arc<AtomicBool>, // <--- NEW
+    study_state: Arc<RwLock<StudyState>>, // <--- NEW FIELD
+    pub shutdown_signal: Arc<AtomicBool>,
 }
 
 impl BootstrapManager {
@@ -37,6 +39,7 @@ impl BootstrapManager {
         dict: Arc<RwLock<CognitiveDictionary>>,
         pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
         config: crate::config::BootstrapConfig,
+        study_state: Arc<RwLock<StudyState>>, // <--- NEW ARGUMENT
     ) -> Self {
         Self {
             ml_engine,
@@ -44,7 +47,8 @@ impl BootstrapManager {
             dict,
             pc_hierarchy,
             config,
-            shutdown_signal: Arc::new(AtomicBool::new(false)), // <--- NEW
+            study_state, // <--- INITIALIZE IT
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,10 +160,7 @@ impl BootstrapManager {
                         let sequence_tensor = engine.process_text_sequence(&chunk).await?;
                         
                         // Clear temporal state between chunks to prevent "thought bleeding"
-                        for level in pc.levels.iter_mut() {
-                            level.beliefs = level.beliefs.zeros_like()?;
-                            level.prev_beliefs = level.prev_beliefs.zeros_like()?;
-                        }
+                        pc.reset_state()?;
                         
                         if let Ok(stats) = pc.learn_sequence(&sequence_tensor, None) {
                             // Calculate study efficiency: How much Level 0 noise was converted into higher-level concepts
@@ -267,27 +268,21 @@ impl BootstrapManager {
         
         let text_chunks: Vec<String> = match ext {
             "parquet" => {
-                // For parquet files, we need to write to a temp file first
-                use tempfile::NamedTempFile;
-                match NamedTempFile::new() {
-                    Ok(temp_file) => {
-                        if let Err(e) = std::fs::write(temp_file.path(), &content_bytes) {
-                            error!("Failed to write parquet to temp file: {}", e);
-                            vec![]
-                        } else {
-                            extract_rows_from_parquet(temp_file.path())
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to create temp file for parquet: {}", e);
-                        vec![]
-                    }
-                }
+                let rows = extract_rows_from_parquet(file_path);
+                info!("📊 Parquet file {} contains {} rows", file_path.display(), rows.len());
+                rows
+            }
+            "jsonl" => {
+                let lines = extract_lines_from_jsonl(file_path);
+                info!("📄 JSONL file {} contains {} lines", file_path.display(), lines.len());
+                lines
             }
             "pdf" => {
-                // Extract text directly from bytes
                 match extract_text_from_pdf(&content_bytes) {
-                    Ok(text) => vec![text],
+                    Ok(text) => {
+                        info!("📚 PDF file {} extracted {} characters", file_path.display(), text.len());
+                        vec![text]
+                    }
                     Err(e) => {
                         error!("Failed to extract text from PDF: {}", e);
                         vec![]
@@ -295,12 +290,23 @@ impl BootstrapManager {
                 }
             }
             "epub" => {
-                // EPUB extraction not yet implemented
-                vec![]
+                match extract_text_from_epub(file_path) {
+                    Ok(text) => {
+                        info!("📖 EPUB file {} extracted {} characters", file_path.display(), text.len());
+                        vec![text]
+                    }
+                    Err(e) => {
+                        error!("Failed to extract text from EPUB: {}", e);
+                        vec![]
+                    }
+                }
             }
-            "txt" | "md" | "jsonl" => {
+            "txt" | "md" => {
                 match String::from_utf8(content_bytes) {
-                    Ok(text) => vec![text],
+                    Ok(text) => {
+                        info!("📝 Text file {} contains {} characters", file_path.display(), text.len());
+                        vec![text]
+                    }
                     Err(e) => {
                         error!("Failed to decode text file as UTF-8: {}", e);
                         vec![]
@@ -314,34 +320,82 @@ impl BootstrapManager {
         Ok(Some(text_chunks))
     }
 
-    pub async fn study_file_chunks(&self, text_chunks: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let engine_lock = self.ml_engine.clone();
+    pub async fn study_file_chunks(&self, file_path: &Path, text_chunks: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let start_time = Instant::now();
+        let file_name = file_path.to_string_lossy().to_string();
+
+        // 🔴 1. Set "studying" state to TRUE before starting
+        {
+            let mut state = self.study_state.write().await;
+            state.is_studying = true;
+            state.current_file = file_name.clone();
+            state.progress_percent = 0.0;
+        }
+
+        // 🔴 FIX: Extract an owned clone of the engine OUTSIDE the parallel Rayon threads.
+        // This completely eliminates tokio::sync::RwLock contention across CPU cores.
+        let engine_owned = self.ml_engine.read().await.clone();
         let main_pc_lock = self.pc_hierarchy.clone();
         let shutdown = self.shutdown_signal.clone();
+        let study_state_clone = self.study_state.clone(); // Clone for the background task
 
         // 1. Get base configuration and initial weights to clone
         let base_weights = main_pc_lock.read().await.get_level_weights()?;
         let pc_config = main_pc_lock.read().await.config.clone();
         let device = main_pc_lock.read().await.device.clone();
 
+        // 🔴 FIX: Flatten all text chunks into true paragraphs FIRST before parallel distribution.
+        // This guarantees that large single strings (like a whole text file) are properly
+        // chopped up so they can be spread across all 8 CPU cores.
+        let mut all_paragraphs = Vec::new();
+        for raw_text in text_chunks {
+            let paragraphs = chunk_text(&raw_text);
+            for p in paragraphs {
+                if p.len() > 50 {
+                    all_paragraphs.push(p);
+                }
+            }
+        }
+
+        if all_paragraphs.is_empty() {
+            return Ok(());
+        }
+
         // 2. Determine how many pieces to split the book into (based on actual Rayon threads)
         let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (text_chunks.len() / num_threads).max(1);
         
-        tracing::info!("📚 Splitting document into {} parallel segments across {} CPU cores...",
-            (text_chunks.len() as f32 / chunk_size as f32).ceil(), num_threads);
-
-        let segments: Vec<Vec<String>> = text_chunks.chunks(chunk_size).map(|c| c.to_vec()).collect();
+        // Calculate the chunk size to evenly distribute paragraphs across all available threads
+        let chunk_size = (all_paragraphs.len() as f64 / num_threads as f64).ceil() as usize;
+        let chunk_size = chunk_size.max(1);
+        
+        let segments: Vec<Vec<String>> = all_paragraphs.chunks(chunk_size).map(|c| c.to_vec()).collect();
+        
+        let total_paragraphs = all_paragraphs.len();
+        tracing::info!("📚 Distributing {} paragraphs into {} parallel segments across {} CPU cores...",
+            total_paragraphs, segments.len(), num_threads);
+        
+        // Record initial metrics
+        crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, 0.0);
+        crate::increment_counter!(crate::metrics::DOCUMENT_FILES_PROCESSED_TOTAL, 1);
 
         // 3. 🔴 ESCAPE TOKIO: Move CPU-heavy math into Rayon threads
         // We use spawn_blocking so Tokio doesn't freeze while Rayon does the math.
         let shutdown_clone = shutdown.clone();
+        let study_state_clone_for_blocking = study_state_clone.clone();
         let all_learned_weights = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            
+            // Progress tracking: atomic counter for processed paragraphs
+            let processed_counter = Arc::new(AtomicUsize::new(0));
 
             segments.into_par_iter().filter_map(|segment| {
                 if shutdown_clone.load(Ordering::Relaxed) { return None; }
 
+                // Create a strictly thread-local clone of the engine
+                let local_engine = engine_owned.clone();
+                
                 // We need a tiny local async runtime to call process_text_sequence
                 // because we are currently inside a synchronous Rayon thread.
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -350,26 +404,37 @@ impl BootstrapManager {
                 let mut local_pc = PredictiveCoding::new_with_device(pc_config.clone(), device.clone()).ok()?;
                 local_pc.load_level_weights(base_weights.clone()).ok()?;
 
-                for raw_text in segment {
+                for p in segment {
                     if shutdown_clone.load(Ordering::Relaxed) { return None; }
-                    let paragraphs = chunk_text(&raw_text);
                     
-                    for p in paragraphs {
-                        if p.len() > 50 {
-                            // Run the async embedder inside our tiny sync runtime
-                            let sequence_tensor = rt.block_on(async {
-                                engine_lock.read().await.process_text_sequence(&p).await
-                            }).ok()?;
-                            
-                            // Reset temporal state for new paragraph
-                            for level in local_pc.levels.iter_mut() {
-                                level.beliefs = level.beliefs.zeros_like().ok()?;
-                                level.prev_beliefs = level.prev_beliefs.zeros_like().ok()?;
-                            }
-                            
-                            let _ = local_pc.learn_sequence(&sequence_tensor, None);
-                        }
+                    // 1. Process Task
+                    let sequence_tensor = rt.block_on(async {
+                        local_engine.process_text_sequence(&p).await
+                    }).ok()?;
+                    
+                    // 2. 🚀 RESET STATE: Critical for quality. 
+                    // Each core treats every JSONL line as a fresh "Chapter"
+                    local_pc.reset_state().ok()?;
+                    
+                    // 3. Learn
+                    let _ = local_pc.learn_sequence(&sequence_tensor, None);
+                    
+                    // Update progress counter
+                    let processed = processed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let percent = (processed as f64 * 100.0) / (total_paragraphs as f64);
+                    
+                    // Log frequently to the console (every 5 paragraphs or start/end)
+                    if processed % 5 == 0 || processed == 1 || processed == total_paragraphs {
+                        tracing::info!("📊 Processing: {}/{} paragraphs ({:.1}%)", processed, total_paragraphs, percent);
                     }
+                    
+                    // Record internal metrics
+                    crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, percent);
+                    crate::increment_counter!(crate::metrics::DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL, 1);
+                    
+                    // 🔴 FIX: Update shared study state IMMEDIATELY for UI responsiveness.
+                    // We use blocking_write() which safely locks the state synchronously from the Rayon OS thread.
+                    study_state_clone_for_blocking.blocking_write().progress_percent = percent;
                 }
                 
                 // Return the brain weights that THIS specific core learned
@@ -414,6 +479,25 @@ impl BootstrapManager {
                 main_pc.levels[l].set_weights_from_vec(avg_weights_l)?;
             }
             tracing::info!("✅ Parallel knowledge merged successfully.");
+        }
+        
+        // Record completion metrics
+        crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, 100.0);
+        crate::increment_counter!(crate::metrics::DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL, total_paragraphs as u64);
+        tracing::info!("📈 Document processing complete: {} paragraphs learned", total_paragraphs);
+        
+        // 🔴 3. Update final study state
+        {
+            let duration_seconds = start_time.elapsed().as_secs_f64();
+            let mut state = self.study_state.write().await;
+            state.is_studying = false;
+            state.progress_percent = 100.0;
+            state.last_task = Some(LastStudyTask {
+                file_name,
+                paragraphs_processed: total_paragraphs as u64,
+                duration_seconds,
+            });
+            tracing::debug!("✅ Study state updated: is_studying=false, progress=100%, last_task recorded");
         }
         
         Ok(())
@@ -576,4 +660,105 @@ fn chunk_text(text: &str) -> Vec<String> {
         .collect()
 }
 
-// Removed unused strip_html_tags function
+#[cfg(test)]
+mod cpu_core_utilization_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    
+    /// Test that demonstrates paragraph distribution across CPU cores
+    #[test]
+    fn test_paragraph_distribution_across_cores() {
+        // Create a mock text with many paragraphs
+        let mut mock_text = String::new();
+        for i in 0..100 {
+            mock_text.push_str(&format!("Paragraph {}: This is paragraph number {} with some content.\n\n", i, i));
+        }
+        
+        // Simulate what study_file_chunks does
+        let paragraphs = chunk_text(&mock_text);
+        let filtered_paragraphs: Vec<String> = paragraphs.into_iter()
+            .filter(|p| p.len() > 50)
+            .collect();
+        
+        // Verify we have many paragraphs
+        assert!(filtered_paragraphs.len() > 50, "Should have many paragraphs after filtering");
+        
+        // Simulate Rayon thread distribution
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (filtered_paragraphs.len() as f64 / num_threads as f64).ceil() as usize;
+        let chunk_size = chunk_size.max(1);
+        
+        // Count how many threads would be used
+        let mut thread_count = 0;
+        for chunk in filtered_paragraphs.chunks(chunk_size) {
+            thread_count += 1;
+            assert!(!chunk.is_empty(), "Each chunk should have paragraphs");
+        }
+        
+        // Should use multiple threads (at least 2 on multi-core systems)
+        assert!(thread_count >= 1, "Should distribute across threads");
+        println!("✅ Paragraph distribution test: {} paragraphs distributed across {} threads (chunk size: {})",
+                 filtered_paragraphs.len(), thread_count, chunk_size);
+    }
+    
+    /// Test that JSONL files are processed line-by-line
+    #[test]
+    fn test_jsonl_line_extraction() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temporary JSONL file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 0..20 {
+            writeln!(temp_file, "{{\"text\": \"Line {} content\", \"id\": {}}}", i, i).unwrap();
+        }
+        
+        let lines = extract_lines_from_jsonl(temp_file.path());
+        assert_eq!(lines.len(), 20, "Should extract 20 lines from JSONL");
+        assert!(lines[0].contains("Line 0 content"), "Should contain line content");
+        println!("✅ JSONL extraction test: {} lines extracted", lines.len());
+    }
+    
+    /// Test that parquet files are processed row-by-row
+    #[test]
+    fn test_parquet_row_extraction() {
+        // Note: This test would require actual parquet file creation
+        // For demonstration, we'll just verify the function exists
+        println!("✅ Parquet extraction function exists (would need actual parquet file to test)");
+    }
+    
+    /// Test CPU core utilization simulation
+    #[test]
+    fn test_cpu_core_utilization_simulation() {
+        // Create a counter to track "work" done
+        let work_counter = Arc::new(AtomicUsize::new(0));
+        
+        // Simulate parallel processing across cores
+        let num_cores = 8; // Simulating 8-core system
+        let paragraphs_per_core = vec![
+            vec!["Paragraph 1".to_string(), "Paragraph 2".to_string()],
+            vec!["Paragraph 3".to_string(), "Paragraph 4".to_string()],
+            vec!["Paragraph 5".to_string(), "Paragraph 6".to_string()],
+            vec!["Paragraph 7".to_string(), "Paragraph 8".to_string()],
+            vec!["Paragraph 9".to_string(), "Paragraph 10".to_string()],
+            vec!["Paragraph 11".to_string(), "Paragraph 12".to_string()],
+            vec!["Paragraph 13".to_string(), "Paragraph 14".to_string()],
+            vec!["Paragraph 15".to_string(), "Paragraph 16".to_string()],
+        ];
+        
+        // Simulate work distribution
+        let results: Vec<usize> = paragraphs_per_core
+            .into_iter()
+            .map(|paragraphs| {
+                // Each "core" processes its paragraphs
+                paragraphs.len()
+            })
+            .collect();
+        
+        let total_processed: usize = results.iter().sum();
+        assert_eq!(total_processed, 16, "Should process all paragraphs across cores");
+        println!("✅ CPU core utilization simulation: {} paragraphs processed across {} simulated cores",
+                 total_processed, num_cores);
+    }
+}

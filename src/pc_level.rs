@@ -22,6 +22,7 @@ pub struct PCLevel {
     pub cached_temporal_eta: Option<(f32, Tensor)>,
     // Delta propagation cache
     pub last_prediction_input: Option<Tensor>,
+    pub last_spatial_prediction: Option<Tensor>,
 }
 
 impl PCLevel {
@@ -59,6 +60,7 @@ impl PCLevel {
             cached_spatial_eta: None,
             cached_temporal_eta: None,
             last_prediction_input: None,
+            last_spatial_prediction: None,
         })
     }
 
@@ -66,15 +68,19 @@ impl PCLevel {
     /// ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
     pub fn predict(&mut self, beliefs_next: &Tensor) -> CandleResult<()> {
         // 🚀 DELTA PROPAGATION: Only multiply the difference if we have cached previous input
-        let spatial_pred = if let Some(old_input) = &self.last_prediction_input {
+        let spatial_pred = if let (Some(old_input), Some(old_spatial)) = (&self.last_prediction_input, &self.last_spatial_prediction) {
             let delta_r = (beliefs_next - old_input)?;
             let delta_pred = self.weights.matmul(&delta_r.contiguous()?)?;
-            (&self.predictions + &delta_pred)?
+            (old_spatial + &delta_pred)?
         } else {
             // Initial step: full matmul
             self.weights.matmul(&beliefs_next.contiguous()?)?
         };
         
+        // Cache for next delta propagation
+        self.last_spatial_prediction = Some(spatial_pred.clone());
+        self.last_prediction_input = Some(beliefs_next.clone());
+
         // ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
         let prev_beliefs_sum = self.prev_beliefs.sum_all()?.to_scalar::<f32>()?;
         if prev_beliefs_sum.abs() > 1e-6 {
@@ -85,8 +91,6 @@ impl PCLevel {
             self.predictions = spatial_pred;
         }
         
-        // Cache the input for next delta propagation
-        self.last_prediction_input = Some(beliefs_next.clone());
         Ok(())
     }
 
@@ -121,7 +125,7 @@ impl PCLevel {
     
     pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Tensor, precision: Option<&Tensor>, mu_pc_scaling: bool) -> CandleResult<()> {
         // 🚀 OPTIMIZATION: Force contiguous memory layout after transpose for fast BLAS/Native matmul
-        let next_t = next_level_beliefs.t()?.contiguous()?;
+        let next_t = next_level_beliefs.t()?.contiguous()?.to_device(&self.device)?;
         let matmul_result = self.errors.matmul(&next_t)?;
         
         // --- NEW: NUMERICAL GUARDRAIL ---
@@ -165,7 +169,11 @@ impl PCLevel {
         // L2 Regularization / Weight Decay to prevent infinite weight explosion
         let weight_decay = 1e-4;
         let decayed_weights = (&self.weights * (1.0 - weight_decay))?;
-        self.weights = decayed_weights.broadcast_add(&delta_weights)?;
+        
+        // 🚀 CACHE LOCALITY: After updating weights, we MUST ensure the new tensor
+        // is contiguous. This allows the NEXT token's matmul to use BLAS/SIMD optimally.
+        let new_weights = decayed_weights.broadcast_add(&delta_weights)?;
+        self.weights = new_weights.contiguous()?;
         
         // NEW: Also update temporal causal weights using Hebbian learning on prev_beliefs
         // 🚀 OPTIMIZATION: Force contiguous memory layout
@@ -198,7 +206,10 @@ impl PCLevel {
             }
             
             let decayed_temporal = (&self.temporal_weights * (1.0 - weight_decay))?;
-            self.temporal_weights = decayed_temporal.broadcast_add(&temporal_update)?;
+            
+            // 🚀 CACHE LOCALITY: Ensure temporal weights are also contiguous
+            let new_temporal_weights = decayed_temporal.broadcast_add(&temporal_update)?;
+            self.temporal_weights = new_temporal_weights.contiguous()?;
         }
         
         Ok(())
@@ -384,6 +395,54 @@ mod numerical_guardrail_tests {
         }
         
         assert!(max_diff < 1.5, "Gradient clipping failed! Weights moved too far: {}", max_diff);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delta_propagation_tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn test_spatial_delta_propagation_vs_fresh_matmul() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let mut level = PCLevel::new(4, 4, &device)?;
+        
+        // Initialize temporal state to guarantee temporal_pred is active
+        level.prev_beliefs = Tensor::ones((4, 1), candle_core::DType::F32, &device)?;
+        level.temporal_weights = Tensor::eye(4, candle_core::DType::F32, &device)?;
+        
+        let input1 = Tensor::full(1.0f32, (4, 1), &device)?;
+        let input2 = Tensor::full(2.0f32, (4, 1), &device)?;
+
+        // 1. Run with delta propagation
+        level.predict(&input1)?; // Populates caches
+        level.predict(&input2)?; // Uses delta propagation
+        let pred_with_delta = level.predictions.to_vec2::<f32>()?;
+
+        // 2. Run fresh (simulate what it SHOULD be without the delta cache)
+        let mut level_fresh = PCLevel::new(4, 4, &device)?;
+        // Copy weights so they are identical
+        level_fresh.weights = level.weights.clone();
+        level_fresh.temporal_weights = level.temporal_weights.clone();
+        level_fresh.prev_beliefs = level.prev_beliefs.clone();
+        
+        // Only predict input2 directly (no cache)
+        level_fresh.predict(&input2)?;
+        let pred_fresh = level_fresh.predictions.to_vec2::<f32>()?;
+
+        // Verify they are practically identical
+        let mut max_diff = 0.0f32;
+        for i in 0..4 {
+            for j in 0..1 {
+                let diff = (pred_with_delta[i][j] - pred_fresh[i][j]).abs();
+                if diff > max_diff { max_diff = diff; }
+            }
+        }
+        
+        // If the temporal bug was still there, the difference would be massive
+        assert!(max_diff < 1e-4, "Delta propagation diverged from fresh matmul! Max diff: {}", max_diff);
         Ok(())
     }
 }

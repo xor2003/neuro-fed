@@ -10,6 +10,12 @@ pub struct ProxyMetrics {
     pub pc_learning_calls: u64,
     pub thought_decoder_calls: u64,
     pub errors: u64,
+
+    // --- 🔴 ADD THESE NEW FIELDS ---
+    pub is_studying: bool,
+    pub study_progress: f64,
+    pub current_study_file: String,
+    pub last_study_summary: String,
 }
 
 impl ProxyMetrics {

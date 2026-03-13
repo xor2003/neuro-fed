@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 
-use crate::openai_proxy::{OpenAiProxy, UiState};
+use crate::openai_proxy::OpenAiProxy;
 
 const INDEX_HTML: &str = include_str!("../../ui/index.html");
 const APP_JS: &str = include_str!("../../ui/app.js");
@@ -22,7 +22,6 @@ pub fn create_router(proxy: Arc<OpenAiProxy>) -> Router {
         .route("/ui/app.js", get(ui_app_js))
         .route("/ui/styles.css", get(ui_styles))
         .route("/ui/metrics", get(ui_metrics))
-        .route("/ui/state", get(ui_state))
         .route("/ui/stats", get(ui_stats))
         .with_state(proxy)
 }
@@ -40,11 +39,39 @@ async fn ui_styles() -> Response {
 }
 
 async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai_proxy::metrics::ProxyMetrics> {
-    Json(proxy.metrics.read().await.clone())
-}
+    // Read from both the standard metrics and the new study state
+    let metrics_lock = proxy.metrics.read().await;
+    let study_state_lock = proxy.study_state.read().await;
 
-async fn ui_state(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiState> {
-    Json(proxy.ui_state.read().await.clone())
+    // Create the summary string for the last completed task
+    let summary = if let Some(last_task) = &study_state_lock.last_task {
+        format!(
+            "Studied {} ({} paragraphs) in {:.2}s",
+            last_task.file_name, last_task.paragraphs_processed, last_task.duration_seconds
+        )
+    } else {
+        "No documents studied yet.".to_string()
+    };
+
+    // Combine data from both sources into a single response
+    let combined_metrics = crate::openai_proxy::metrics::ProxyMetrics {
+        total_requests: metrics_lock.total_requests,
+        total_processing_time_ms: metrics_lock.total_processing_time_ms,
+        cache_hits: metrics_lock.cache_hits,
+        cache_misses: metrics_lock.cache_misses,
+        pc_inference_calls: metrics_lock.pc_inference_calls,
+        pc_learning_calls: metrics_lock.pc_learning_calls,
+        thought_decoder_calls: metrics_lock.thought_decoder_calls,
+        errors: metrics_lock.errors,
+
+        // Populate the new fields from the study state
+        is_studying: study_state_lock.is_studying,
+        study_progress: study_state_lock.progress_percent,
+        current_study_file: study_state_lock.current_file.clone(),
+        last_study_summary: summary,
+    };
+
+    Json(combined_metrics)
 }
 
 #[derive(serde::Serialize)]

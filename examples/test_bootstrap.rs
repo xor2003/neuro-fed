@@ -3,7 +3,7 @@ use neuro_fed_node::config::BootstrapConfig;
 use neuro_fed_node::ml_engine::MLEngine;
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
-use neuro_fed_node::types::{DeviceType, CognitiveDictionary};
+use neuro_fed_node::types::{DeviceType, CognitiveDictionary, StudyState};
 use candle_core::Device;
 use std::error::Error;
 use std::sync::Arc;
@@ -44,6 +44,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         vec![], // document_paths (empty for synthetic training)
     );
     
+    // Create StudyState for tracking progress
+    let study_state = Arc::new(RwLock::new(StudyState::default()));
+    
     // Create BootstrapManager
     let bootstrapper = BootstrapManager::new(
         ml_engine,
@@ -51,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dict,
         pc_hierarchy,
         bootstrap_config,
+        study_state,
     );
     
     println!("Running bootstrap synthetic training...");

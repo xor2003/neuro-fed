@@ -1,4 +1,5 @@
 // src/main.rs
+use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, RwLock};
@@ -6,7 +7,7 @@ use anyhow::Result;
 use thread_priority::*; // <--- NEW IMPORT
 use neuro_fed_node::{
     config::{self, NodeConfig}, ml_engine::MLEngine, pc_hierarchy::PredictiveCoding,
-    types::{DeviceType, Episode},
+    types::{DeviceType, Episode, StudyState},
     persistence::PCPersistence,
     sleep_phase::SleepManager,
     node_loop::NodeLoop,
@@ -33,10 +34,26 @@ use walkdir::WalkDir;
 /// Динамический выбор устройства на основе конфигурации
 fn select_device(config: &NodeConfig) -> Device {
     if config.ml_config.use_gpu {
-        // Пробуем CUDA, затем Metal, затем CPU
-        Device::new_cuda(0)
-            .or_else(|_| Device::new_metal(0))
-            .unwrap_or(Device::Cpu)
+        // 1. Try NVIDIA (CUDA)
+        if let Ok(dev) = Device::new_cuda(0) {
+            return dev;
+        }
+        
+        // 2. Try AMD (HIP) 🔴 NEW SUPPORT
+        #[cfg(feature = "hip")]
+        {
+            if let Ok(dev) = Device::new_hip(0) {
+                return dev;
+            }
+        }
+
+        // 3. Try Apple Silicon (Metal)
+        if let Ok(dev) = Device::new_metal(0) {
+            return dev;
+        }
+
+        tracing::warn!("GPU requested but no compatible NVIDIA/AMD/Metal device found. Falling back to CPU.");
+        Device::Cpu
     } else {
         Device::Cpu
     }
@@ -44,7 +61,7 @@ fn select_device(config: &NodeConfig) -> Device {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut config = NodeConfig::load_or_default();
+    let config = NodeConfig::load_or_default();
     let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
@@ -78,7 +95,7 @@ async fn main() -> Result<()> {
 
     // Create global shutdown signal for graceful termination
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
+    let _stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
     
     // Create global shutdown signal for graceful termination
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -213,6 +230,10 @@ async fn main() -> Result<()> {
         &device
     )?));
 
+    // 🔴 Create shared StudyState for tracking document study progress
+    let study_state = Arc::new(RwLock::new(StudyState::default()));
+    tracing::info!("📊 StudyState initialized for UI progress tracking");
+
     // 3. Создание каналов для Gossip и Событий
     let (gossip_tx, _gossip_rx) = mpsc::channel(100); // gossip_rx пойдет в NostrFederation
     pc_hierarchy.write().await.gossip_sender = Some(gossip_tx);
@@ -252,6 +273,7 @@ async fn main() -> Result<()> {
     };
     let proxy = Arc::new(OpenAiProxy::new(
         config.clone(), proxy_config, ml_engine.clone(), pc_hierarchy.clone(), embedding_dim, thought_decoder.clone(), cognitive_dict.clone(),
+        study_state.clone(),
     ));
 
     // Initialize Nostr federation and brain sharing (config-driven)
@@ -363,6 +385,7 @@ async fn main() -> Result<()> {
             // Small delay to ensure logs are flushed
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             tracing::info!("[DEBUG] Final log before exit");
+            exit(0);
         } else {
             tracing::warn!("Ctrl+C await returned error");
         }
@@ -396,6 +419,7 @@ async fn main() -> Result<()> {
             cognitive_dict.clone(),
             pc_hierarchy.clone(),
             config.bootstrap_config.clone(),
+            study_state.clone(), // <--- ADD STUDY STATE
         );
         bootstrap.shutdown_signal = stop_signal_for_bootstrap; // <--- WIRE IT UP
 
@@ -422,6 +446,7 @@ async fn main() -> Result<()> {
         let pc_hierarchy_clone = pc_hierarchy.clone();
         let bootstrap_config_clone = config.bootstrap_config.clone();
         
+        let study_state_clone = study_state.clone();
         tokio::spawn(async move {
             if let Err(e) = start_file_watcher(
                 watch_path,
@@ -431,6 +456,7 @@ async fn main() -> Result<()> {
                 cognitive_dict_clone,
                 pc_hierarchy_clone,
                 bootstrap_config_clone,
+                study_state_clone,
             ).await {
                 tracing::error!("File watcher failed: {}", e);
             }
@@ -456,6 +482,7 @@ async fn start_file_watcher(
     cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     bootstrap_config: config::BootstrapConfig,
+    study_state: Arc<RwLock<StudyState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use notify::event::{CreateKind, ModifyKind, EventKind};
     use std::path::Path;
@@ -488,6 +515,7 @@ async fn start_file_watcher(
         cognitive_dict,
         pc_hierarchy,
         bootstrap_config,
+        study_state.clone(), // <--- ADD STUDY STATE
     );
     
     // Process existing files first
@@ -500,7 +528,7 @@ async fn start_file_watcher(
                 let file_path = entry.path();
                 tracing::debug!("Processing existing file: {:?}", file_path);
                 if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&file_path, &persistence).await {
-                    if let Err(e) = bootstrap.study_file_chunks(chunks).await {
+                    if let Err(e) = bootstrap.study_file_chunks(&file_path, chunks).await {
                         tracing::warn!("Failed to study file {:?}: {}", file_path, e);
                     }
                 }
@@ -522,7 +550,7 @@ async fn start_file_watcher(
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         
                         if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&path, &persistence).await {
-                            if let Err(e) = bootstrap.study_file_chunks(chunks).await {
+                            if let Err(e) = bootstrap.study_file_chunks(&path, chunks).await {
                                 tracing::warn!("Failed to study file {:?}: {}", path, e);
                             } else {
                                 tracing::info!("✅ Successfully studied file: {:?}", path);

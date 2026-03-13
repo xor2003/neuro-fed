@@ -65,6 +65,8 @@ impl SleepManager {
             let flat_data: Vec<f32> = ep.query_sequence.iter().flatten().copied().collect();
             let embed_tensor = Tensor::from_vec(flat_data, (seq_len, dim), &Device::Cpu)?;
             
+            pc.reset_state().map_err(|e| e.to_string())?;
+
             // Use learn_sequence for proper temporal processing
             if ep.novelty > 2.0 {
                 pc.checkpoint_weights().map_err(|e| e.to_string())?;

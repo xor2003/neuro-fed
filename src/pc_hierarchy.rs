@@ -151,77 +151,56 @@ impl PredictiveCoding {
             weights_t.push(level.weights.t()?.contiguous()?);
         }
         
+        let mut prev_fe = f32::MAX; // Track for early exit
+        
         for step in 0..steps {
             // Upward pass: compute predictions and errors
             for l in 0..self.levels.len() - 1 {
-                if self.levels[l+1].is_dirty {
-                    let (left, right) = self.levels.split_at_mut(l + 1);
-                    left[l].predict(&right[0].beliefs)?;
-                    // 🔴 STRICT BOUND: Prevent prediction explosion
-                    left[l].predictions = left[l].predictions.clamp(-10.0f32, 10.0f32)?;
-                    left[l].compute_errors()?;
-                    // 🔴 STRICT BOUND: Prevent error explosion
-                    left[l].errors = left[l].errors.clamp(-5.0f32, 5.0f32)?;
-                    
-                    let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                    stats.level_surprises[l] += err_sq;
-                } else {
-                    self.levels[l].compute_errors()?;
-                    // 🔴 STRICT BOUND: Prevent error explosion
-                    self.levels[l].errors = self.levels[l].errors.clamp(-5.0f32, 5.0f32)?;
-                    
-                    let err_sq = self.levels[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                    stats.level_surprises[l] += err_sq;
-                }
+                // Use pre-computed weights_t for downward pass, but for upward 
+                // we use the level's weights directly.
+                let (left, right) = self.levels.split_at_mut(l + 1);
+                left[l].predict(&right[0].beliefs)?;
+                left[l].compute_errors()?;
+                
+                let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                stats.level_surprises[l] += err_sq;
             }
             
-            // Downward pass: update beliefs based on errors
+            // Downward pass: update beliefs
             for l in (0..self.levels.len() - 1).rev() {
                 if l > 0 {
-                    // Update current level beliefs based on its own prediction error
-                    let mut update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
-                    // 🔴 STRICT BOUND: Beliefs can only move a maximum of 0.1 per step
-                    update = update.clamp(-0.1f32, 0.1f32)?;
-                    
-                    let mut new_belief = (&self.levels[l].beliefs - &update)?;
-                    // 🔴 STRICT BOUND: Total belief values cannot exceed 10.0
-                    new_belief = new_belief.clamp(-10.0f32, 10.0f32)?;
-                    
-                    self.levels[l].beliefs = new_belief;
-                    self.levels[l].is_dirty = true;
+                    let update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
+                    self.levels[l].beliefs = (&self.levels[l].beliefs - &update.clamp(-0.1f32, 0.1f32)?)?
+                        .clamp(-10.0f32, 10.0f32)?;
                 }
                 
-                // Propagate error upward to influence beliefs at next level
+                // Propagate error upward
                 if l + 1 < self.levels.len() {
+                    // 🚀 CACHE LOCALITY: use the pre-transposed contiguous matrix
                     let matmul_result = weights_t[l].matmul(&self.levels[l].errors)?;
-                    let mut belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
-                    
-                    // 🔴 STRICT BOUND: Upward influence max 0.1 per step
-                    belief_update = belief_update.clamp(-0.1f32, 0.1f32)?;
-                    
-                    let mut new_belief = (&self.levels[l+1].beliefs + &belief_update)?;
-                    // 🔴 STRICT BOUND: Total belief values cannot exceed 10.0
-                    new_belief = new_belief.clamp(-10.0f32, 10.0f32)?;
-                    
-                    self.levels[l+1].beliefs = new_belief;
-                    self.levels[l+1].is_dirty = true;
+                    let belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
+                    self.levels[l+1].beliefs = (&self.levels[l+1].beliefs + &belief_update.clamp(-0.1f32, 0.1f32)?)?
+                        .clamp(-10.0f32, 10.0f32)?;
                 }
             }
             
-            // Track free energy and surprise
             let fe = self.compute_free_energy()?;
             stats.free_energy_history.push(fe);
-            
+
             if fe > self.config.surprise_threshold {
                 stats.high_surprise_indices.push(step);
             }
 
-            // Early exiting: stop ONLY if FE is extremely low AND we've thought for at least 3 steps
-            if fe < 0.0001 && step > 3 {
-                // 🔴 FIX: Changed to trace to avoid spam
-                tracing::trace!("PC inference converged early at step {} (FE: {:.4})", step, fe);
-                break;
+            // 🚀 OPTIMIZATION: Early Exit (Algorithmic Speedup)
+            // If Free Energy change is less than threshold (e.g., 0.01%), the belief is stable.
+            if step > 2 {
+                let fe_delta = (prev_fe - fe).abs() / fe.max(1e-6);
+                if fe_delta < self.config.convergence_threshold {
+                    tracing::trace!("PC converged at step {}", step);
+                    break;
+                }
             }
+            prev_fe = fe;
         }
         
         stats.total_surprise = stats.free_energy_history.iter().sum::<f32>();
@@ -472,6 +451,20 @@ impl PredictiveCoding {
             level.rollback()?;
         }
         tracing::warn!("PC weights rolled back due to unstable Free Energy rise.");
+        Ok(())
+    }
+
+    /// Resets all temporary and cache states between sequences to prevent bleed-over
+    pub fn reset_state(&mut self) -> Result<(), PCError> {
+        for level in &mut self.levels {
+            level.beliefs = level.beliefs.zeros_like()?;
+            level.prev_beliefs = level.prev_beliefs.zeros_like()?;
+            level.predictions = level.predictions.zeros_like()?;
+            level.errors = level.errors.zeros_like()?;
+            level.last_prediction_input = None;
+            level.last_spatial_prediction = None;
+            level.is_dirty = true;
+        }
         Ok(())
     }
 
@@ -999,6 +992,54 @@ mod explosion_tests {
             assert!(row[0].is_finite());
             assert!(row[0] <= 10.1, "Belief exceeded clamp limit: {}", row[0]);
             assert!(row[0] >= -10.1, "Belief exceeded clamp limit: {}", row[0]);
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod state_reset_tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn test_reset_state_clears_all_caches_and_prevents_bleeding() -> Result<(), PCError> {
+        let config = PCConfig::new(2, vec![4, 2]);
+        let mut pc = PredictiveCoding::new(config)?;
+        let device = Device::Cpu;
+
+        let input = Tensor::randn(0f32, 1.0, (4, 1), &device)?;
+        
+        // Run inference to populate internal caches, beliefs, and temporal states
+        pc.infer(&input, 5)?;
+        
+        // Verify caches are actually populated
+        assert!(pc.levels[0].last_prediction_input.is_some(), "last_prediction_input cache wasn't populated");
+        assert!(pc.levels[0].last_spatial_prediction.is_some(), "last_spatial_prediction cache wasn't populated");
+        
+        // Verify beliefs are non-zero
+        let b_sum: f32 = pc.levels[0].beliefs.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(b_sum > 0.0);
+
+        // Perform the state reset (simulating a paragraph/document boundary)
+        pc.reset_state()?;
+
+        // Check everything was wiped cleanly
+        for (i, level) in pc.levels.iter().enumerate() {
+            assert!(level.last_prediction_input.is_none(), "Level {} last_prediction_input cache was not cleared", i);
+            assert!(level.last_spatial_prediction.is_none(), "Level {} last_spatial_prediction cache was not cleared", i);
+            
+            let b_sum: f32 = level.beliefs.abs()?.sum_all()?.to_scalar::<f32>()?;
+            assert_eq!(b_sum, 0.0, "Level {} Beliefs were not zeroed out", i);
+            
+            let pb_sum: f32 = level.prev_beliefs.abs()?.sum_all()?.to_scalar::<f32>()?;
+            assert_eq!(pb_sum, 0.0, "Level {} prev_beliefs were not zeroed out", i);
+
+            let err_sum: f32 = level.errors.abs()?.sum_all()?.to_scalar::<f32>()?;
+            assert_eq!(err_sum, 0.0, "Level {} errors were not zeroed out", i);
+            
+            assert!(level.is_dirty, "Level {} should be marked dirty after reset", i);
         }
 
         Ok(())

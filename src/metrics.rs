@@ -20,6 +20,13 @@ pub const AGENT_VERIFICATION_FAILURE_TOTAL: &str = "agent.verification_failure_t
 pub const SLEEP_EPISODES_CONSOLIDATED_TOTAL: &str = "sleep.episodes_consolidated_total";
 pub const COGNITIVE_CHUNKS_DISCOVERED_TOTAL: &str = "cognitive.chunks_discovered_total";
 
+// Документная обработка/Обучение
+pub const DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL: &str = "document.paragraphs_processed_total";
+pub const DOCUMENT_PROCESSING_PERCENT: &str = "document.processing_percent";
+pub const DOCUMENT_PARAGRAPHS_PER_SECOND: &str = "document.paragraphs_per_second";
+pub const DOCUMENT_LEARNING_TIME_SECONDS: &str = "document.learning_time_seconds";
+pub const DOCUMENT_FILES_PROCESSED_TOTAL: &str = "document.files_processed_total";
+
 /// Тип значения метрики
 #[derive(Debug, Clone)]
 pub enum MetricValue {

@@ -128,7 +128,36 @@ impl NodeLoop {
                     });
                 }
                 _ = dream_phase_check_interval.tick() => {
-                    self.check_and_trigger_dream_phase().await?;
+                    // 🔴 FIX: Do not block the event loop while dreaming!
+                    // If we `await` here directly, the node completely stops responding to HTTP/Nostr events.
+                    let sleep_mgr_clone = self.sleep_manager.clone();
+                    let pc_hierarchy_clone = self.pc_hierarchy.clone();
+                    let last_activity_clone = self.last_activity_time.clone();
+                    let interval_clone = self.dream_phase_interval;
+
+                    tokio::spawn(async move {
+                        let last_activity = *last_activity_clone.read().await;
+                        let inactivity_duration = std::time::Instant::now().duration_since(last_activity);
+                        
+                        if inactivity_duration >= interval_clone {
+                            tracing::info!(
+                                "Inactivity detected ({:?}), triggering sleep phase for memory consolidation",
+                                inactivity_duration
+                            );
+                            
+                            if let Some(sleep_mgr) = sleep_mgr_clone {
+                                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
+                                    tracing::error!("Sleep cycle failed: {}", e);
+                                }
+                            } else if let Some(pc) = pc_hierarchy_clone {
+                                let _pc_write = pc.write().await;
+                                tracing::info!("Basic dream phase running (offline weight consolidation)");
+                            }
+                            
+                            // Reset activity time to prevent immediate retrigger
+                            *last_activity_clone.write().await = std::time::Instant::now();
+                        }
+                    });
                 }
                 // Periodic wake-up to check stop signal when no events are pending
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {

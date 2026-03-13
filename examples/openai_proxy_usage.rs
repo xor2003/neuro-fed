@@ -4,7 +4,7 @@ use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::openai_proxy::{OpenAiProxy, create_router};
 use neuro_fed_node::openai_proxy::components::ProxyConfig;
-use neuro_fed_node::types::{DeviceType, CognitiveDictionary};
+use neuro_fed_node::types::{DeviceType, CognitiveDictionary, StudyState};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create OpenAI Proxy
     println!("4. Creating OpenAI Smart Proxy...");
+    let study_state = Arc::new(RwLock::new(StudyState::default()));
     let proxy = Arc::new(OpenAiProxy::new(
         config,
         proxy_config,
@@ -62,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         512, // embedding_dim from PC config
         thought_decoder,
         cognitive_dict,
+        study_state,
     ));
 
     // 5. Start the proxy server (in a separate task)

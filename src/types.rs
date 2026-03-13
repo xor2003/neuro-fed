@@ -338,6 +338,23 @@ impl CognitiveDictionary {
     }
 }
 
+/// Holds statistics about the last completed study task.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastStudyTask {
+    pub file_name: String,
+    pub paragraphs_processed: u64,
+    pub duration_seconds: f64,
+}
+
+/// A thread-safe, shared state for tracking document study progress.
+#[derive(Debug, Clone, Default)]
+pub struct StudyState {
+    pub is_studying: bool,
+    pub current_file: String,
+    pub progress_percent: f64,
+    pub last_task: Option<LastStudyTask>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

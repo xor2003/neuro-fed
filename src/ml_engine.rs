@@ -12,6 +12,7 @@ use tracing::warn;
 use crate::types::{DeviceType, MLError};
 use crate::model_manager::ModelManager;
 
+#[derive(Clone)]
 pub struct MLEngine {
     token_embeddings: Tensor,
     lm_head: Tensor,

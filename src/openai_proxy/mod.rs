@@ -10,7 +10,6 @@ use axum::{
     routing::post,
 };
 use serde::Serialize;
-use tracing::{info, warn};
 use chrono::Utc;
 
 pub mod metrics;
@@ -23,7 +22,7 @@ pub mod streaming;
 use crate::ml_engine::MLEngine;
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::pc_decoder::ThoughtDecoder;
-use crate::types::{CognitiveDictionary, StructuredState, Episode};
+use crate::types::{CognitiveDictionary, StructuredState, Episode, StudyState};
 use crate::config::NodeConfig;
 use crate::openai_proxy::metrics::ProxyMetrics;
 use crate::openai_proxy::types::{ProxyError, OpenAiRequest, OpenAiResponse, Message, Choice, Usage};
@@ -49,22 +48,7 @@ pub struct OpenAiProxy {
     
     episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
-    pub ui_state: Arc<RwLock<UiState>>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct UiState {
-    pub status: String,
-    pub steps: Vec<String>,
-    pub last_response: Option<String>,
-    pub last_source: Option<String>,
-    pub estimated_remote_cost_usd: f64,
-    pub last_saved_usd: f64,
-    pub saved_total_usd: f64,
-    pub progress_current: u32,
-    pub progress_total: u32,
-    pub progress_percent: f32,
-    pub last_updated: i64,
+    pub study_state: Arc<RwLock<StudyState>>,
 }
 
 impl OpenAiProxy {
@@ -76,6 +60,7 @@ impl OpenAiProxy {
         embedding_dim: usize,
         thought_decoder: Arc<RwLock<ThoughtDecoder>>,
         cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
+        study_state: Arc<RwLock<StudyState>>,
     ) -> Self {
         let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
         OpenAiProxy {
@@ -90,7 +75,7 @@ impl OpenAiProxy {
             cache: None,
             episodic_memory: Arc::new(RwLock::new(VecDeque::new())),
             calibration: Arc::new(RwLock::new(CalibrationStore::default())),
-            ui_state: Arc::new(RwLock::new(UiState::default())),
+            study_state,
         }
     }
 
@@ -108,15 +93,6 @@ impl OpenAiProxy {
             req.messages = req.messages[start..].to_vec();
         }
         let estimated_prompt_tokens = estimate_tokens_from_messages(&req.messages);
-        {
-            let mut ui = self.ui_state.write().await;
-            ui.status = "processing".to_string();
-            ui.steps.clear();
-            ui.progress_current = 0;
-            ui.progress_total = 0;
-            ui.progress_percent = 0.0;
-            ui.last_updated = Utc::now().timestamp();
-        }
         {
             let mut metrics = self.metrics.write().await;
             metrics.total_requests += 1;
@@ -136,13 +112,6 @@ impl OpenAiProxy {
 
         // Step 1: PC-only attempt
         {
-            let mut ui = self.ui_state.write().await;
-            ui.status = "PC reasoning".to_string();
-            ui.steps.push("PC reasoning".to_string());
-            ui.progress_total = 3;
-            ui.progress_current = 1;
-            ui.progress_percent = 33.0;
-            ui.last_updated = Utc::now().timestamp();
         }
         
         match self.local_engine.read().await.process_text_sequence(&state.raw_query).await {
@@ -188,9 +157,6 @@ impl OpenAiProxy {
 
                 if let Some(err) = err_msg {
                     pc_error = Some(err.clone());
-                    let mut ui = self.ui_state.write().await;
-                    ui.steps.push(err);
-                    ui.last_updated = Utc::now().timestamp();
                 } else if let (Some(belief), Some(pc_stats)) = (belief_opt, stats_opt) {
                     initial_novelty = pc_stats.novelty_score;
                     raw_confidence = pc_stats.confidence_score;
@@ -202,9 +168,6 @@ impl OpenAiProxy {
                                 let msg = format!("PC output low confidence (max={:.4}) — trying remote LLM", max_logit);
                                 tracing::info!("{}", msg);
                                 pc_error = Some(msg.clone());
-                                let mut ui = self.ui_state.write().await;
-                                ui.steps.push(msg);
-                                ui.last_updated = Utc::now().timestamp();
                                 final_text.clear();
                             } else {
                                 final_text = decoded;
@@ -221,12 +184,6 @@ impl OpenAiProxy {
 
         // Step 2: Remote LLM attempt
         if final_text.trim().is_empty() {
-            let mut ui = self.ui_state.write().await;
-            ui.status = "Remote LLM request".to_string();
-            ui.steps.push("Remote LLM request".to_string());
-            ui.progress_current = 2;
-            ui.last_updated = Utc::now().timestamp();
-            drop(ui);
             match self.forward_to_remote(&req).await {
                 Ok(resp) => {
                     if let Some(choice) = resp.choices.first() {
@@ -247,12 +204,6 @@ impl OpenAiProxy {
 
         // Step 3: Local LLM attempt
         if final_text.trim().is_empty() {
-            let mut ui = self.ui_state.write().await;
-            ui.status = "Local LLM request".to_string();
-            ui.steps.push("Local LLM request".to_string());
-            ui.progress_current = 3;
-            ui.last_updated = Utc::now().timestamp();
-            drop(ui);
             match self.forward_to_local(&req).await {
                 Ok(resp) => {
                     if let Some(choice) = resp.choices.first() {
@@ -279,7 +230,7 @@ impl OpenAiProxy {
             final_text = format!("No response from PC, remote LLM, or local LLM. {}", details.join(" | "));
         }
 
-        let verification_result: Result<String, String> = Ok("Verification skipped".to_string());
+        let _verification_result: Result<String, String> = Ok("Verification skipped".to_string());
         let success = !final_text.starts_with("No response");
 
         if success && self.config.proxy_config.pc_learning_enabled {
@@ -315,18 +266,6 @@ impl OpenAiProxy {
         let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
         let actual_cost = if last_source == "remote_llm" { (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD } else { 0.0 };
         let saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD - actual_cost).max(0.0);
-
-        {
-            let mut ui = self.ui_state.write().await;
-            ui.status = if success { "done".to_string() } else { "error".to_string() };
-            ui.last_response = Some(final_text.clone());
-            ui.last_source = Some(last_source.to_string());
-            ui.last_saved_usd = saved;
-            ui.saved_total_usd += saved;
-            ui.progress_current = 3;
-            ui.progress_percent = 100.0;
-            ui.last_updated = Utc::now().timestamp();
-        }
 
         let response = OpenAiResponse {
             id: format!("agent-{}", Utc::now().timestamp()),

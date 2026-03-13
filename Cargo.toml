@@ -19,9 +19,9 @@ path = "src/bin/neurofed-tauri.rs"
 
 # Core dependencies
 
-candle-core = "0.9"
-candle-nn = { version = "0.9" }
-candle-transformers = { version = "0.9" }
+candle-core = { version = "0.9", features = ["mkl"]}
+candle-nn = { version = "0.9", features = ["mkl"]}
+candle-transformers = { version = "0.9", features = ["mkl"]}
 anyhow = "1.0"
 notify = "8.2"
 ring = "0.17"
