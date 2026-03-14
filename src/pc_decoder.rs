@@ -106,6 +106,13 @@ impl ThoughtDecoder {
 
                 for (&lp, &token_id) in top_k_log_probs_vec.iter().zip(top_k_indices_vec.iter()) {
                     let mut new_seq = seq.clone();
+                    
+                    // 🔴 ADD REPETITION PENALTY
+                    let mut penalty = 0.0;
+                    if seq.contains(&token_id) {
+                        penalty = 2.0; // Discourage repeating "Define_function"
+                    }
+                    
                     new_seq.push(token_id);
                     
                     let cost = action_costs
@@ -113,7 +120,7 @@ impl ThoughtDecoder {
                         .copied()
                         .unwrap_or(0.0);
                         
-                    let new_raw_score = raw_score + lp - cost;
+                    let new_raw_score = raw_score + lp - cost - penalty;
                     let norm_score = new_raw_score / (new_seq.len() as f32).powf(0.7);
                     
                     let done = token_id == 7; // EOF

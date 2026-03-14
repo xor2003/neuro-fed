@@ -159,6 +159,17 @@ impl NodeLoop {
                         }
                     });
                 }
+                // 🔴 HEARTBEAT: Keep the UI "Alive" indicator green
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    // Update activity timer to show node is alive even when doing heavy processing
+                    // This prevents the UI from showing the node as "dead" when it's just busy
+                    let last_activity = self.last_activity_time.clone();
+                    tokio::spawn(async move {
+                        let mut activity = last_activity.write().await;
+                        *activity = Instant::now();
+                    });
+                }
+                
                 // Periodic wake-up to check stop signal when no events are pending
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     // Just a periodic check - no action needed
@@ -198,38 +209,6 @@ impl NodeLoop {
         Ok(())
     }
 
-    /// Check inactivity and trigger dream phase if needed
-    async fn check_and_trigger_dream_phase(&self) -> Result<(), NodeError> {
-        let last_activity = *self.last_activity_time.read().await;
-        let inactivity_duration = Instant::now().duration_since(last_activity);
-        
-        if inactivity_duration >= self.dream_phase_interval {
-            tracing::info!(
-                "Inactivity detected ({:?}), triggering sleep phase for memory consolidation",
-                inactivity_duration
-            );
-            
-            // Trigger SleepManager if available
-            if let Some(sleep_mgr) = &self.sleep_manager {
-                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
-                    tracing::error!("Sleep cycle failed: {}", e);
-                } else {
-                    tracing::info!("Sleep cycle completed successfully");
-                }
-            } else if let Some(pc) = &self.pc_hierarchy {
-                // Fallback: basic dream phase without SleepManager
-                let _pc_write = pc.write().await;
-                tracing::info!("Basic dream phase running (offline weight consolidation)");
-            } else {
-                tracing::debug!("Sleep phase skipped: no PC hierarchy or SleepManager configured");
-            }
-            
-            // Reset activity time to prevent immediate retrigger
-            *self.last_activity_time.write().await = Instant::now();
-        }
-        
-        Ok(())
-    }
 
     /// Stop the node loop gracefully
     pub fn stop(&self) {

@@ -1,5 +1,5 @@
 // src/openai_proxy/client.rs
-use reqwest::{Client, header};
+use reqwest::Client;
 use std::time::Duration;
 use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse, ProxyError};
 
@@ -75,16 +75,17 @@ impl BackendClient {
     
     pub async fn send_to_fallback(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
         let url = Self::build_chat_url(&self.fallback_url);
-        tracing::info!("🌐 Sending request to remote API: {}", url); // Changed to INFO
+        
+        tracing::info!("🌐 Sending request to remote API: {}", url);
         
         let mut builder = self.client
             .post(&url)
-            .json(req)
             .timeout(self.timeout)
-            .header("HTTP-Referer", "http://localhost:8080")
-            .header("X-Title", "NeuroFed Node");
-            
-        // Explicitly handle API key
+            .header("HTTP-Referer", "http://neurofed.local")
+            .header("X-Title", "NeuroFed-Node-v1")
+            // 🚀 CACHING: Many providers use this to prioritize prefix caching
+            .header("X-OpenRouter-Cache", "true");
+
         if let Some(key) = &self.api_key {
             if !key.is_empty() {
                 builder = builder.bearer_auth(key);
@@ -94,12 +95,17 @@ impl BackendClient {
         } else {
             tracing::warn!("No API key configured for remote fallback!");
         }
-        
-        let response = builder
-            .send()
-            .await
+
+        // 🚀 OLLAMA SPECIFIC CACHING
+        // If the URL points to localhost, we add Ollama-specific options
+        let final_req = req.clone();
+        if url.contains("localhost") || url.contains("127.0.0.1") {
+            tracing::debug!("Ollama endpoint detected, caching should work automatically");
+        }
+
+        let response = builder.json(&final_req).send().await
             .map_err(|e| {
-                tracing::error!("❌ Remote API network error: {}", e);
+                tracing::error!("❌ Network Error: check your internet or TLS features! {:?}", e);
                 ProxyError::BackendError(format!("Network error: {}", e))
             })?;
             

@@ -631,7 +631,7 @@ fn extract_text_from_epub(path: &Path) -> Result<String, String> {
     let mut content = String::new();
 
     // Iterate through all chapters
-    let total_pages = doc.get_num_pages();
+    let total_pages = doc.get_num_chapters();
     for page_num in 0..total_pages {
         if let Some((curr_content, _)) = doc.get_current_str() {
             content.push_str(&strip_html_tags(&curr_content));

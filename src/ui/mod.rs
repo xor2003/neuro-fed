@@ -39,12 +39,23 @@ async fn ui_styles() -> Response {
 }
 
 async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai_proxy::metrics::ProxyMetrics> {
-    // Read from both the standard metrics and the new study state
-    let metrics_lock = proxy.metrics.read().await;
-    let study_state_lock = proxy.study_state.read().await;
+    // 1. Get lock-free metrics from the global METRICS store
+    let _telemetry = crate::metrics::METRICS.get_snapshot();
+    
+    // 2. Get StudyState with a TRY lock to prevent UI freezing
+    let study = match proxy.study_state.try_read() {
+        Ok(s) => s.clone(),
+        Err(_) => crate::types::StudyState::default(), // Fallback if busy
+    };
+
+    // 3. Try to get proxy metrics with a TRY lock
+    let proxy_metrics = match proxy.metrics.try_read() {
+        Ok(m) => m.clone(),
+        Err(_) => crate::openai_proxy::metrics::ProxyMetrics::default(), // Fallback if busy
+    };
 
     // Create the summary string for the last completed task
-    let summary = if let Some(last_task) = &study_state_lock.last_task {
+    let summary = if let Some(last_task) = &study.last_task {
         format!(
             "Studied {} ({} paragraphs) in {:.2}s",
             last_task.file_name, last_task.paragraphs_processed, last_task.duration_seconds
@@ -53,21 +64,21 @@ async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai
         "No documents studied yet.".to_string()
     };
 
-    // Combine data from both sources into a single response
+    // Combine data from all sources into a single response
     let combined_metrics = crate::openai_proxy::metrics::ProxyMetrics {
-        total_requests: metrics_lock.total_requests,
-        total_processing_time_ms: metrics_lock.total_processing_time_ms,
-        cache_hits: metrics_lock.cache_hits,
-        cache_misses: metrics_lock.cache_misses,
-        pc_inference_calls: metrics_lock.pc_inference_calls,
-        pc_learning_calls: metrics_lock.pc_learning_calls,
-        thought_decoder_calls: metrics_lock.thought_decoder_calls,
-        errors: metrics_lock.errors,
+        total_requests: proxy_metrics.total_requests,
+        total_processing_time_ms: proxy_metrics.total_processing_time_ms,
+        cache_hits: proxy_metrics.cache_hits,
+        cache_misses: proxy_metrics.cache_misses,
+        pc_inference_calls: proxy_metrics.pc_inference_calls,
+        pc_learning_calls: proxy_metrics.pc_learning_calls,
+        thought_decoder_calls: proxy_metrics.thought_decoder_calls,
+        errors: proxy_metrics.errors,
 
         // Populate the new fields from the study state
-        is_studying: study_state_lock.is_studying,
-        study_progress: study_state_lock.progress_percent,
-        current_study_file: study_state_lock.current_file.clone(),
+        is_studying: study.is_studying,
+        study_progress: study.progress_percent,
+        current_study_file: study.current_file.clone(),
         last_study_summary: summary,
     };
 

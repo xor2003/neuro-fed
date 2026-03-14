@@ -2,7 +2,7 @@
 // Pure Predictive Coding (PC) implementation based on Rao-Ballard/Friston free-energy minimization
 // Migrated from ndarray to candle-core for GPU acceleration
 
-use candle_core::{Device, Tensor, DType, Result as CandleResult};
+use candle_core::{Device, Tensor, Result as CandleResult};
 use tokio::sync::mpsc;
 use chrono;
 
@@ -34,7 +34,6 @@ pub struct PrecisionHyperNet {
     // Small MLP: surprise_scalar -> [hidden] -> precision_scaling_factors
     weights1: Tensor,  // (1, hidden_dim)
     weights2: Tensor,  // (hidden_dim, max_levels)
-    hidden_dim: usize,
     max_levels: usize,
 }
 
@@ -47,7 +46,6 @@ impl PrecisionHyperNet {
         Ok(Self {
             weights1,
             weights2,
-            hidden_dim,
             max_levels,
         })
     }
@@ -86,14 +84,14 @@ impl PrecisionHyperNet {
     }
     
     /// Update hyper-network weights based on performance feedback
-    pub fn update(&mut self, surprise_scalar: f32, target_scales: &[f32], learning_rate: f32, device: &Device) -> CandleResult<()> {
+    pub fn update(&mut self, surprise_scalar: f32, target_scales: &[f32], _learning_rate: f32, device: &Device) -> CandleResult<()> {
         // Simple gradient descent update for demonstration
         // In a full implementation, this would use backpropagation through the hyper-network
         let current_scales = self.compute_precision_scales(surprise_scalar, device)?;
         
         // Compute error and update weights (simplified)
         for i in 0..self.max_levels.min(target_scales.len()) {
-            let error = target_scales[i] - current_scales[i];
+            let _error = target_scales[i] - current_scales[i];
             // Simplified update - in reality would need proper backprop
             // This is a placeholder for the actual learning rule
         }
@@ -290,6 +288,9 @@ impl PredictiveCoding {
             let fe = self.compute_free_energy()?;
             stats.free_energy_history.push(fe);
 
+            // 🔴 ADD THIS: Push live telemetry to the Lock-Free metrics store
+            crate::gauge!(crate::metrics::PC_FREE_ENERGY, fe as f64);
+
             if fe > self.config.surprise_threshold {
                 stats.high_surprise_indices.push(step);
             }
@@ -321,6 +322,11 @@ impl PredictiveCoding {
         // 🔴 BOTTLENECK DETECTION
         self.detect_saturation(&stats);
         
+        // 🔴 ADD THIS: Update surprise metrics
+        if let Some(last_fe) = stats.free_energy_history.last() {
+            crate::gauge!("pc.latest_surprise", *last_fe as f64);
+        }
+        
         Ok(stats)
     }
 
@@ -343,7 +349,7 @@ impl PredictiveCoding {
         }
     }
     
-    pub fn learn(&mut self, input: &Tensor, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
+    pub fn learn(&mut self, input: &Tensor, _context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
         // Perform inference to compute errors
         let stats = self.infer(input, self.config.inference_steps)?;
         

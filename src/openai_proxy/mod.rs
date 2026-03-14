@@ -9,7 +9,6 @@ use axum::{
     Router,
     routing::post,
 };
-use serde::Serialize;
 use chrono::Utc;
 
 pub mod metrics;
@@ -32,7 +31,6 @@ use crate::openai_proxy::calibration::CalibrationStore;
 use crate::openai_proxy::client::BackendClient;
 
 const REMOTE_PRICE_PER_1K_TOKENS_USD: f64 = 0.002;
-const LOCAL_PRICE_PER_1K_TOKENS_USD: f64 = 0.0;
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
@@ -111,8 +109,10 @@ impl OpenAiProxy {
         let mut remote_error: Option<String> = None;
         let mut local_error: Option<String> = None;
 
-        // Step 1: PC-only attempt
-        tracing::info!("🧠 Starting PC reasoning...");
+        // 🚀 PART 1: LOGGING FIX - Log BEFORE the blocking task
+        tracing::info!("🤖 STARTING COGNITIVE STEP: Attempting PC Inference first...");
+        
+        let mut pc_thoughts_string = String::new();
         
         match self.local_engine.read().await.process_text_sequence(&state.raw_query).await {
             Ok(query_seq) => {
@@ -125,84 +125,80 @@ impl OpenAiProxy {
                     }
                 }
                 
-                // 🔴 FIX: PARALLEL INFERENCE
-                // Instead of locking the main brain, we clone its state into a local thread
-                let pc_config = self.pc_hierarchy.read().await.config.clone();
-                let pc_device = self.pc_hierarchy.read().await.device.clone();
-                let pc_weights = self.pc_hierarchy.read().await.get_level_weights().unwrap_or_default();
-                let embedding_dim = self.embedding_dim;
-                
-                let (belief_opt, stats_opt, err_msg) = tokio::task::spawn_blocking(move || {
-                    let mut local_pc = match PredictiveCoding::new_with_device(pc_config, pc_device) {
-                        Ok(pc) => pc,
-                        Err(e) => return (None, None, Some(format!("Failed to init PC clone: {}", e))),
-                    };
-                    if let Err(e) = local_pc.load_level_weights(pc_weights) {
-                        return (None, None, Some(format!("Failed to load weights into PC clone: {}", e)));
-                    }
+                // 🚀 PART 2: PC GUIDANCE & LOGGING
+                let pc_result = {
+                    let pc_config = self.pc_hierarchy.read().await.config.clone();
+                    let pc_device = self.pc_hierarchy.read().await.device.clone();
+                    let pc_weights = self.pc_hierarchy.read().await.get_level_weights().unwrap_or_default();
+                    let query_seq_tensor = query_seq.clone();
                     
-                    match local_pc.infer_sequence(&query_seq, 5) {
-                        Ok(stats) => {
-                            let expected_dims =[embedding_dim, 1];
-                            let belief = if local_pc.levels.first().map(|l| l.beliefs.dims()) == Some(expected_dims.as_slice()) {
-                                local_pc.levels.first().unwrap().beliefs.clone()
-                            } else {
-                                local_pc.levels.last().unwrap().beliefs.clone()
-                            };
-                            (Some(belief), Some(stats), None)
-                        }
-                        Err(e) => (None, None, Some(format!("PC inference failed: {}", e))),
-                    }
-                }).await.unwrap_or((None, None, Some("Inference task panicked".to_string())));
+                    tokio::task::spawn_blocking(move || {
+                        let mut local_pc = PredictiveCoding::new_with_device(pc_config, pc_device).ok()?;
+                        local_pc.load_level_weights(pc_weights).ok()?;
+                        let stats = local_pc.infer_sequence(&query_seq_tensor, 5).ok()?;
+                        let belief = local_pc.levels.last()?.beliefs.clone();
+                        Some((belief, stats))
+                    }).await.unwrap_or(None)
+                };
 
-                if let Some(err) = err_msg {
-                    pc_error = Some(err.clone());
-                    tracing::error!("❌ PC inference error: {}", err);
-                } else if let (Some(belief), Some(pc_stats)) = (belief_opt, stats_opt) {
-                    initial_novelty = pc_stats.novelty_score;
-                    raw_confidence = pc_stats.confidence_score;
-                    
-                    // 🔴 FIX: USE THOUGHT DECODER, NOT GREEDY LM_HEAD PROJECTION
+                if let Some((belief, stats)) = pc_result {
+                    raw_confidence = stats.confidence_score;
+                    initial_novelty = stats.novelty_score;
+
                     let decoder = self.thought_decoder.read().await;
                     let dict = self.cognitive_dict.read().await;
                     
-                    match decoder.decode_sequence(&belief, 10, 3) {
-                        Ok(sequence) => {
-                            thought_trajectory = sequence.clone();
-                            
-                            // Translate thought IDs back into words/concepts
-                            let mut thoughts = Vec::new();
-                            for id in sequence {
-                                thoughts.push(dict.get_op(id).to_string());
-                            }
-                            
-                            let decoded_thoughts = thoughts.join(" -> ");
-                            
-                            // 🔴 FIX: ALWAYS log the PC's internal thoughts and confidence
-                            tracing::info!("🧠 PC Thought Trajectory: {}", decoded_thoughts);
-                            tracing::info!("🧠 PC Confidence: {:.4} | Novelty: {:.4}", pc_stats.confidence_score, pc_stats.novelty_score);
-                            
-                            if pc_stats.confidence_score > 0.6 {
-                                tracing::info!("✅ PC is confident. Using thoughts to guide LLM.");
-                                // We don't set final_text here. We let the fallback logic run,
-                                // but we could modify the `req` to include these thoughts.
-                            } else {
-                                let msg = format!("⚠️ PC output low confidence ({:.4}) — falling back to LLMs", pc_stats.confidence_score);
-                                tracing::info!("{}", msg);
-                                pc_error = Some(msg.clone());
-                            }
+                    if let Ok(seq) = decoder.decode_sequence(&belief, 10, 3) {
+                        thought_trajectory = seq.clone();
+                        let thoughts: Vec<String> = seq.iter().map(|id| dict.get_op(*id).to_string()).collect();
+                        pc_thoughts_string = thoughts.join(" -> ");
+                        
+                        // 🚀 FIX: This log will now definitely show up
+                        tracing::info!("🧠 PC Thought Trajectory: {}", pc_thoughts_string);
+                        tracing::info!("🧠 PC confidence: {:.4} (Threshold: 0.6)", raw_confidence);
+                        
+                        if raw_confidence > 0.6 {
+                            tracing::info!("✅ PC is confident. Using thoughts to guide LLM.");
+                        } else {
+                            let msg = format!("⚠️ PC output low confidence ({:.4}) — falling back to LLMs", raw_confidence);
+                            tracing::info!("{}", msg);
+                            pc_error = Some(msg.clone());
                         }
-                        Err(e) => {
-                            pc_error = Some(format!("Thought Decoder failed: {}", e));
-                            tracing::error!("❌ Thought Decoder error: {}", e);
-                        }
+                    } else {
+                        pc_error = Some("Thought Decoder failed".to_string());
+                        tracing::error!("❌ Thought Decoder error");
                     }
+                } else {
+                    tracing::warn!("⚠️ PC Inference failed to return a result.");
+                    pc_error = Some("PC Inference failed".to_string());
                 }
             }
             Err(e) => {
                 pc_error = Some(format!("PC embedding failed: {}", e));
                 tracing::error!("❌ PC embedding error: {}", e);
             }
+        }
+
+        // 🚀 PART 3: PROMPT IMPROVEMENT & CACHING
+        // We inject the PC's thoughts into the LLM's messages.
+        // This makes the LLM follow the PC's logic and improves result quality.
+        if !pc_thoughts_string.is_empty() {
+            let guidance = format!(
+                "[INTERNAL_THOUGHT_PLAN]: {}\n[CONFIDENCE]: {:.2}",
+                pc_thoughts_string, raw_confidence
+            );
+            
+            // Insert guidance as a system-like message at the top for better caching
+            req.messages.insert(0, Message {
+                role: "system".to_string(),
+                content: serde_json::json!(format!(
+                    "You are a NeuroFed executor. Use the provided internal thought plan to craft your answer. {}",
+                    guidance
+                )),
+                name: None,
+            });
+            
+            tracing::info!("📝 Injected PC guidance into LLM prompt for caching");
         }
 
         // Step 2: Remote LLM attempt
@@ -288,7 +284,7 @@ impl OpenAiProxy {
         let estimated_completion_tokens = estimate_tokens_from_text(&final_text);
         let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
         let actual_cost = if last_source == "remote_llm" { (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD } else { 0.0 };
-        let saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD - actual_cost).max(0.0);
+        let _saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD - actual_cost).max(0.0);
 
         let response = OpenAiResponse {
             id: format!("agent-{}", Utc::now().timestamp()),

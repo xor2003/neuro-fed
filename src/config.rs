@@ -230,7 +230,7 @@ impl PCConfig {
             enable_code_verification: false,
             enable_nostr_zap_tracking: false,
             min_zaps_for_consensus: 3,
-            persistence_db_path: None,
+            persistence_db_path: Some("./neurofed.db".to_string()),
             convergence_threshold: 0.01,
             hidden_dim_factor: 0.5,
             surprise_threshold: 2.0,
