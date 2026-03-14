@@ -260,11 +260,12 @@ impl BootstrapManager {
         hasher.update(&content_bytes);
         let content_hash = format!("{:x}", hasher.finalize());
         
-        // Comment out this check temporarily for debugging
-        // if persistence.is_document_studied(&file_path.to_string_lossy(), &content_hash).await? {
-        //     tracing::debug!("Skipping already studied file: {:?}", file_path);
-        //     return Ok(None);
-        // }
+        // 🔴 FIX: UNCOMMENT THIS BLOCK
+        if persistence.is_document_studied(&file_path.to_string_lossy(), &content_hash).await? {
+            tracing::info!("✅ Skipping already studied file: {:?}", file_path);
+            return Ok(None);
+        }
+        // -----------------------------
         
         let text_chunks: Vec<String> = match ext {
             "parquet" => {

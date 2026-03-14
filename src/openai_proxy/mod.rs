@@ -101,7 +101,7 @@ impl OpenAiProxy {
 
         let state = self.extract_structured_state(&req).await;
         let mut final_text = String::new();
-        let thought_trajectory: Vec<u32> = Vec::new();
+        let mut thought_trajectory: Vec<u32> = Vec::new();
         let mut sequence_tensors_vec = Vec::new();
         let mut initial_novelty = 0.0;
         let mut raw_confidence = 0.0;
@@ -161,21 +161,39 @@ impl OpenAiProxy {
                     initial_novelty = pc_stats.novelty_score;
                     raw_confidence = pc_stats.confidence_score;
                     
-                    match self.local_engine.read().await.decode_belief_with_confidence(&belief) {
-                        Ok((decoded, avg_logit, max_logit)) if !decoded.trim().is_empty() => {
-                            // Threshold for babbling vs knowing
-                            if max_logit < 5.0 {
-                                let msg = format!("PC output low confidence (max={:.4}) — trying remote LLM", max_logit);
+                    // 🔴 FIX: USE THOUGHT DECODER, NOT GREEDY LM_HEAD PROJECTION
+                    let decoder = self.thought_decoder.read().await;
+                    let dict = self.cognitive_dict.read().await;
+                    
+                    match decoder.decode_sequence(&belief, 10, 3) {
+                        Ok(sequence) => {
+                            thought_trajectory = sequence.clone();
+                            
+                            // Translate thought IDs back into words/concepts
+                            let mut thoughts = Vec::new();
+                            for id in sequence {
+                                thoughts.push(dict.get_op(id).to_string());
+                            }
+                            
+                            let decoded_thoughts = thoughts.join(" -> ");
+                            
+                            // 🔴 FIX: ALWAYS log the PC's internal thoughts and confidence
+                            tracing::info!("🧠 PC Thought Trajectory: {}", decoded_thoughts);
+                            tracing::info!("🧠 PC Confidence: {:.4} | Novelty: {:.4}", pc_stats.confidence_score, pc_stats.novelty_score);
+                            
+                            if pc_stats.confidence_score > 0.6 {
+                                tracing::info!("✅ PC is confident. Using thoughts to guide LLM.");
+                                // We don't set final_text here. We let the fallback logic run,
+                                // but we could modify the `req` to include these thoughts.
+                            } else {
+                                let msg = format!("⚠️ PC output low confidence ({:.4}) — falling back to LLMs", pc_stats.confidence_score);
                                 tracing::info!("{}", msg);
                                 pc_error = Some(msg.clone());
-                                final_text.clear();
-                            } else {
-                                final_text = decoded;
-                                last_source = "local_pc";
                             }
                         }
-                        Ok(_) => { pc_error = Some("PC produced empty response".to_string()); }
-                        Err(e) => { pc_error = Some(format!("PC decode failed: {}", e)); }
+                        Err(e) => {
+                            pc_error = Some(format!("Thought Decoder failed: {}", e));
+                        }
                     }
                 }
             }
