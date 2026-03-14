@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
     let proxy = Arc::new(OpenAiProxy::new(
         config.clone(), proxy_config, ml_engine.clone(), pc_hierarchy.clone(), embedding_dim, thought_decoder.clone(), cognitive_dict.clone(),
         study_state.clone(),
+        episodic_memory.clone(),
     ));
 
     // Initialize Nostr federation and brain sharing (config-driven)

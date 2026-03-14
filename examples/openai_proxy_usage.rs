@@ -4,9 +4,10 @@ use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::openai_proxy::{OpenAiProxy, create_router};
 use neuro_fed_node::openai_proxy::components::ProxyConfig;
-use neuro_fed_node::types::{DeviceType, CognitiveDictionary, StudyState};
+use neuro_fed_node::types::{DeviceType, CognitiveDictionary, StudyState, Episode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::collections::VecDeque;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Create OpenAI Proxy
     println!("4. Creating OpenAI Smart Proxy...");
     let study_state = Arc::new(RwLock::new(StudyState::default()));
+    let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
     let proxy = Arc::new(OpenAiProxy::new(
         config,
         proxy_config,
@@ -64,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thought_decoder,
         cognitive_dict,
         study_state,
+        episodic_memory,
     ));
 
     // 5. Start the proxy server (in a separate task)

@@ -61,6 +61,7 @@ impl OpenAiProxy {
         thought_decoder: Arc<RwLock<ThoughtDecoder>>,
         cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
         study_state: Arc<RwLock<StudyState>>,
+        episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
     ) -> Self {
         let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
         OpenAiProxy {
@@ -73,7 +74,7 @@ impl OpenAiProxy {
             cognitive_dict,
             metrics,
             cache: None,
-            episodic_memory: Arc::new(RwLock::new(VecDeque::new())),
+            episodic_memory,
             calibration: Arc::new(RwLock::new(CalibrationStore::default())),
             study_state,
         }
@@ -111,8 +112,7 @@ impl OpenAiProxy {
         let mut local_error: Option<String> = None;
 
         // Step 1: PC-only attempt
-        {
-        }
+        tracing::info!("🧠 Starting PC reasoning...");
         
         match self.local_engine.read().await.process_text_sequence(&state.raw_query).await {
             Ok(query_seq) => {
@@ -157,6 +157,7 @@ impl OpenAiProxy {
 
                 if let Some(err) = err_msg {
                     pc_error = Some(err.clone());
+                    tracing::error!("❌ PC inference error: {}", err);
                 } else if let (Some(belief), Some(pc_stats)) = (belief_opt, stats_opt) {
                     initial_novelty = pc_stats.novelty_score;
                     raw_confidence = pc_stats.confidence_score;
@@ -193,11 +194,15 @@ impl OpenAiProxy {
                         }
                         Err(e) => {
                             pc_error = Some(format!("Thought Decoder failed: {}", e));
+                            tracing::error!("❌ Thought Decoder error: {}", e);
                         }
                     }
                 }
             }
-            Err(e) => { pc_error = Some(format!("PC embedding failed: {}", e)); }
+            Err(e) => {
+                pc_error = Some(format!("PC embedding failed: {}", e));
+                tracing::error!("❌ PC embedding error: {}", e);
+            }
         }
 
         // Step 2: Remote LLM attempt
