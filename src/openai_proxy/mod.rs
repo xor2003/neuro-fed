@@ -23,7 +23,7 @@ pub mod streaming;
 use crate::ml_engine::MLEngine;
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::pc_decoder::ThoughtDecoder;
-use crate::types::{CognitiveDictionary, StructuredState, Episode, StudyState};
+use crate::types::{CognitiveDictionary, StructuredState, Episode, StudyState, DeviceType};
 use crate::config::NodeConfig;
 use crate::openai_proxy::metrics::ProxyMetrics;
 use crate::openai_proxy::types::{ProxyError, OpenAiRequest, OpenAiResponse, Message, Choice, Usage};
@@ -99,16 +99,9 @@ impl OpenAiProxy {
         {
             let mut metrics = self.metrics.write().await;
             metrics.total_requests += 1;
+            metrics.status_message = "Answering...".to_string();
         }
         let start_time = Instant::now();
-        
-        // 🔴 FIX 3: Update UI Status to show we are currently thinking
-        {
-            let mut state = self.study_state.write().await;
-            state.is_studying = true;
-            state.current_file = "Answering prompt...".to_string();
-            state.progress_percent = 50.0;
-        }
 
         let state = self.extract_structured_state(&req).await;
         let mut final_text = String::new();
@@ -137,24 +130,27 @@ impl OpenAiProxy {
                 }
                 
                 let pc_result = {
-                    let pc_config = self.pc_hierarchy.read().await.config.clone();
-                    let pc_device = self.pc_hierarchy.read().await.device.clone();
-                    let pc_weights = self.pc_hierarchy.read().await.get_level_weights().unwrap_or_default();
-                    let query_seq_tensor = query_seq.clone();
-                    
-                    tokio::task::spawn_blocking(move || {
-                        let mut local_pc = PredictiveCoding::new_with_device(pc_config, pc_device).ok()?;
-                        local_pc.load_level_weights(pc_weights).ok()?;
-                        let stats = local_pc.infer_sequence(&query_seq_tensor, 5).ok()?;
-                        let belief = local_pc.levels.last()?.beliefs.clone();
-                        Some((belief, stats))
-                    }).await.unwrap_or(None)
+                    let mut pc = self.pc_hierarchy.write().await;
+                    match pc.infer_sequence(&query_seq, 5) {
+                        Ok(stats) => {
+                            raw_confidence = stats.confidence_score;
+                            initial_novelty = stats.novelty_score;
+                            match pc.get_top_belief() {
+                                Ok(belief) => Some(belief),
+                                Err(e) => {
+                                    pc_error = Some(format!("Failed to get top belief: {}", e));
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            pc_error = Some(format!("PC inference failed: {}", e));
+                            None
+                        }
+                    }
                 };
 
-                if let Some((belief, stats)) = pc_result {
-                    raw_confidence = stats.confidence_score;
-                    initial_novelty = stats.novelty_score;
-
+                if let Some(belief) = pc_result {
                     let decoder = self.thought_decoder.read().await;
                     let dict = self.cognitive_dict.read().await;
                     
@@ -177,8 +173,8 @@ impl OpenAiProxy {
                         pc_error = Some("Thought Decoder failed".to_string());
                         tracing::error!("❌ Thought Decoder error");
                     }
-                } else {
-                    tracing::warn!("⚠️ PC Inference failed to return a result.");
+                } else if pc_error.is_none() {
+                    tracing::warn!("⚠️ PC Inference failed to return a belief.");
                     pc_error = Some("PC Inference failed".to_string());
                 }
             }
@@ -314,6 +310,13 @@ impl OpenAiProxy {
         };
         
         self.update_metrics_success(start_time.elapsed(), &response).await;
+
+        {
+            let mut metrics = self.metrics.write().await;
+            if metrics.status_message != "Idle" {
+                metrics.status_message = "Idle".to_string();
+            }
+        }
         Ok(response)
     }
 
@@ -459,5 +462,56 @@ mod proxy_integration_tests {
         }
 
         assert!(!state.read().await.is_studying);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_consistency_tests {
+    use super::*;
+    use candle_core::Device;
+    use crate::config::NodeConfig;
+    use crate::types::DeviceType;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_pc_reasoning_is_deterministic() {
+        let config = NodeConfig::default();
+        let device = Device::Cpu;
+        let engine = Arc::new(RwLock::new(MLEngine::new(&config.model_path, DeviceType::default()).unwrap()));
+        let embedding_dim = engine.read().await.embedding_dim();
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(config.pc_config.clone()).unwrap()));
+        let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(512, dict.read().await.len(), &device).unwrap()));
+        let study_state = Arc::new(RwLock::new(StudyState::default()));
+        let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
+        let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
+
+        let proxy = OpenAiProxy::new(
+            config,
+            ProxyConfig::default(),
+            engine,
+            pc_hierarchy.clone(),
+            embedding_dim,
+            thought_decoder,
+            dict,
+            study_state,
+            episodic_memory,
+            calibration,
+            None,
+        );
+
+        let req = OpenAiRequest {
+            model: "test".into(),
+            messages: vec![Message { role: "user".into(), content: json!("Calculate the square root of 144"), name: None }],
+            ..Default::default()
+        };
+
+        let res1 = proxy.handle_chat_completion(req.clone()).await.unwrap();
+        let trajectory1 = res1.choices[0].message.content.to_string();
+
+        let res2 = proxy.handle_chat_completion(req.clone()).await.unwrap();
+        let trajectory2 = res2.choices[0].message.content.to_string();
+
+        assert_eq!(trajectory1, trajectory2, "Amnesia detected! The brain produced different thoughts for the same input on consecutive runs.");
     }
 }

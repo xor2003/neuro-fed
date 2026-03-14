@@ -67,7 +67,7 @@ async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai
     };
 
     // Combine data from all sources into a single response
-    let combined_metrics = crate::openai_proxy::metrics::ProxyMetrics {
+    let mut combined_metrics = crate::openai_proxy::metrics::ProxyMetrics {
         total_requests: proxy_metrics.total_requests,
         total_processing_time_ms: proxy_metrics.total_processing_time_ms,
         cache_hits: proxy_metrics.cache_hits,
@@ -76,6 +76,7 @@ async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai
         pc_learning_calls: proxy_metrics.pc_learning_calls,
         thought_decoder_calls: proxy_metrics.thought_decoder_calls,
         errors: proxy_metrics.errors,
+        status_message: proxy_metrics.status_message.clone(),
 
         // Populate the new fields from the study state
         is_studying: study.is_studying,
@@ -83,6 +84,14 @@ async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai
         current_study_file: study.current_file.clone(),
         last_study_summary: summary,
     };
+
+    if combined_metrics.status_message.is_empty() {
+        if study.is_studying {
+            combined_metrics.status_message = "Studying...".to_string();
+        } else {
+            combined_metrics.status_message = "Idle".to_string();
+        }
+    }
 
     Json(combined_metrics)
 }

@@ -11,6 +11,7 @@ pub struct ProxyMetrics {
     pub thought_decoder_calls: u64,
     pub errors: u64,
 
+    pub status_message: String,
     // --- 🔴 ADD THESE NEW FIELDS ---
     pub is_studying: bool,
     pub study_progress: f64,
