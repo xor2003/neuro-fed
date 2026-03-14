@@ -23,6 +23,8 @@ pub struct PCLevel {
     // Delta propagation cache
     pub last_prediction_input: Option<Tensor>,
     pub last_spatial_prediction: Option<Tensor>,
+    // 🔒 NEURON PROTECTION: Freeze mask to prevent catastrophic forgetting (optional)
+    pub freeze_mask: Option<Tensor>,
 }
 
 impl PCLevel {
@@ -61,6 +63,7 @@ impl PCLevel {
             cached_temporal_eta: None,
             last_prediction_input: None,
             last_spatial_prediction: None,
+            freeze_mask: None,
         })
     }
 
@@ -242,11 +245,17 @@ impl PCLevel {
         }
         
         // Нормализация входа (предотвращает взрывы весов)
+        let input_zero_sum = next_beliefs.sum_all()?.to_scalar::<f32>()?;
         let input_norm = (next_beliefs.sqr()?.sum_all()?.to_scalar::<f32>()? + 1e-6).sqrt();
         let normalized_input = next_beliefs.affine((1.0 / input_norm) as f64, 0.0)?;
         
         // Delta = error * normalized_input^T
-        let delta = error.matmul(&normalized_input.t()?)?;
+        let mut delta = error.matmul(&normalized_input.t()?)?;
+        
+        // 🔒 APPLY NEURON PROTECTION (If enabled)
+        if let Some(mask) = &self.freeze_mask {
+            delta = delta.broadcast_mul(mask)?;
+        }
         
         // L2 decay + большой шаг при Aha!
         let l2_decay = 1e-4;
@@ -294,6 +303,40 @@ impl PCLevel {
         }
         
         self.temporal_weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?;
+        Ok(())
+    }
+    /// 🔴 DIAGNOSTIC: Analyzes if this specific level appears entirely untrained
+    pub fn check_if_random(&self) -> CandleResult<bool> {
+        let (input_dim, _) = self.weights.shape().dims2()?;
+        let expected_var = 1.0 / input_dim as f32;
+        
+        let sqr_sum = self.weights.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let num_elements = self.weights.elem_count() as f32;
+        let actual_var = sqr_sum / num_elements;
+        
+        let diff_ratio = (actual_var - expected_var).abs() / expected_var;
+        // Allow 20% tolerance due to random sampling variance
+        Ok(diff_ratio < 0.2)
+    }
+
+    /// 🧠 NEURON PROTECTION: Freezes specific features from ever being overwritten
+    pub fn freeze_neurons(&mut self, protected_indices: &[usize]) -> CandleResult<()> {
+        let (input_dim, output_dim) = self.weights.shape().dims2()?;
+        
+        // Create a mask of 1.0s (everything plastic/learnable)
+        let mut mask_vec = vec![1.0f32; input_dim * output_dim];
+        
+        // Set the protected indices to 0.0 (unlearnable/frozen)
+        for &idx in protected_indices {
+            if idx < output_dim {
+                for i in 0..input_dim {
+                    mask_vec[i * output_dim + idx] = 0.0;
+                }
+            }
+        }
+        
+        self.freeze_mask = Some(Tensor::from_vec(mask_vec, (input_dim, output_dim), &self.device)?);
+        tracing::info!("🔒 Protected {} neurons from catastrophic forgetting.", protected_indices.len());
         Ok(())
     }
 }
@@ -535,6 +578,87 @@ mod aha_optimizer_tests {
         assert!(weights_norm < 50.0, "Weights exploded! Norm: {}", weights_norm);
         
         println!("✅ Normalized Hebbian test passed: final norm={:.2}", weights_norm);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod neuron_protection_tests {
+    use super::*;
+
+    #[test]
+    fn test_check_if_random_detects_untrained() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let level = PCLevel::new(16, 8, &device)?;
+        
+        // Freshly initialized level should be detected as random
+        let is_random = level.check_if_random()?;
+        assert!(is_random, "Freshly initialized level should be detected as random");
+        println!("✅ Random detection test passed: fresh level correctly identified as random");
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_freeze_neurons_prevents_updates() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let mut level = PCLevel::new(8, 4, &device)?;
+        
+        // Freeze neuron 0 and 2
+        level.freeze_neurons(&[0, 2])?;
+        
+        // Store initial weights for protected columns
+        let initial_weights = level.weights.clone();
+        
+        // Apply a weight update
+        let error = Tensor::full(1.0f32, (8, 1), &device)?;
+        let next = Tensor::full(1.0f32, (4, 1), &device)?;
+        level.update_weights_exact(&error, &next, None)?;
+        
+        // Check that columns 0 and 2 didn't change
+        let new_weights = level.weights;
+        let diff = new_weights.sub(&initial_weights)?;
+        
+        // For each protected neuron (column), all rows should have zero change
+        for &col in &[0, 2] {
+            for row in 0..8 {
+                let idx = row * 4 + col;
+                let change = diff.flatten_all()?.to_vec1::<f32>()?[idx];
+                assert!(
+                    change.abs() < 1e-4,
+                    "Protected neuron (col={}, row={}) changed by {}",
+                    col, row, change
+                );
+            }
+        }
+        
+        // Unprotected columns (1, 3) should have changed
+        let mut any_unprotected_changed = false;
+        for &col in &[1, 3] {
+            for row in 0..8 {
+                let idx = row * 4 + col;
+                let change = diff.flatten_all()?.to_vec1::<f32>()?[idx];
+                if change.abs() > 1e-6 {
+                    any_unprotected_changed = true;
+                    break;
+                }
+            }
+        }
+        assert!(any_unprotected_changed, "Unprotected neurons should have changed");
+        
+        println!("✅ Neuron freezing test passed: protected neurons unchanged, unprotected neurons updated");
+        Ok(())
+    }
+
+    #[test]
+    fn test_freeze_mask_optional_by_default() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let level = PCLevel::new(8, 4, &device)?;
+        
+        // freeze_mask should be None by default
+        assert!(level.freeze_mask.is_none(), "freeze_mask should be None by default");
+        println!("✅ Optional freeze_mask test passed: default is None");
+        
         Ok(())
     }
 }

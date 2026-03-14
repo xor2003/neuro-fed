@@ -810,3 +810,29 @@ mod test_harness_verification_tests {
         assert!(err_msg.contains("Math failed"), "Error missing custom assertion message");
     }
 }
+
+#[cfg(test)]
+mod precision_math_tests {
+    use super::*;
+
+    #[test]
+    fn test_hyper_precision_curve_bounds() {
+        let config = PrecisionConfig::default();
+        let calc = PrecisionCalculator::new(config);
+
+        // Scenario 1: Zero Surprise (The brain perfectly predicted the input).
+        // It should exploit this state, meaning precision should be HIGH (near 2.0)
+        let exploit_scale = calc.hyper_precision(0.0);
+        assert!(exploit_scale > 1.8, "Zero surprise should yield high precision. Got {}", exploit_scale);
+
+        // Scenario 2: Massive Surprise (The brain was completely wrong).
+        // It needs to explore, meaning precision should drop drastically to allow large weight updates (near 0.1)
+        let explore_scale = calc.hyper_precision(10.0);
+        assert!(explore_scale < 0.2, "Massive surprise should yield low precision. Got {}", explore_scale);
+
+        // Scenario 3: Medium Surprise (At the inflection point of 5.0)
+        // It should be exactly in the middle of the sigmoid.
+        let mid_scale = calc.hyper_precision(5.0);
+        assert!((mid_scale - 1.05).abs() < 0.01, "Sigmoid midpoint math is incorrect. Got {}", mid_scale);
+    }
+}

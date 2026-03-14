@@ -238,8 +238,17 @@ impl BootstrapManager {
         let mut pc = self.pc_hierarchy.write().await;
         let mut dataset = Vec::new();
 
+        // 🔴 FIX: Give the PC Brain a much broader foundational education.
+        // If it only knows 1 example, it hallucinates for everything else.
+        // 🔴 FIX: Give the PC Brain a much broader foundational education.
+        // If it only knows 1 example, it hallucinates for everything else.
         let scenarios = vec![
             ("Solve 2x = 10", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Compute], dict.op_to_id[&ThoughtOp::EOF]]),
+            ("Write a Python script to reverse a string", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Iterate], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
+            ("Explain the theory of relativity", vec![dict.op_to_id[&ThoughtOp::Explain], dict.op_to_id[&ThoughtOp::EOF]]),
+            ("Check if a number is prime", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Check], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
+            ("Summarize this document", vec![dict.op_to_id[&ThoughtOp::Aggregate], dict.op_to_id[&ThoughtOp::Explain], dict.op_to_id[&ThoughtOp::EOF]]),
+            ("Calculate the square root of 144", vec![dict.op_to_id[&ThoughtOp::Compute], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
         ];
 
         for (query, seq) in scenarios {
@@ -664,7 +673,6 @@ fn chunk_text(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod cpu_core_utilization_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     
     /// Test that demonstrates paragraph distribution across CPU cores
@@ -732,9 +740,6 @@ mod cpu_core_utilization_tests {
     /// Test CPU core utilization simulation
     #[test]
     fn test_cpu_core_utilization_simulation() {
-        // Create a counter to track "work" done
-        let work_counter = Arc::new(AtomicUsize::new(0));
-        
         // Simulate parallel processing across cores
         let num_cores = 8; // Simulating 8-core system
         let paragraphs_per_core = vec![

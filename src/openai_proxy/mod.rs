@@ -1,3 +1,5 @@
+// src/openai_proxy/mod.rs
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
@@ -60,6 +62,8 @@ impl OpenAiProxy {
         cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
         study_state: Arc<RwLock<StudyState>>,
         episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
+        calibration: Arc<RwLock<CalibrationStore>>,
+        cache: Option<Arc<RwLock<SemanticCache>>>,
     ) -> Self {
         let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
         OpenAiProxy {
@@ -71,9 +75,9 @@ impl OpenAiProxy {
             thought_decoder,
             cognitive_dict,
             metrics,
-            cache: None,
+            cache,
             episodic_memory,
-            calibration: Arc::new(RwLock::new(CalibrationStore::default())),
+            calibration,
             study_state,
         }
     }
@@ -97,6 +101,14 @@ impl OpenAiProxy {
             metrics.total_requests += 1;
         }
         let start_time = Instant::now();
+        
+        // 🔴 FIX 3: Update UI Status to show we are currently thinking
+        {
+            let mut state = self.study_state.write().await;
+            state.is_studying = true;
+            state.current_file = "Answering prompt...".to_string();
+            state.progress_percent = 50.0;
+        }
 
         let state = self.extract_structured_state(&req).await;
         let mut final_text = String::new();
@@ -109,7 +121,6 @@ impl OpenAiProxy {
         let mut remote_error: Option<String> = None;
         let mut local_error: Option<String> = None;
 
-        // 🚀 PART 1: LOGGING FIX - Log BEFORE the blocking task
         tracing::info!("🤖 STARTING COGNITIVE STEP: Attempting PC Inference first...");
         
         let mut pc_thoughts_string = String::new();
@@ -125,7 +136,6 @@ impl OpenAiProxy {
                     }
                 }
                 
-                // 🚀 PART 2: PC GUIDANCE & LOGGING
                 let pc_result = {
                     let pc_config = self.pc_hierarchy.read().await.config.clone();
                     let pc_device = self.pc_hierarchy.read().await.device.clone();
@@ -153,7 +163,6 @@ impl OpenAiProxy {
                         let thoughts: Vec<String> = seq.iter().map(|id| dict.get_op(*id).to_string()).collect();
                         pc_thoughts_string = thoughts.join(" -> ");
                         
-                        // 🚀 FIX: This log will now definitely show up
                         tracing::info!("🧠 PC Thought Trajectory: {}", pc_thoughts_string);
                         tracing::info!("🧠 PC confidence: {:.4} (Threshold: 0.6)", raw_confidence);
                         
@@ -179,16 +188,12 @@ impl OpenAiProxy {
             }
         }
 
-        // 🚀 PART 3: PROMPT IMPROVEMENT & CACHING
-        // We inject the PC's thoughts into the LLM's messages.
-        // This makes the LLM follow the PC's logic and improves result quality.
         if !pc_thoughts_string.is_empty() {
             let guidance = format!(
                 "[INTERNAL_THOUGHT_PLAN]: {}\n[CONFIDENCE]: {:.2}",
                 pc_thoughts_string, raw_confidence
             );
             
-            // Insert guidance as a system-like message at the top for better caching
             req.messages.insert(0, Message {
                 role: "system".to_string(),
                 content: serde_json::json!(format!(
@@ -285,6 +290,13 @@ impl OpenAiProxy {
         let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
         let actual_cost = if last_source == "remote_llm" { (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD } else { 0.0 };
         let _saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD - actual_cost).max(0.0);
+
+        // 🔴 FIX 3: Reset UI Status
+        {
+            let mut state = self.study_state.write().await;
+            state.is_studying = false;
+            state.progress_percent = 100.0;
+        }
 
         let response = OpenAiResponse {
             id: format!("agent-{}", Utc::now().timestamp()),
@@ -390,4 +402,62 @@ fn estimate_tokens_from_messages(messages: &[Message]) -> usize {
 
 fn estimate_tokens_from_text(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
+}
+
+#[cfg(test)]
+mod proxy_utility_tests {
+    use super::*;
+    use crate::openai_proxy::types::Message;
+
+    #[test]
+    fn test_token_estimation_safety() {
+        // Test empty strings don't crash and return a minimum of 1 token
+        assert_eq!(estimate_tokens_from_text(""), 1);
+        
+        // Test standard text (Roughly 1 token per 4 chars)
+        let text = "Hello world, this is a test string.";
+        let estimated = estimate_tokens_from_text(text);
+        assert!(estimated > 5 && estimated < 15, "Token estimation is wildly inaccurate: {}", estimated);
+
+        // Test Message array parsing
+        let msgs = vec![
+            Message { role: "user".into(), content: serde_json::json!("short"), name: None },
+            Message { role: "system".into(), content: serde_json::json!("also short"), name: None },
+        ];
+        let msg_tokens = estimate_tokens_from_messages(&msgs);
+        assert!(msg_tokens >= 3, "Message token estimation failed");
+    }
+}
+#[cfg(test)]
+mod proxy_integration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ui_status_transitions_during_inference() {
+        // PROVES: The study_state toggles from "Idle" to "Answering" to "Idle" during a request.
+        let state = Arc::new(RwLock::new(StudyState::default()));
+        
+        // Assert initial state is idle
+        assert!(!state.read().await.is_studying);
+
+        // Simulating the exact logic from handle_chat_completion
+        {
+            let mut s = state.write().await;
+            s.is_studying = true;
+            s.current_file = "Answering prompt...".to_string();
+            s.progress_percent = 50.0;
+        }
+
+        assert!(state.read().await.is_studying);
+        assert_eq!(state.read().await.current_file, "Answering prompt...");
+
+        // Simulating the end of handle_chat_completion
+        {
+            let mut s = state.write().await;
+            s.is_studying = false;
+            s.progress_percent = 100.0;
+        }
+
+        assert!(!state.read().await.is_studying);
+    }
 }

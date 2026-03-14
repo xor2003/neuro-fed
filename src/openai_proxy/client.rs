@@ -39,6 +39,9 @@ impl BackendClient {
     pub async fn send_to_ollama(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
         let url = Self::build_chat_url(&self.ollama_url);
         tracing::info!("🦙 Sending request to Ollama: {}", url);
+        
+        tracing::info!("📤 Outgoing Ollama Request: {}", serde_json::to_string_pretty(&req).unwrap_or_default());
+        
         let response = self.client
             .post(&url)
             .json(req)
@@ -53,7 +56,7 @@ impl BackendClient {
         let response_text = response.text().await
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read Ollama response: {}", e)))?;
         let response_text = response_text.trim_start().to_string();
-        tracing::debug!("ollama raw response status={} body={}", status, response_text);
+        
         if !status.is_success() {
             tracing::error!("❌ Ollama API failed! Status: {}", status);
             tracing::error!("❌ Ollama Body: {}", response_text);
@@ -83,7 +86,6 @@ impl BackendClient {
             .timeout(self.timeout)
             .header("HTTP-Referer", "http://neurofed.local")
             .header("X-Title", "NeuroFed-Node-v1")
-            // 🚀 CACHING: Many providers use this to prioritize prefix caching
             .header("X-OpenRouter-Cache", "true");
 
         if let Some(key) = &self.api_key {
@@ -96,12 +98,12 @@ impl BackendClient {
             tracing::warn!("No API key configured for remote fallback!");
         }
 
-        // 🚀 OLLAMA SPECIFIC CACHING
-        // If the URL points to localhost, we add Ollama-specific options
         let final_req = req.clone();
         if url.contains("localhost") || url.contains("127.0.0.1") {
             tracing::debug!("Ollama endpoint detected, caching should work automatically");
         }
+
+        tracing::info!("📤 Outgoing Remote Request: {}", serde_json::to_string_pretty(&final_req).unwrap_or_default());
 
         let response = builder.json(&final_req).send().await
             .map_err(|e| {
@@ -114,11 +116,13 @@ impl BackendClient {
             .map_err(|e| ProxyError::InvalidResponse(format!("Failed to read fallback response: {}", e)))?;
             
         if !status.is_success() {
-            // 🔴 FIX: Force this to be printed clearly
             tracing::error!("❌ Remote API failed! Status: {}", status);
             tracing::error!("❌ Remote API Body: {}", response_text);
             return Err(ProxyError::BackendError(format!("Status: {}", status)));
         }
+        
+        // 🔴 FIX 2: Print the SUCCESSFUL remote response so we can see what the LLM said!
+        tracing::info!("📥 Remote API Response: {}", response_text);
         
         let response_body = serde_json::from_str::<OpenAiResponse>(&response_text)
             .map_err(|e| {

@@ -23,6 +23,8 @@ pub fn create_router(proxy: Arc<OpenAiProxy>) -> Router {
         .route("/ui/styles.css", get(ui_styles))
         .route("/ui/metrics", get(ui_metrics))
         .route("/ui/stats", get(ui_stats))
+        .route("/ui/introspection", get(get_brain_introspection))
+        .route("/ui/brain_stats", get(get_brain_statistics))
         .with_state(proxy)
 }
 
@@ -127,6 +129,135 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
         memory_bytes,
         cpu_usage,
     })
+}
+
+async fn get_brain_introspection(
+    State(proxy): State<Arc<OpenAiProxy>>,
+) -> Json<serde_json::Value> {
+    // Try to get read locks on both PC hierarchy and ML engine
+    let pc = match proxy.pc_hierarchy.try_read() {
+        Ok(pc) => pc,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "PC hierarchy is busy (locked)"
+            }))
+        }
+    };
+    
+    let engine = match proxy.local_engine.try_read() {
+        Ok(engine) => engine,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "ML engine is busy (locked)"
+            }))
+        }
+    };
+    
+    // 1. Get the current belief at the top of the hierarchy
+    if let Ok(top_belief) = pc.get_top_belief() {
+        // 2. Decode what this math vector means in English words!
+        if let Ok((word, avg_mag, max_mag)) = engine.decode_belief_with_confidence(&top_belief) {
+            return Json(serde_json::json!({
+                "status": "success",
+                "current_dominant_concept": word,
+                "activation_magnitude": max_mag,
+                "average_activation": avg_mag,
+                "total_levels": pc.levels.len(),
+                "free_energy": pc.free_energy,
+            }));
+        }
+    }
+    
+    Json(serde_json::json!({"status": "idle or empty"}))
+}
+
+async fn get_brain_statistics(
+    State(proxy): State<Arc<OpenAiProxy>>,
+) -> Json<serde_json::Value> {
+    // Try to get read lock on PC hierarchy
+    let pc = match proxy.pc_hierarchy.try_read() {
+        Ok(pc) => pc,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "PC hierarchy is busy (locked)"
+            }))
+        }
+    };
+    
+    let mut level_stats = Vec::new();
+    
+    // Analyze each level
+    for (i, level) in pc.levels.iter().enumerate() {
+        // Get weights matrix
+        if let Ok(weights_vec) = level.weights.to_vec2::<f32>() {
+            let rows = weights_vec.len();
+            let cols = if rows > 0 { weights_vec[0].len() } else { 0 };
+            
+            // Calculate statistics
+            let mut dead_neurons = 0;
+            let mut hyper_active_neurons = 0;
+            let mut total_abs = 0.0;
+            let mut max_abs = 0.0;
+            let mut min_abs = f32::MAX;
+            
+            // Analyze each column (neuron)
+            for col in 0..cols {
+                let mut col_sum = 0.0;
+                let mut col_max = 0.0;
+                
+                for row in 0..rows {
+                    let val = weights_vec[row][col].abs();
+                    col_sum += val;
+                    if val > col_max {
+                        col_max = val;
+                    }
+                }
+                
+                let col_avg = col_sum / rows as f32;
+                total_abs += col_sum;
+                
+                if col_avg < 0.001 {
+                    dead_neurons += 1;
+                } else if col_max > 1.0 {
+                    hyper_active_neurons += 1;
+                }
+                
+                if col_max > max_abs {
+                    max_abs = col_max;
+                }
+                if col_avg < min_abs && col_avg > 0.0 {
+                    min_abs = col_avg;
+                }
+            }
+            
+            let avg_activation = if cols > 0 { total_abs / (rows * cols) as f32 } else { 0.0 };
+            
+            level_stats.push(serde_json::json!({
+                "level": i,
+                "dimensions": format!("{}x{}", rows, cols),
+                "dead_neurons": dead_neurons,
+                "hyper_active_neurons": hyper_active_neurons,
+                "dead_neuron_percentage": if cols > 0 { (dead_neurons as f32 / cols as f32) * 100.0 } else { 0.0 },
+                "avg_activation": avg_activation,
+                "max_activation": max_abs,
+                "min_nonzero_activation": if min_abs == f32::MAX { 0.0 } else { min_abs },
+            }));
+        }
+    }
+    
+    Json(serde_json::json!({
+        "status": "success",
+        "total_levels": pc.levels.len(),
+        "free_energy": pc.free_energy,
+        "levels": level_stats,
+        "summary": {
+            "total_dead_neurons": level_stats.iter().map(|s| s["dead_neurons"].as_u64().unwrap_or(0)).sum::<u64>(),
+            "total_hyper_active_neurons": level_stats.iter().map(|s| s["hyper_active_neurons"].as_u64().unwrap_or(0)).sum::<u64>(),
+        }
+    }))
 }
 
 fn static_response(body: &'static str, content_type: &'static str) -> Response {

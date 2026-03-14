@@ -13,8 +13,10 @@ use neuro_fed_node::{
     node_loop::NodeLoop,
     openai_proxy::{OpenAiProxy, create_router},
     openai_proxy::components::ProxyConfig,
+    openai_proxy::calibration::CalibrationStore,
     pc_decoder::ThoughtDecoder,
     types::CognitiveDictionary,
+    semantic_cache::SemanticCache,
     metrics,
     ui,
     bootstrap::BootstrapManager,
@@ -214,7 +216,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    let cognitive_dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+    // Load CognitiveDictionary from persistence if available
+    let cognitive_dict = if !db_missing {
+        match persistence.load_dictionary().await {
+            Ok(Some(dict)) => {
+                tracing::info!("✅ Successfully loaded CognitiveDictionary from persistence ({} ops)", dict.len());
+                Arc::new(RwLock::new(dict))
+            }
+            Ok(None) => {
+                tracing::info!("No CognitiveDictionary found in persistence, creating default");
+                Arc::new(RwLock::new(CognitiveDictionary::default()))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load CognitiveDictionary: {}, creating default", e);
+                Arc::new(RwLock::new(CognitiveDictionary::default()))
+            }
+        }
+    } else {
+        tracing::info!("Database missing, creating default CognitiveDictionary");
+        Arc::new(RwLock::new(CognitiveDictionary::default()))
+    };
+
+    
     let top_belief_dim = *pc_hierarchy.read().await.config.dim_per_level.last().unwrap_or(&embedding_dim);
     let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
         top_belief_dim,
@@ -263,10 +286,64 @@ async fn main() -> Result<()> {
         cache_size: config.proxy_config.max_cache_size,
         timeout_seconds: 30,
     };
+    
+    // Create semantic cache if enabled
+    let semantic_cache = if proxy_config.enable_cache {
+        let similarity_threshold = config.proxy_config.semantic_similarity_threshold;
+        let mut cache = SemanticCache::new(
+            proxy_config.cache_size as u64,
+            embedding_dim,
+            similarity_threshold,
+            Some(persistence.clone()),
+        );
+        
+        // Load existing cache entries from database
+        if !db_missing {
+            match cache.load_from_db(&persistence).await {
+                Ok(()) => tracing::info!("✅ Successfully loaded semantic cache from persistence"),
+                Err(e) => tracing::warn!("Failed to load semantic cache: {}", e),
+            }
+        }
+        
+        Some(Arc::new(RwLock::new(cache)))
+    } else {
+        None
+    };
+
+    // Load CalibrationStore from persistence if available
+    let calibration_store = if !db_missing {
+        match persistence.load_calibration_store().await {
+            Ok(Some(store)) => {
+                tracing::info!("✅ Successfully loaded CalibrationStore from persistence");
+                Arc::new(RwLock::new(store))
+            }
+            Ok(None) => {
+                tracing::info!("No CalibrationStore found in persistence, creating default");
+                Arc::new(RwLock::new(CalibrationStore::default()))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load CalibrationStore: {}, creating default", e);
+                Arc::new(RwLock::new(CalibrationStore::default()))
+            }
+        
+        }
+    } else {
+        tracing::info!("Database missing, creating default CalibrationStore");
+        Arc::new(RwLock::new(CalibrationStore::default()))
+    };
+    
     let proxy = Arc::new(OpenAiProxy::new(
-        config.clone(), proxy_config, ml_engine.clone(), pc_hierarchy.clone(), embedding_dim, thought_decoder.clone(), cognitive_dict.clone(),
+        config.clone(),
+        proxy_config,
+        ml_engine.clone(),
+        pc_hierarchy.clone(),
+        embedding_dim,
+        thought_decoder.clone(),
+        cognitive_dict.clone(),
         study_state.clone(),
         episodic_memory.clone(),
+        calibration_store.clone(),
+        semantic_cache.clone(),
     ));
 
     // Initialize Nostr federation and brain sharing (config-driven)
@@ -310,6 +387,8 @@ async fn main() -> Result<()> {
                 tracing::warn!("BrainManager init failed: {}", e);
                 None
             }
+            
+            
         }
     } else {
         None
@@ -322,6 +401,9 @@ async fn main() -> Result<()> {
     let pc_hierarchy_for_shutdown = pc_hierarchy.clone();
     let persistence_for_shutdown = persistence.clone();
     let stop_signal_for_shutdown = stop_signal.clone(); // <--- Capture for shutdown handler
+    let cognitive_dict_for_shutdown = cognitive_dict.clone();
+    let calibration_store_for_shutdown = calibration_store.clone();
+    let semantic_cache_for_shutdown = semantic_cache.clone();
     let shutdown = async move {
         tracing::info!("[DEBUG] Shutdown handler initialized and waiting for Ctrl+C...");
         
@@ -364,13 +446,45 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::error!("❌ Failed to extract PC weights: {}", e),
             }
             
-            // 2. TODO: Save semantic cache if enabled
-            tracing::info!("Semantic cache saving not yet implemented");
+            // 2. Save CognitiveDictionary
+            tracing::info!("Saving CognitiveDictionary...");
+            match cognitive_dict_for_shutdown.read().await.clone() {
+                dict => {
+                    if let Err(e) = persistence_for_shutdown.save_dictionary(&dict).await {
+                        tracing::error!("Failed to save CognitiveDictionary: {}", e);
+                    } else {
+                        tracing::info!("✅ Successfully saved CognitiveDictionary");
+                    }
+                }
+            }
             
-            // 3. TODO: Save trust graph peers
+            // 3. Save CalibrationStore
+            tracing::info!("Saving CalibrationStore...");
+            match calibration_store_for_shutdown.read().await.clone() {
+                store => {
+                    if let Err(e) = persistence_for_shutdown.save_calibration_store(&store).await {
+                        tracing::error!("Failed to save CalibrationStore: {}", e);
+                    } else {
+                        tracing::info!("✅ Successfully saved CalibrationStore");
+                    }
+                }
+            }
+            
+            // 4. Save semantic cache if enabled
+            if let Some(cache) = semantic_cache_for_shutdown {
+                tracing::info!("Saving semantic cache...");
+                match cache.read().await.save_all_to_db(&persistence_for_shutdown).await {
+                    Ok(()) => tracing::info!("✅ Successfully saved semantic cache"),
+                    Err(e) => tracing::error!("Failed to save semantic cache: {}", e),
+                }
+            } else {
+                tracing::info!("Semantic cache not enabled, skipping");
+            }
+            
+            // 5. TODO: Save trust graph peers
             tracing::info!("Trust graph peers saving not yet implemented");
             
-            // 4. TODO: Save delta history
+            // 6. TODO: Save delta history
             tracing::info!("Delta history saving not yet implemented");
             
             tracing::info!("Shutdown preparation complete. Terminating process...");
@@ -405,6 +519,37 @@ async fn main() -> Result<()> {
         }
     }
     
+    // 🔴 FIX: Load Thought Decoder
+    if !db_missing {
+        if let Ok(Some((gate, vocab))) = persistence.load_decoder().await {
+            if let Err(e) = thought_decoder.write().await.set_weights(&gate, &vocab) {
+                tracing::warn!("Failed to set loaded decoder weights: {}", e);
+            } else {
+                tracing::info!("✅ Successfully loaded Thought Decoder from persistence");
+            }
+        }
+    }
+
+
+    // 🔴 RUN DIAGNOSTICS: Check if the brain is an empty shell
+    let is_decoder_random = thought_decoder.read().await.check_if_random().unwrap_or(true);
+    let mut is_pc_random = false;
+    if let Some(level_0) = pc_hierarchy.read().await.levels.first() {
+        is_pc_random = level_0.check_if_random().unwrap_or(true);
+    }
+    
+    if is_decoder_random || is_pc_random {
+        tracing::warn!("============================================================");
+        tracing::warn!("🧠 DIAGNOSTIC ALERT: BRAIN AMNESIA DETECTED");
+        if is_pc_random { tracing::warn!(" -> Level 0 Perception Matrix is untrained (Random)."); }
+        if is_decoder_random { tracing::warn!(" -> Thought Decoder is untrained (Random)."); }
+        tracing::warn!("The node will generate completely random, out-of-order thought trajectories until it learns.");
+        tracing::warn!("💡 TROUBLESHOOTING: Drop text files in your 'study/' folder, or temporarily set `bootstrap_on_start = true` in config.toml.");
+        tracing::warn!("============================================================");
+    } else {
+        tracing::info!("🧠 DIAGNOSTIC: Brain weights look mature and structurally formed.");
+    }
+
     if config.bootstrap_on_start && (db_missing || !has_weights) {
         let mut bootstrap = BootstrapManager::new(
             ml_engine.clone(),

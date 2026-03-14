@@ -82,24 +82,37 @@ pub struct NostrEvent {
     pub metadata: HashMap<String, String>,
 }
 
+// 🔴 FIX: 100% OpenAI-Compliant Tool Schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
-    pub arguments: HashMap<String, String>,
+    // OpenAI sends arguments as a raw JSON formatted string, not a HashMap
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    // OpenAI uses a JSON Schema object for parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
-    pub name: String,
-    pub description: String,
-    pub function: FunctionCall,
+    #[serde(rename = "type")]
+    pub tool_type: String, // Usually "function"
+    pub function: FunctionDefinition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String, // Usually "function"
     pub function: FunctionCall,
-    pub timestamp: SystemTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +335,10 @@ impl CognitiveDictionary {
         let mut new_chunks = 0;
         for ((id1, id2), count) in bigrams {
             if count >= 3 { // Threshold for chunking
+                // Skip chunking if either thought is EOF (terminal marker)
+                if self.get_op(id1) == ThoughtOp::EOF || self.get_op(id2) == ThoughtOp::EOF {
+                    continue;
+                }
                 let name1 = self.get_op(id1).to_string();
                 let name2 = self.get_op(id2).to_string();
                 let new_concept = format!("{}_{}", name1, name2);
@@ -394,14 +411,13 @@ mod cognitive_dictionary_tests {
         let initial_len = dict.len();
         let chunks_added = dict.discover_chunks(&episodes);
         
-        // Should discover 2 new chunks: DEFINE_FUNCTION_CHECK_CONDITION and CHECK_CONDITION_EOF
-        assert_eq!(chunks_added, 2, "Should discover 2 new chunks (Define+Check and Check+EOF)");
-        assert_eq!(dict.len(), initial_len + 2);
+        // Should discover 1 new chunk: DEFINE_FUNCTION_CHECK_CONDITION (Check+EOF is skipped because EOF is terminal)
+        assert_eq!(chunks_added, 1, "Should discover 1 new chunk (Define+Check) because EOF chunks are skipped");
+        assert_eq!(dict.len(), initial_len + 1);
         
         let new_op1 = ThoughtOp::Dynamic("DEFINE_FUNCTION_CHECK_CONDITION".into());
-        let new_op2 = ThoughtOp::Dynamic("CHECK_CONDITION_EOF".into());
         assert!(dict.op_to_id.contains_key(&new_op1), "The combined chunk must exist in the dictionary");
-        assert!(dict.op_to_id.contains_key(&new_op2), "The second combined chunk must exist in the dictionary");
+        // The second chunk (CHECK_CONDITION_EOF) is skipped because EOF chunks are not created
     }
 }
 
@@ -426,5 +442,95 @@ mod types_architecture_tests {
         // to ensure it learns from its past failures.
         assert!(context.contains("Goal: Write a binary search tree"));
         assert!(context.contains("Corrected Assumptions: The array is already sorted; Failed previously on empty array"));
+    }
+}
+
+#[cfg(test)]
+mod openai_compatibility_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tool_definition_serialization() {
+        // This test ensures we generate the JSON schema that OpenAI/OpenRouter expects
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: Some("Get the current weather".to_string()),
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    }
+                })),
+            },
+        };
+
+        let serialized = serde_json::to_value(&tool).unwrap();
+        
+        // Assertions for OpenAI spec requirements
+        assert_eq!(serialized["type"], "function");
+        assert_eq!(serialized["function"]["name"], "get_weather");
+        assert!(serialized["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn test_tool_call_deserialization() {
+        // This test simulates a response coming back from an LLM (like DeepSeek or Llama)
+        // It ensures we can handle 'arguments' as a raw string.
+        let raw_json = json!({
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "solve_math",
+                "arguments": "{\"query\": \"sqrt(144)\"}"
+            }
+        });
+
+        let tool_call: ToolCall = serde_json::from_value(raw_json).unwrap();
+
+        assert_eq!(tool_call.id, "call_123");
+        assert_eq!(tool_call.function.name, "solve_math");
+        
+        // CRITICAL: Ensure arguments is a String, not a Map
+        assert_eq!(tool_call.function.arguments, "{\"query\": \"sqrt(144)\"}");
+    }
+
+    #[test]
+    fn test_optional_function_fields() {
+        // This test ensures that if an IDE sends a tool without a description
+        // or parameters, we don't crash (OpenAI allows these to be optional).
+        let raw_json = json!({
+            "type": "function",
+            "function": {
+                "name": "simple_ping"
+            }
+        });
+
+        let res: Result<Tool, _> = serde_json::from_value(raw_json);
+        assert!(res.is_ok(), "Should successfully parse even without optional fields");
+        
+        let tool = res.unwrap();
+        assert!(tool.function.description.is_none());
+        assert!(tool.function.parameters.is_none());
+    }
+
+    #[test]
+    fn test_continue_extension_compatibility_regression() {
+        // This reproduces the exact error reported: missing field 'arguments'
+        // in a ToolCall-like structure.
+        let raw_json = r#"{
+            "id": "abc",
+            "type": "function",
+            "function": {
+                "name": "test",
+                "arguments": "{}"
+            }
+        }"#;
+
+        let res: Result<ToolCall, _> = serde_json::from_str(raw_json);
+        
+        assert!(res.is_ok(), "Regression check failed: ToolCall failed to parse JSON with arguments string. Error: {:?}", res.err());
     }
 }

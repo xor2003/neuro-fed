@@ -366,3 +366,65 @@ fn current_timestamp() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod semantic_cache_vector_tests {
+    use super::*;
+
+    // Helper to create a fake OpenAI Request/Response
+    fn mock_req_res(prompt: &str) -> (OpenAiRequest, OpenAiResponse) {
+        let req = OpenAiRequest {
+            model: "test".into(),
+            messages: vec![crate::openai_proxy::types::Message {
+                role: "user".into(),
+                content: serde_json::json!(prompt),
+                name: None,
+            }],
+            ..Default::default()
+        };
+        let res = OpenAiResponse {
+            id: "test_res".into(),
+            ..Default::default()
+        };
+        (req, res)
+    }
+
+    #[tokio::test]
+    async fn test_hnsw_similarity_matching() {
+        // Create cache expecting 3-dimensional embeddings, 0.8 similarity threshold
+        let mut cache = SemanticCache::new(100, 3, 0.8, None);
+
+        // Vector 1:[1.0, 0.0, 0.0] (Represents a specific concept)
+        let (req1, res1) = mock_req_res("What is the capital of France?");
+        let emb1 = vec![1.0, 0.0, 0.0];
+        
+        cache.add_to_cache(req1, res1, emb1.clone(), None).await.unwrap();
+
+        // 1. Exact Match Test
+        let hit = cache.check_similarity(&emb1, &mock_req_res("What is the capital of France?").0).await;
+        assert!(hit.is_some(), "Exact hash match failed to hit the cache!");
+
+        // 2. Fuzzy Semantic Match Test (Slightly noisy vector: [0.99, 0.1, 0.0])
+        // This simulates the user asking "Can you tell me the capital of France?"
+        let fuzzy_emb = vec![0.99, 0.1, 0.0];
+        let fuzzy_hit = cache.check_similarity(&fuzzy_emb, &mock_req_res("Tell me Paris").0).await;
+        assert!(fuzzy_hit.is_some(), "HNSW Vector search failed to find a highly similar semantic match!");
+
+        // 3. Orthogonal Miss Test (Completely different concept: [0.0, 1.0, 0.0])
+        // Simulates the user asking "How to bake a cake?"
+        let different_emb = vec![0.0, 1.0, 0.0];
+        let miss = cache.check_similarity(&different_emb, &mock_req_res("How to bake a cake?").0).await;
+        assert!(miss.is_none(), "Cache returned a hit for a completely unrelated vector! Similarity threshold is broken.");
+    }
+
+    #[tokio::test]
+    async fn test_cache_dimension_validation() {
+        let mut cache = SemanticCache::new(100, 1024, 0.8, None); // Expects dim 1024
+        
+        let (req, res) = mock_req_res("Test");
+        let bad_emb = vec![0.5, 0.5]; // Only dim 2
+        
+        let result = cache.add_to_cache(req, res, bad_emb, None).await;
+        assert!(result.is_err(), "Cache accepted an embedding of the wrong dimension!");
+    }
+}

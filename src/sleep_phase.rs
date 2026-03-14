@@ -214,3 +214,56 @@ mod sleep_phase_integration_tests {
             "Decoder w_vocab rows ({}) must match Dictionary length ({})!", current_vocab_size, new_dict_len);
     }
 }
+
+#[cfg(test)]
+mod deep_consolidation_tests {
+    use super::*;
+    use crate::pc_hierarchy::PCConfig;
+    use candle_core::Device;
+
+    #[tokio::test]
+    async fn test_full_sleep_cycle_dimension_stability() {
+        // PROVES: When chunk discovery creates a new token, the Decoder matrix resizes
+        // safely and backpropagation doesn't crash due to dimension mismatches.
+        let pc_config = PCConfig::new(2, vec![4, 2]);
+        let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config).unwrap()));
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        
+        // Base dictionary has 8 items
+        let decoder = Arc::new(RwLock::new(ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap()));
+        let episodic_memory = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+
+        let sleep_mgr = SleepManager::new(pc_hierarchy, decoder.clone(), dict.clone(), episodic_memory.clone());
+
+        // Push 5 successful identical episodes to force Chunk Discovery of [0, 1]
+        for _ in 0..5 {
+            episodic_memory.write().await.push_back(Episode {
+                raw_query: "Test".into(),
+                query_sequence: vec![vec![0.1, 0.2, 0.3, 0.4], vec![0.5, 0.6, 0.7, 0.8]],
+                novelty: 5.0,
+                confidence: 0.9,
+                generated_code: "pass".into(),
+                thought_sequence: vec![0, 1, 7], // Will chunk 0 and 1
+                success: true,
+            });
+        }
+
+        // Run sleep cycle
+        let result = sleep_mgr.process_sleep_cycle().await;
+        assert!(result.is_ok(), "Sleep cycle crashed: {:?}", result.err());
+
+        // 1. Verify Dictionary expanded
+        let new_dict_size = dict.read().await.len();
+        assert_eq!(new_dict_size, 9, "Dictionary failed to discover new chunk!");
+
+        // 2. Verify Neural Network resized WITHOUT losing old data
+        let w_vocab_shape = decoder.read().await.w_vocab.shape().clone();
+        assert_eq!(w_vocab_shape.dims()[0], 9, "Decoder matrix did not resize to fit new vocabulary!");
+
+        // 3. Verify it can STILL run a forward/backward pass with the new dimensions
+        let test_belief = Tensor::randn(0f32, 1.0, (2, 1), &Device::Cpu).unwrap();
+        // Train it on the newly discovered token ID (8)
+        let train_res = decoder.write().await.train_step(&test_belief, &[8], 0.01);
+        assert!(train_res.is_ok(), "BPTT Panicked after matrix resize! Dimension mismatch likely.");
+    }
+}
