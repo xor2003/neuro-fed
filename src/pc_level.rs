@@ -250,8 +250,8 @@ impl PCLevel {
         let normalized_input = next_beliefs.affine((1.0 / input_norm) as f64, 0.0)?;
         
         // Delta = error * normalized_input^T
-        let mut delta = error.matmul(&normalized_input.t()?)?;
-        
+        let mut delta = error.matmul(&normalized_input.t()?.contiguous()?)?;
+
         // 🔒 APPLY NEURON PROTECTION (If enabled)
         if let Some(mask) = &self.freeze_mask {
             delta = delta.broadcast_mul(mask)?;

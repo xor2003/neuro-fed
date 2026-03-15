@@ -506,7 +506,7 @@ mod reasoning_consistency_tests {
 
     #[tokio::test]
     async fn test_pc_reasoning_is_deterministic() {
-        let config = NodeConfig::default();
+        let config = NodeConfig::load_or_default();
         let device = Device::Cpu;
         let engine = Arc::new(RwLock::new(MLEngine::new(&config.model_path, DeviceType::default()).unwrap()));
         let embedding_dim = engine.read().await.embedding_dim();
