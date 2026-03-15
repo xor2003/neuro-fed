@@ -5,7 +5,8 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor, DType};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
+use ahash::AHashMap;
+use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
@@ -20,6 +21,7 @@ pub struct MLEngine {
     device: Device,
     embedding_dim: usize, // Store the actual embedding dimension from the model
     model_path: String,   // Store the path to the GGUF file for later weight extraction
+    is_mock: bool,
 }
 
 impl MLEngine {
@@ -159,6 +161,7 @@ impl MLEngine {
             device,
             embedding_dim,
             model_path: model_path.to_string(),
+            is_mock: false,
         })
     }
 
@@ -237,6 +240,63 @@ impl MLEngine {
         }
     }
 
+    fn mock_tokenizer() -> Result<Tokenizer, MLError> {
+        let mut vocab = AHashMap::new();
+        vocab.insert("<unk>".to_string(), 0u32);
+        let word_level = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .map_err(|e| MLError::ModelLoadError(format!("Failed to build mock tokenizer: {}", e)))?;
+        let mut tokenizer = Tokenizer::new(word_level);
+        tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
+        Ok(tokenizer)
+    }
+
+    pub fn mock() -> Result<Self, MLError> {
+        let device = Device::Cpu;
+        let embedding_dim = 32;
+        let token_embeddings = Tensor::zeros((1, embedding_dim), DType::F32, &device)
+            .map_err(|e| MLError::ModelLoadError(format!("Mock engine tensor creation failed: {}", e)))?;
+        let lm_head = Tensor::zeros((1, embedding_dim), DType::F32, &device)
+            .map_err(|e| MLError::ModelLoadError(format!("Mock engine tensor creation failed: {}", e)))?;
+        let tokenizer = Self::mock_tokenizer()?;
+        Ok(Self {
+            token_embeddings,
+            lm_head,
+            tokenizer,
+            device,
+            embedding_dim,
+            model_path: "mock".to_string(),
+            is_mock: true,
+        })
+    }
+
+    fn deterministic_embedding_values(text: &str, seq_len: usize, dim: usize) -> Vec<f32> {
+        let mut hash = 0u64;
+        for b in text.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(*b as u64);
+        }
+        let total = seq_len.max(1) * dim;
+        (0..total)
+            .map(|i| {
+                let val = hash.wrapping_add(i as u64).wrapping_mul(6364136223846793005);
+                (((val >> 16) as f32 % 1000.0) / 1000.0) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn deterministic_embedding(&self, text: &str, seq_len: usize, dim_override: Option<usize>) -> Result<Tensor, MLError> {
+        let dim = dim_override.unwrap_or(self.embedding_dim);
+        let values = Self::deterministic_embedding_values(text, seq_len, dim);
+        Tensor::from_vec(values, (seq_len.max(1), dim), &self.device)
+            .map_err(|e| MLError::InvalidResponse(format!("Deterministic embedding creation failed: {}", e)))
+    }
+
+    pub fn deterministic_embedding_with_dim(&self, text: &str, seq_len: usize, dim: usize) -> Result<Tensor, MLError> {
+        self.deterministic_embedding(text, seq_len, Some(dim))
+    }
+
     /// Extract embedding dimension from GGUF metadata or tensor shape
     fn extract_embedding_dim(content: &candle_core::quantized::gguf_file::Content, token_embeddings: &candle_core::Tensor) -> Option<usize> {
         // Try to get embedding dimension from metadata
@@ -297,6 +357,10 @@ impl MLEngine {
 
     /// "The Eyes": Convert text into a semantic vector for the PC Brain
     pub async fn process_text(&self, text: &str) -> Result<Tensor, MLError> {
+        if self.is_mock {
+            return self.deterministic_embedding(text, 1, None);
+        }
+
         let tokens = self.tokenizer.encode(text, true)
             .map_err(|e| MLError::InvalidResponse(format!("Tokenization error: {}", e)))?;
         
@@ -331,6 +395,10 @@ impl MLEngine {
 
     /// Returns unpooled sequence of embeddings: shape [seq_len, embedding_dim]
     pub async fn process_text_sequence(&self, text: &str) -> Result<Tensor, MLError> {
+        if self.is_mock {
+            return self.deterministic_embedding(text, text.len().max(1), None);
+        }
+
         let tokens = self.tokenizer.encode(text, true)
             .map_err(|e| MLError::InvalidResponse(format!("Tokenization error: {}", e)))?;
         

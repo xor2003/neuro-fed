@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::env;
 use std::collections::VecDeque;
+use neuro_fed_node::openai_proxy::calibration::CalibrationStore;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("4. Creating OpenAI Smart Proxy...");
     let study_state = Arc::new(RwLock::new(StudyState::default()));
     let episodic_memory = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let calibration_store = Arc::new(RwLock::new(CalibrationStore::default()));
     let proxy = Arc::new(OpenAiProxy::new(
         config,
         proxy_config,
@@ -77,6 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cognitive_dict,
         study_state,
         episodic_memory,
+        calibration_store,
+        None,
     ));
 
     // 5. Start the proxy server

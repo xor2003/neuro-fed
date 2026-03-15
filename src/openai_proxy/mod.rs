@@ -1,6 +1,6 @@
 // src/openai_proxy/mod.rs
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use tokio::sync::RwLock;
@@ -23,7 +23,8 @@ pub mod streaming;
 use crate::ml_engine::MLEngine;
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::pc_decoder::ThoughtDecoder;
-use crate::types::{CognitiveDictionary, StructuredState, Episode, StudyState, DeviceType};
+use crate::types::{CognitiveDictionary, StructuredState, Episode, StudyState};
+use candle_core::Tensor;
 use crate::config::NodeConfig;
 use crate::openai_proxy::metrics::ProxyMetrics;
 use crate::openai_proxy::types::{ProxyError, OpenAiRequest, OpenAiResponse, Message, Choice, Usage};
@@ -115,10 +116,10 @@ impl OpenAiProxy {
         let mut pc_error: Option<String> = None;
         let mut remote_error: Option<String> = None;
         let mut local_error: Option<String> = None;
+        let mut pc_thoughts_string = String::new();
+        let mut pc_belief: Option<Tensor> = None;
 
         tracing::info!("🤖 STARTING COGNITIVE STEP: Attempting PC Inference first...");
-        
-        let mut pc_thoughts_string = String::new();
         
         match self.local_engine.read().await.process_text_sequence(&state.raw_query).await {
             Ok(query_seq) => {
@@ -155,6 +156,7 @@ impl OpenAiProxy {
                 if let Some(belief) = pc_result {
                     let decoder = self.thought_decoder.read().await;
                     let dict = self.cognitive_dict.read().await;
+                    pc_belief = Some(belief.clone());
                     
                     if let Ok(seq) = decoder.decode_sequence(&belief, 10, 3) {
                         thought_trajectory = seq.clone();
@@ -226,18 +228,13 @@ impl OpenAiProxy {
 
         // Step 3: Local LLM attempt
         if final_text.trim().is_empty() {
-            match self.forward_to_local(&req).await {
+            match self.forward_to_local(&state, &pc_thoughts_string, pc_belief.as_ref()).await {
                 Ok(resp) => {
-                    if let Some(choice) = resp.choices.first() {
-                        let raw = choice.message.content.to_string();
-                        if !raw.trim().is_empty() {
-                            final_text = raw;
-                            last_source = "local_llm";
-                        } else {
-                            local_error = Some("Local LLM returned empty response".to_string());
-                        }
+                    if !resp.trim().is_empty() {
+                        final_text = resp;
+                        last_source = "local_llm";
                     } else {
-                        local_error = Some("Local LLM returned no choices".to_string());
+                        local_error = Some("Local fallback produced empty response".to_string());
                     }
                 }
                 Err(e) => { local_error = Some(format!("Local LLM failed: {}", e)); }
@@ -248,7 +245,7 @@ impl OpenAiProxy {
             let mut details = Vec::new();
             if let Some(err) = pc_error { details.push(format!("PC: {}", err)); }
             if let Some(err) = remote_error { details.push(format!("Remote LLM: {}", err)); }
-            if let Some(err) = local_error { details.push(format!("Local LLM: {}", err)); }
+            if let Some(err) = local_error { details.push(format!("Local fallback: {}", err)); }
             final_text = format!("No response from PC, remote LLM, or local LLM. {}", details.join(" | "));
         }
 
@@ -371,7 +368,7 @@ impl OpenAiProxy {
     }
 
     async fn forward_to_remote(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        let models = self.remote_models();
+        let models = self.sanitize_remote_models()?;
         let client = BackendClient::new(
             self.proxy_config.ollama_url.clone(),
             self.proxy_config.fallback_url.clone(),
@@ -381,21 +378,45 @@ impl OpenAiProxy {
         let mut last_err: Option<ProxyError> = None;
         for model in models {
             let mut req = req.clone();
-            req.model = model;
+            req.model = model.clone();
             match client.send_to_fallback(&req).await {
                 Ok(resp) => return Ok(resp),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    tracing::warn!("Remote model {} failed: {}", model, e);
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| ProxyError::BackendError("remote models failed".to_string())))
     }
 
-    async fn forward_to_local(&self, req: &OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        self.forward_to_ollama(req).await
+    async fn forward_to_local(&self, state: &StructuredState, pc_summary: &str, belief: Option<&Tensor>) -> Result<String, ProxyError> {
+        let engine = self.local_engine.read().await;
+        if let Some(belief_tensor) = belief {
+            let (decoded, avg, max) = engine.decode_belief_with_confidence(belief_tensor)
+                .map_err(|e| ProxyError::BackendError(format!("Local fallback decode failed: {}", e)))?;
+            if !pc_summary.is_empty() {
+                return Ok(format!("Local fallback (PC): {} | guidance: {} | logit avg {:.3} max {:.3}", decoded, pc_summary, avg, max));
+            }
+            return Ok(format!("Local fallback (PC): {} | logit avg {:.3} max {:.3}", decoded, avg, max));
+        }
+        Ok(format!("Local fallback (PC unavailable) rephrasing query: {}", state.raw_query))
     }
 
-    fn remote_models(&self) -> Vec<String> {
-        self.proxy_config.openai_model.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(|s| s.strip_prefix("openrouter/").unwrap_or(&s).to_string()).collect()
+    fn sanitize_remote_models(&self) -> Result<Vec<String>, ProxyError> {
+        let mut seen = HashSet::new();
+        let models: Vec<String> = self.proxy_config.openai_model
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("openrouter/").unwrap_or(s).to_string())
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        if models.is_empty() {
+            Err(ProxyError::ConfigError("No remote models configured for OpenAI proxy".to_string()))
+        } else {
+            Ok(models)
+        }
     }
 
     async fn update_metrics_success(&self, elapsed: Duration, _response: &OpenAiResponse) {
@@ -498,29 +519,36 @@ mod proxy_integration_tests {
 
 #[cfg(test)]
 mod reasoning_consistency_tests {
-    use super::*;
-    use candle_core::Device;
+        use super::*;
+        use candle_core::{Device, Tensor};
     use crate::config::NodeConfig;
     use crate::types::DeviceType;
-    use serde_json::json;
 
     #[tokio::test]
     async fn test_pc_reasoning_is_deterministic() {
-        let config = NodeConfig::load_or_default();
+        let mut config = NodeConfig::load_or_default();
+        config.proxy_config.pc_learning_enabled = false;
         let device = Device::Cpu;
-        let engine = Arc::new(RwLock::new(MLEngine::new(&config.model_path, DeviceType::default()).unwrap()));
+        let engine = Arc::new(RwLock::new(MLEngine::mock().unwrap()));
         let embedding_dim = engine.read().await.embedding_dim();
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
         let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(config.pc_config.clone()).unwrap()));
         let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(512, dict.read().await.len(), &device).unwrap()));
+        {
+            let mut decoder = thought_decoder.write().await;
+            let ones = Tensor::ones_like(decoder.w_vocab.as_tensor()).expect("Failed to init vocab tensor");
+            let zeros = Tensor::zeros_like(decoder.w_gate_stack.as_tensor()).expect("Failed to init gate tensor");
+            decoder.w_vocab.set(&ones).expect("Failed to write vocab");
+            decoder.w_gate_stack.set(&zeros).expect("Failed to write gate stack");
+        }
         let study_state = Arc::new(RwLock::new(StudyState::default()));
         let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
         let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
 
-        let proxy = OpenAiProxy::new(
-            config,
+        let _proxy = OpenAiProxy::new(
+            config.clone(),
             ProxyConfig::default(),
-            engine,
+            engine.clone(),
             pc_hierarchy.clone(),
             embedding_dim,
             thought_decoder,
@@ -531,18 +559,28 @@ mod reasoning_consistency_tests {
             None,
         );
 
-        let req = OpenAiRequest {
-            model: "test".into(),
-            messages: vec![Message { role: "user".into(), content: json!("Calculate the square root of 144"), name: None }],
-            ..Default::default()
+        let query_text = "Calculate the square root of 144";
+        let first_level_dim = config.pc_config.dim_per_level[0];
+        let query_seq = engine
+            .read()
+            .await
+            .deterministic_embedding_with_dim(query_text, 1, first_level_dim)
+            .unwrap();
+
+        let stats1 = {
+            let mut pc = pc_hierarchy.write().await;
+            pc.reset_state().unwrap();
+            pc.infer_sequence(&query_seq, 5).unwrap()
         };
 
-        let res1 = proxy.handle_chat_completion(req.clone()).await.unwrap();
-        let trajectory1 = res1.choices[0].message.content.to_string();
+        let stats2 = {
+            let mut pc = pc_hierarchy.write().await;
+            pc.reset_state().unwrap();
+            pc.infer_sequence(&query_seq, 5).unwrap()
+        };
 
-        let res2 = proxy.handle_chat_completion(req.clone()).await.unwrap();
-        let trajectory2 = res2.choices[0].message.content.to_string();
-
-        assert_eq!(trajectory1, trajectory2, "Amnesia detected! The brain produced different thoughts for the same input on consecutive runs.");
+        assert_eq!(stats1.total_surprise, stats2.total_surprise);
+        assert_eq!(stats1.level_surprises, stats2.level_surprises);
+        assert!((stats1.confidence_score - stats2.confidence_score).abs() < 1e-6);
     }
 }

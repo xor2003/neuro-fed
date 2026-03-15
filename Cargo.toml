@@ -63,6 +63,7 @@ thiserror = "2.0"
 
 # Hashing for cache keys
 sha2 = "0.10"
+ahash = "0.8"
 
 # Brain sharing (safetensors for model weights)
 safetensors = "0.7"
