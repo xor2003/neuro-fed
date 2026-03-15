@@ -7,6 +7,7 @@ use crate::pc_hierarchy::PredictiveCoding;
 use crate::pc_decoder::ThoughtDecoder;
 use crate::types::{CognitiveDictionary, Episode};
 use candle_core::{Tensor, Device};
+use tokio::task;
 
 pub struct SleepManager {
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
@@ -29,51 +30,50 @@ impl SleepManager {
     pub async fn process_sleep_cycle(&self) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("🌙 Entering SLEEP PHASE: Consolidating memory...");
         
-        let mut memory = self.episodic_memory.write().await;
-        if memory.is_empty() {
-            tracing::info!("No new episodes to consolidate.");
-            return Ok(());
-        }
+        let episodes = {
+            let mut memory = self.episodic_memory.write().await;
+            if memory.is_empty() {
+                tracing::info!("No new episodes to consolidate.");
+                return Ok(());
+            }
+            memory.drain(..).collect::<Vec<Episode>>()
+        };
 
-        let episodes: Vec<Episode> = memory.iter().cloned().collect();
-        
         // 1. Chunk Discovery on successful episodes
-        let mut dict = self.dict.write().await;
-        let new_chunks = dict.discover_chunks(&episodes);
-        let new_dict_len = dict.len();
-        drop(dict);
+        let (new_chunks, new_dict_len) = {
+            let mut dict = self.dict.write().await;
+            let chunks = dict.discover_chunks(&episodes);
+            let len = dict.len();
+            (chunks, len)
+        };
 
-        // 1.5. Expand Decoder Matrix if new thoughts were chunked
         if new_chunks > 0 {
             tracing::info!("🧠 Discovered {} new thought chunks! Expanding Decoder Matrix...", new_chunks);
             let mut decoder = self.decoder.write().await;
             decoder.resize_vocab(new_dict_len).map_err(|e| e.to_string())?;
+            drop(decoder);
         }
 
-        // 2. Safe Slow Memory Update over Sequences
-        let mut decoder = self.decoder.write().await;
-        let mut pc = self.pc_hierarchy.write().await;
         let mut total_loss = 0.0;
         let mut learned_count = 0;
 
-        for ep in episodes.iter().filter(|e| e.success) {
+        for ep in episodes.into_iter().filter(|e| e.success) {
             if ep.query_sequence.is_empty() { continue; }
             let seq_len = ep.query_sequence.len();
             let dim = ep.query_sequence[0].len();
             if dim == 0 { continue; }
-            
+
             let flat_data: Vec<f32> = ep.query_sequence.iter().flatten().copied().collect();
             let embed_tensor = Tensor::from_vec(flat_data, (seq_len, dim), &Device::Cpu)?;
-            
+
+            let mut pc = self.pc_hierarchy.write().await;
+            let mut decoder = self.decoder.write().await;
+
             pc.reset_state().map_err(|e| e.to_string())?;
 
-            // Use learn_sequence for proper temporal processing
             if ep.novelty > 2.0 {
                 pc.checkpoint_weights().map_err(|e| e.to_string())?;
-                
                 let stats = pc.learn_sequence(&embed_tensor, None).map_err(|e| e.to_string())?;
-                
-                // Rollback if learning caused divergence
                 if stats.total_surprise.is_nan() || stats.total_surprise > 1000.0 {
                     pc.rollback_weights().map_err(|e| e.to_string())?;
                 }
@@ -82,18 +82,22 @@ impl SleepManager {
             }
 
             let belief = pc.levels.last().unwrap().beliefs.flatten_all()?;
-            
-            if let Ok(loss) = decoder.train_step(&belief, &ep.thought_sequence, 0.01) {
+
+        if let Ok(loss) = decoder.train_step(&belief, &ep.thought_sequence, 0.05) {
                 total_loss += loss;
                 learned_count += 1;
             }
+
+            drop(decoder);
+            drop(pc);
+            task::yield_now().await;
         }
 
         if learned_count > 0 {
             tracing::info!("📈 Sleep training complete. Avg Loss: {:.4}", total_loss / learned_count as f32);
         }
 
-        memory.clear();
+        self.episodic_memory.write().await.clear();
         tracing::info!("☀️ Waking up. Episodic memory cleared.");
         Ok(())
     }

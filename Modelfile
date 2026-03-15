@@ -1,1 +1,1 @@
-FROM /home/xor/neurofed/models/gguf_model.gguf
+FROM /home/xor/neurofed/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf

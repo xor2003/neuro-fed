@@ -31,8 +31,10 @@ use crate::openai_proxy::components::ProxyConfig;
 use crate::semantic_cache::SemanticCache;
 use crate::openai_proxy::calibration::CalibrationStore;
 use crate::openai_proxy::client::BackendClient;
+use crate::sleep_phase::SleepManager;
 
 const REMOTE_PRICE_PER_1K_TOKENS_USD: f64 = 0.002;
+const EPISODIC_MEMORY_CAPACITY: usize = 50;
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
@@ -281,6 +283,35 @@ impl OpenAiProxy {
             thought_sequence: thought_trajectory,
             success,
         });
+
+        // 🔴 FIX: PREVENT OOM AND ENFORCE SLEEP CYCLE WHEN MEMORY IS FULL
+        if self.episodic_memory.read().await.len() >= EPISODIC_MEMORY_CAPACITY {
+            tracing::warn!("🧠 Episodic memory full ({} entries). Forcing sleep cycle.", EPISODIC_MEMORY_CAPACITY);
+            let pc_clone = self.pc_hierarchy.clone();
+            let decoder_clone = self.thought_decoder.clone();
+            let dict_clone = self.cognitive_dict.clone();
+            let mem_clone = self.episodic_memory.clone();
+            let state_clone = self.study_state.clone();
+
+            tokio::spawn(async move {
+                {
+                    let mut state = state_clone.write().await;
+                    state.is_studying = true;
+                    state.current_file = "Forced Sleep Phase (Memory Full)".to_string();
+                    state.progress_percent = 0.0;
+                }
+
+                let sleep_mgr = SleepManager::new(pc_clone, decoder_clone, dict_clone, mem_clone);
+                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
+                    tracing::error!("Forced sleep cycle failed: {}", e);
+                }
+
+                let mut state = state_clone.write().await;
+                state.is_studying = false;
+                state.current_file = "".to_string();
+                state.progress_percent = 100.0;
+            });
+        }
 
         let estimated_completion_tokens = estimate_tokens_from_text(&final_text);
         let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;

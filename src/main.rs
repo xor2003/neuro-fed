@@ -550,7 +550,8 @@ async fn main() -> Result<()> {
         tracing::info!("🧠 DIAGNOSTIC: Brain weights look mature and structurally formed.");
     }
 
-    if config.bootstrap_on_start && (db_missing || !has_weights) {
+    let should_bootstrap = should_spawn_bootstrap(&config, db_missing, has_weights);
+    if should_bootstrap {
         let mut bootstrap = BootstrapManager::new(
             ml_engine.clone(),
             thought_decoder.clone(),
@@ -561,16 +562,25 @@ async fn main() -> Result<()> {
         );
         bootstrap.shutdown_signal = stop_signal_for_bootstrap; // <--- WIRE IT UP
 
+        let force_training = config.force_synthetic_training_on_boot;
+        let training_needed = should_run_synthetic_training(force_training, is_decoder_random, db_missing, has_weights);
+
         tokio::spawn(async move {
-            tracing::info!("🚀 Running synthetic bootstrap training...");
-            if let Err(e) = bootstrap.run_synthetic_training().await {
-                tracing::warn!("Bootstrap synthetic training failed: {}", e);
+            if training_needed {
+                tracing::info!("🚀 Running synthetic bootstrap training...");
+                if let Err(e) = bootstrap.run_synthetic_training().await {
+                    tracing::warn!("Bootstrap synthetic training failed: {}", e);
+                }
+            } else {
+                tracing::info!("Synthetic bootstrap training skipped: brain already trained and force flag is off.");
             }
         });
-    } else if config.bootstrap_on_start && !db_missing && has_weights {
-        tracing::info!("Bootstrap skipped: existing DB with weights found at {}", db_path);
-    } else if config.bootstrap_on_start && !db_missing && !has_weights {
-        tracing::info!("Bootstrap scheduled: DB exists but contains no weights at {}", db_path);
+    } else if config.bootstrap_on_start {
+        if has_weights && !db_missing {
+            tracing::info!("Bootstrap skipped: existing DB with weights found at {}", db_path);
+        } else if !has_weights && !db_missing {
+            tracing::info!("Bootstrap scheduled: DB exists but contains no weights at {}", db_path);
+        }
     }
 
     // Start persistent event-driven study system with notify watcher
@@ -704,6 +714,31 @@ async fn start_file_watcher(
     Ok(())
 }
 
+fn should_spawn_bootstrap(config: &NodeConfig, db_missing: bool, has_weights: bool) -> bool {
+    if !config.bootstrap_on_start {
+        return false;
+    }
+
+    db_missing || !has_weights || config.force_synthetic_training_on_boot
+}
+
+fn should_run_synthetic_training(
+    force_flag: bool,
+    is_decoder_random: bool,
+    db_missing: bool,
+    has_weights: bool,
+) -> bool {
+    if force_flag {
+        return true;
+    }
+
+    if db_missing || !has_weights {
+        return true;
+    }
+
+    is_decoder_random
+}
+
 #[cfg(test)]
 mod main_architecture_tests {
     use super::*;
@@ -740,5 +775,29 @@ mod main_architecture_tests {
         assert_eq!(injected_weights[0].len(), 1024);
         
         Ok(())
+    }
+
+    #[test]
+    fn test_should_spawn_bootstrap_when_forced_or_missing_weights() {
+        let mut config = NodeConfig::default();
+        config.bootstrap_on_start = true;
+        config.force_synthetic_training_on_boot = false;
+
+        assert!(should_spawn_bootstrap(&config, true, false));
+        assert!(should_spawn_bootstrap(&config, false, false));
+
+        config.force_synthetic_training_on_boot = true;
+        assert!(should_spawn_bootstrap(&config, false, true));
+
+        config.bootstrap_on_start = false;
+        assert!(!should_spawn_bootstrap(&config, true, false));
+    }
+
+    #[test]
+    fn test_should_run_synthetic_training_conditions() {
+        assert!(should_run_synthetic_training(true, false, false, true));
+        assert!(should_run_synthetic_training(false, true, false, true));
+        assert!(should_run_synthetic_training(false, false, true, false));
+        assert!(!should_run_synthetic_training(false, false, false, true));
     }
 }
