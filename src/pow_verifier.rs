@@ -1,15 +1,15 @@
 // src/pow_verifier.rs
 // Proof-of-work verification for no-wallet mode
 
-use std::time::{Duration, SystemTime, Instant};
-use sha2::{Sha256, Digest};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::info;
-use async_trait::async_trait;
 
-use crate::types::PoWVerification;
 use crate::federation_manager::PoWVerifier as PoWVerifierTrait;
+use crate::types::PoWVerification;
 
 /// Errors that can occur during PoW verification
 #[derive(Error, Debug, Clone)]
@@ -51,9 +51,9 @@ impl PoWVerifier {
         timeout: Duration,
     ) -> Result<PoWVerification, PoWVerifierError> {
         info!("Verifying PoW proof with difficulty {}", difficulty);
-        
+
         let start_time = Instant::now();
-        
+
         // Parse proof
         let proof: PoWProof = serde_json::from_str(pow_proof)
             .map_err(|e| PoWVerifierError::InvalidProof(e.to_string()))?;
@@ -85,7 +85,9 @@ impl PoWVerifier {
 
         // Check timeout
         if start_time.elapsed() > timeout {
-            return Err(PoWVerifierError::Timeout("Verification timed out".to_string()));
+            return Err(PoWVerifierError::Timeout(
+                "Verification timed out".to_string(),
+            ));
         }
 
         Ok(PoWVerification {
@@ -99,7 +101,7 @@ impl PoWVerifier {
     /// Generate a PoW challenge
     pub async fn generate_pow_challenge(&self, data: &str) -> Result<String, PoWVerifierError> {
         info!("Generating PoW challenge for data: {}", data);
-        
+
         let challenge = PoWChallenge {
             data: data.to_string(),
             timestamp: SystemTime::now()
@@ -109,8 +111,7 @@ impl PoWVerifier {
             target_difficulty: 5, // Default difficulty
         };
 
-        serde_json::to_string(&challenge)
-            .map_err(|e| PoWVerifierError::InvalidProof(e.to_string()))
+        serde_json::to_string(&challenge).map_err(|e| PoWVerifierError::InvalidProof(e.to_string()))
     }
 
     /// Compute hash of data + nonce
@@ -159,18 +160,26 @@ impl PoWVerifier {
     }
 
     /// Mine a proof-of-work (for testing)
-    pub async fn mine_pow(&self, data: &str, difficulty: u32, timeout: Duration) -> Result<PoWProof, PoWVerifierError> {
-        info!("Mining PoW for data: {} with difficulty {}", data, difficulty);
-        
+    pub async fn mine_pow(
+        &self,
+        data: &str,
+        difficulty: u32,
+        timeout: Duration,
+    ) -> Result<PoWProof, PoWVerifierError> {
+        info!(
+            "Mining PoW for data: {} with difficulty {}",
+            data, difficulty
+        );
+
         // Clone data for move into spawn_blocking
         let data = data.to_string();
         let max_nonce = self.max_nonce;
         let hash_algorithm = self.hash_algorithm.clone();
-        
+
         // Perform CPU-intensive mining in spawn_blocking
         tokio::task::spawn_blocking(move || {
             let start_time = Instant::now();
-            
+
             // Use sequential nonce search for deterministic mining
             for nonce in 0..max_nonce {
                 if start_time.elapsed() > timeout {
@@ -192,9 +201,14 @@ impl PoWVerifier {
                 }
             }
 
-            Err(PoWVerifierError::Timeout("Max nonce attempts exceeded".to_string()))
-        }).await
-        .map_err(|join_err| PoWVerifierError::Timeout(format!("Mining task panicked: {}", join_err)))?
+            Err(PoWVerifierError::Timeout(
+                "Max nonce attempts exceeded".to_string(),
+            ))
+        })
+        .await
+        .map_err(|join_err| {
+            PoWVerifierError::Timeout(format!("Mining task panicked: {}", join_err))
+        })?
     }
 }
 
@@ -219,11 +233,12 @@ impl PoWVerifierTrait for PoWVerifier {
             .await
             .map_err(Into::into)
     }
-    
-    async fn generate_pow_challenge(&self, data: &str) -> Result<String, Box<dyn std::error::Error>> {
-        self.generate_pow_challenge(data)
-            .await
-            .map_err(Into::into)
+
+    async fn generate_pow_challenge(
+        &self,
+        data: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.generate_pow_challenge(data).await.map_err(Into::into)
     }
 }
 
@@ -258,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_pow_success() {
         let verifier = PoWVerifier::default();
-        
+
         // Create a simple proof (this would normally be mined)
         let proof = PoWProof {
             data: "test_data".to_string(),
@@ -266,9 +281,11 @@ mod tests {
             hash: verifier.compute_hash("test_data", 12345),
             timestamp: 1234567890,
         };
-        
+
         let proof_json = serde_json::to_string(&proof).unwrap();
-        let result = verifier.verify_pow(&proof_json, 0, Duration::from_secs(5)).await;
+        let result = verifier
+            .verify_pow(&proof_json, 0, Duration::from_secs(5))
+            .await;
         assert!(result.is_ok());
         let verification = result.unwrap();
         assert!(verification.verified);
@@ -278,16 +295,18 @@ mod tests {
     #[tokio::test]
     async fn test_verify_pow_invalid_hash() {
         let verifier = PoWVerifier::default();
-        
+
         let proof = PoWProof {
             data: "test_data".to_string(),
             nonce: 12345,
             hash: "invalid_hash".to_string(),
             timestamp: 1234567890,
         };
-        
+
         let proof_json = serde_json::to_string(&proof).unwrap();
-        let result = verifier.verify_pow(&proof_json, 0, Duration::from_secs(5)).await;
+        let result = verifier
+            .verify_pow(&proof_json, 0, Duration::from_secs(5))
+            .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             PoWVerifierError::HashMismatch(_) => {}
@@ -307,7 +326,9 @@ mod tests {
     #[tokio::test]
     async fn test_mine_pow() {
         let verifier = PoWVerifier::new("sha256".to_string(), 1000);
-        let result = verifier.mine_pow("test_data", 2, Duration::from_secs(1)).await;
+        let result = verifier
+            .mine_pow("test_data", 2, Duration::from_secs(1))
+            .await;
         // Might succeed or timeout depending on difficulty
         // Just ensure no panic
         assert!(result.is_ok() || matches!(result.err(), Some(PoWVerifierError::Timeout(_))));

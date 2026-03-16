@@ -1,14 +1,14 @@
 // src/semantic_cache.rs
 // High-performance semantic cache with HNSW vector index and Moka cache
 
+use anyhow::Result;
+use hnsw_rs::prelude::*;
+use moka::future::Cache;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use moka::future::Cache;
-use hnsw_rs::prelude::*;
-use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn};
-use anyhow::Result;
+use tracing::{debug, info, warn};
 
 use crate::openai_proxy::types::{OpenAiRequest, OpenAiResponse};
 use crate::persistence::{PCPersistence, SemanticCacheEntryDB};
@@ -56,7 +56,7 @@ impl SemanticCache {
         let max_nb_connection = 16;
         let nb_layer = 16.min((max_cache_size as f32).log2() as usize);
         let ef_c = 200;
-        
+
         let vector_index = Hnsw::<'static, f32, DistCosine>::new(
             max_nb_connection,
             max_cache_size as usize,
@@ -64,14 +64,14 @@ impl SemanticCache {
             ef_c,
             DistCosine {},
         );
-        
+
         // Configure Moka cache with time-based eviction
         let cache = Cache::builder()
             .max_capacity(max_cache_size)
             .time_to_idle(std::time::Duration::from_secs(3600)) // 1 hour idle
             .time_to_live(std::time::Duration::from_secs(86400)) // 24 hours max
             .build();
-        
+
         Self {
             cache,
             vector_index,
@@ -83,18 +83,18 @@ impl SemanticCache {
             db,
         }
     }
-    
+
     /// Generate hash for a request (for exact matching)
     fn generate_request_hash(&self, request: &OpenAiRequest) -> String {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let request_json = serde_json::to_string(request).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(request_json);
         let result = hasher.finalize();
         format!("{:x}", result)
     }
-    
+
     /// Check cache for similar requests using vector similarity
     pub async fn check_similarity(
         &mut self,
@@ -114,19 +114,19 @@ impl SemanticCache {
                 return Some(entry.response.clone());
             }
         }
-        
+
         // If no exact match, search for similar embeddings
         if self.vector_index.get_nb_point() == 0 {
             return None;
         }
-        
+
         // Search for nearest neighbors
         let search_result = self.vector_index.search(embedding, 1, 24);
-        
+
         if let Some(nearest) = search_result.first() {
             // Distance is 1.0 - CosineSimilarity, so we invert it
             let similarity = 1.0 - nearest.distance;
-            
+
             if similarity >= self.similarity_threshold {
                 let id = nearest.d_id as u32;
                 if let Some(entry) = self.cache.get(&id).await {
@@ -140,10 +140,10 @@ impl SemanticCache {
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Add new request-response pair to cache
     pub async fn add_to_cache(
         &mut self,
@@ -160,12 +160,12 @@ impl SemanticCache {
                 embedding.len()
             ));
         }
-        
+
         let id = self.next_id;
         self.next_id += 1;
-        
+
         let request_hash = self.generate_request_hash(&request);
-        
+
         let entry = SemanticCacheEntry {
             id,
             request: request.clone(),
@@ -174,34 +174,34 @@ impl SemanticCache {
             access_count: 1,
             last_accessed: current_timestamp(),
         };
-        
+
         // Add to Moka cache
         self.cache.insert(id, entry.clone()).await;
-        
+
         // Add to hash mapping
         self.hash_to_id.insert(request_hash, id);
-        
+
         // Add to HNSW vector index
         self.vector_index.insert((&embedding, id as usize));
-        
+
         debug!("Added new entry to semantic cache with ID: {}", id);
-        
+
         // Persist to database if available
         if let Some(db) = db {
             if let Err(e) = self.save_entry_to_db(db, id).await {
                 warn!("Failed to persist cache entry {}: {}", id, e);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get cache statistics
     pub async fn get_stats(&self) -> CacheStats {
         let cache_size = self.cache.entry_count();
         let vector_index_size = self.vector_index.get_nb_point();
         let hash_map_size = self.hash_to_id.len();
-        
+
         CacheStats {
             cache_size,
             vector_index_size,
@@ -211,7 +211,7 @@ impl SemanticCache {
             embedding_dim: self.embedding_dim,
         }
     }
-    
+
     /// Clear the entire cache
     pub async fn clear(&mut self) {
         self.cache.invalidate_all();
@@ -220,7 +220,7 @@ impl SemanticCache {
         let max_nb_connection = 16;
         let nb_layer = 16.min((self.max_cache_size as f32).log2() as usize);
         let ef_c = 200;
-        
+
         self.vector_index = Hnsw::<'static, f32, DistCosine>::new(
             max_nb_connection,
             self.max_cache_size as usize,
@@ -229,34 +229,34 @@ impl SemanticCache {
             DistCosine {},
         );
         self.next_id = 1;
-        
+
         info!("Semantic cache cleared");
     }
-    
+
     /// Load cache from database on startup
     pub async fn load_from_db(&mut self, db: &PCPersistence) -> Result<()> {
         let Some(_pool) = &self.db else {
             warn!("No database pool configured, skipping load");
             return Ok(());
         };
-        
+
         let entries = db.load_semantic_cache_entries().await?;
         let entry_count = entries.len();
         info!("Loading {} entries from semantic cache DB", entry_count);
-        
+
         for db_entry in entries {
             // Deserialize embedding from bytes
             let embedding: Vec<f32> = bincode::deserialize(&db_entry.embedding)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize embedding: {}", e))?;
-            
+
             // Reconstruct request and response from JSON
             let request: OpenAiRequest = serde_json::from_str(&db_entry.prompt_text)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize request: {}", e))?;
             let response: OpenAiResponse = serde_json::from_str(&db_entry.response_json)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))?;
-            
+
             let id = db_entry.id as u32;
-            
+
             // Create cache entry
             let entry = SemanticCacheEntry {
                 id,
@@ -266,50 +266,52 @@ impl SemanticCache {
                 access_count: db_entry.access_count as u64,
                 last_accessed: db_entry.last_accessed as u64,
             };
-            
+
             // Insert into Moka cache
             self.cache.insert(id, entry.clone()).await;
-            
+
             // Insert into hash mapping
             let request_hash = self.generate_request_hash(&entry.request);
             self.hash_to_id.insert(request_hash, id);
-            
+
             // Insert into HNSW vector index
             self.vector_index.insert((&embedding, id as usize));
-            
+
             // Update next_id to avoid collisions
             if id >= self.next_id {
                 self.next_id = id + 1;
             }
         }
-        
-        info!("Loaded {} entries from semantic cache (HNSW: {}, hashmap: {})",
+
+        info!(
+            "Loaded {} entries from semantic cache (HNSW: {}, hashmap: {})",
             entry_count,
             self.vector_index.get_nb_point(),
-            self.hash_to_id.len());
-        
+            self.hash_to_id.len()
+        );
+
         Ok(())
     }
-    
+
     /// Save a single cache entry to database (called after add_to_cache)
     pub async fn save_entry_to_db(&self, db: &PCPersistence, id: u32) -> Result<()> {
         let Some(entry) = self.cache.get(&id).await else {
             return Ok(()); // Entry was evicted
         };
-        
+
         // Serialize embedding to bytes
         let embedding_bytes = bincode::serialize(&entry.embedding)
             .map_err(|e| anyhow::anyhow!("Failed to serialize embedding: {}", e))?;
-        
+
         // Serialize request and response to JSON
         let request_json = serde_json::to_string(&entry.request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
         let response_json = serde_json::to_string(&entry.response)
             .map_err(|e| anyhow::anyhow!("Failed to serialize response: {}", e))?;
-        
+
         // Generate prompt hash
         let prompt_hash = self.generate_request_hash(&entry.request);
-        
+
         let db_entry = SemanticCacheEntryDB {
             id: id as i64,
             prompt_hash,
@@ -319,22 +321,22 @@ impl SemanticCache {
             access_count: entry.access_count as i64,
             last_accessed: entry.last_accessed as i64,
         };
-        
+
         db.save_semantic_cache_entry(&db_entry).await?;
         debug!("Saved cache entry {} to database", id);
         Ok(())
     }
-    
+
     /// Save all cache entries to database (bulk operation)
     pub async fn save_all_to_db(&self, db: &PCPersistence) -> Result<()> {
         let Some(_pool) = &self.db else {
             warn!("No database pool configured, skipping save");
             return Ok(());
         };
-        
+
         let stats = self.get_stats().await;
         info!("Saving {} cache entries to database", stats.cache_size);
-        
+
         // Iterate through all entries in the cache
         for (id_arc, _entry) in self.cache.iter() {
             let id = *id_arc;
@@ -342,7 +344,7 @@ impl SemanticCache {
                 warn!("Failed to save entry {}: {}", id, e);
             }
         }
-        
+
         info!("Saved {} cache entries to database", stats.cache_size);
         Ok(())
     }
@@ -397,34 +399,52 @@ mod semantic_cache_vector_tests {
         // Vector 1:[1.0, 0.0, 0.0] (Represents a specific concept)
         let (req1, res1) = mock_req_res("What is the capital of France?");
         let emb1 = vec![1.0, 0.0, 0.0];
-        
-        cache.add_to_cache(req1, res1, emb1.clone(), None).await.unwrap();
+
+        cache
+            .add_to_cache(req1, res1, emb1.clone(), None)
+            .await
+            .unwrap();
 
         // 1. Exact Match Test
-        let hit = cache.check_similarity(&emb1, &mock_req_res("What is the capital of France?").0).await;
+        let hit = cache
+            .check_similarity(&emb1, &mock_req_res("What is the capital of France?").0)
+            .await;
         assert!(hit.is_some(), "Exact hash match failed to hit the cache!");
 
         // 2. Fuzzy Semantic Match Test (Slightly noisy vector: [0.99, 0.1, 0.0])
         // This simulates the user asking "Can you tell me the capital of France?"
         let fuzzy_emb = vec![0.99, 0.1, 0.0];
-        let fuzzy_hit = cache.check_similarity(&fuzzy_emb, &mock_req_res("Tell me Paris").0).await;
-        assert!(fuzzy_hit.is_some(), "HNSW Vector search failed to find a highly similar semantic match!");
+        let fuzzy_hit = cache
+            .check_similarity(&fuzzy_emb, &mock_req_res("Tell me Paris").0)
+            .await;
+        assert!(
+            fuzzy_hit.is_some(),
+            "HNSW Vector search failed to find a highly similar semantic match!"
+        );
 
         // 3. Orthogonal Miss Test (Completely different concept: [0.0, 1.0, 0.0])
         // Simulates the user asking "How to bake a cake?"
         let different_emb = vec![0.0, 1.0, 0.0];
-        let miss = cache.check_similarity(&different_emb, &mock_req_res("How to bake a cake?").0).await;
-        assert!(miss.is_none(), "Cache returned a hit for a completely unrelated vector! Similarity threshold is broken.");
+        let miss = cache
+            .check_similarity(&different_emb, &mock_req_res("How to bake a cake?").0)
+            .await;
+        assert!(
+            miss.is_none(),
+            "Cache returned a hit for a completely unrelated vector! Similarity threshold is broken."
+        );
     }
 
     #[tokio::test]
     async fn test_cache_dimension_validation() {
         let mut cache = SemanticCache::new(100, 1024, 0.8, None); // Expects dim 1024
-        
+
         let (req, res) = mock_req_res("Test");
         let bad_emb = vec![0.5, 0.5]; // Only dim 2
-        
+
         let result = cache.add_to_cache(req, res, bad_emb, None).await;
-        assert!(result.is_err(), "Cache accepted an embedding of the wrong dimension!");
+        assert!(
+            result.is_err(),
+            "Cache accepted an embedding of the wrong dimension!"
+        );
     }
 }

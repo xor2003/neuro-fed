@@ -1,16 +1,21 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 #[cfg(not(feature = "web-ui"))]
 fn main() {
-    eprintln!("This binary requires the 'web-ui' feature. Run: cargo run --features web-ui --bin neurofed-tauri");
+    eprintln!(
+        "This binary requires the 'web-ui' feature. Run: cargo run --features web-ui --bin neurofed-tauri"
+    );
 }
 
 #[cfg(feature = "web-ui")]
 fn main() -> tauri::Result<()> {
-    use std::process::Command;
-    use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
     use serde::Deserialize;
+    use std::net::{SocketAddr, TcpStream};
+    use std::process::Command;
+    use std::time::Duration;
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{TrayIconBuilder, TrayIconEvent};
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -26,7 +31,8 @@ fn main() -> tauri::Result<()> {
         .setup(move |app| {
             // Best-effort: start backend if it's not running
             let backend_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-            let backend_alive = TcpStream::connect_timeout(&backend_addr, Duration::from_millis(200)).is_ok();
+            let backend_alive =
+                TcpStream::connect_timeout(&backend_addr, Duration::from_millis(200)).is_ok();
             if !backend_alive {
                 let mut backend_path = std::env::current_exe()?;
                 #[cfg(target_os = "windows")]
@@ -34,8 +40,7 @@ fn main() -> tauri::Result<()> {
                 #[cfg(not(target_os = "windows"))]
                 backend_path.set_file_name("neuro-fed-node");
 
-                let _ = Command::new(backend_path)
-                    .spawn();
+                let _ = Command::new(backend_path).spawn();
             }
 
             let window = if let Some(existing) = app.get_webview_window("main") {
@@ -60,9 +65,12 @@ fn main() -> tauri::Result<()> {
             menu.append(&open_ui)?;
             menu.append(&quit)?;
 
-            let icon_green = tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_green.png"))?;
-            let icon_yellow = tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_yellow.png"))?;
-            let icon_red = tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_red.png"))?;
+            let icon_green =
+                tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_green.png"))?;
+            let icon_yellow =
+                tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_yellow.png"))?;
+            let icon_red =
+                tauri::image::Image::from_bytes(include_bytes!("../../ui/tray_red.png"))?;
 
             let tray = TrayIconBuilder::new()
                 .icon(icon_green.clone())
@@ -109,7 +117,8 @@ fn main() -> tauri::Result<()> {
                 loop {
                     if let Ok(resp) = client.get("http://localhost:8080/ui/state").send().await {
                         if let Ok(state) = resp.json::<UiStateLight>().await {
-                            let source = state.last_source.unwrap_or_else(|| "local_pc".to_string());
+                            let source =
+                                state.last_source.unwrap_or_else(|| "local_pc".to_string());
                             if source != last_source {
                                 let icon = match source.as_str() {
                                     "remote_llm" => &icon_red,

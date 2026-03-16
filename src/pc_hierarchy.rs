@@ -2,18 +2,18 @@
 // Pure Predictive Coding (PC) implementation based on Rao-Ballard/Friston free-energy minimization
 // Migrated from ndarray to candle-core for GPU acceleration
 
-use candle_core::{Device, Tensor, Result as CandleResult};
-use tokio::sync::mpsc;
+use candle_core::{Device, Result as CandleResult, Tensor};
 use chrono;
+use tokio::sync::mpsc;
 
 use crate::knowledge_filter::{PrecisionCalculator, PrecisionConfig, PrecisionContext};
-pub use crate::pc_types::{PCError, PCConfig, SurpriseStats};
 use crate::pc_level::PCLevel;
+pub use crate::pc_types::{PCConfig, PCError, SurpriseStats};
 use crate::persistence::{DeltaHistory, PCLevelWeights};
 
 #[derive(Debug)]
 pub struct AmortizedPredictor {
-    fast_path: Tensor,   // маленький слой: belief → predicted_final_belief
+    fast_path: Tensor, // маленький слой: belief → predicted_final_belief
 }
 
 impl AmortizedPredictor {
@@ -32,8 +32,8 @@ impl AmortizedPredictor {
 #[derive(Debug)]
 pub struct PrecisionHyperNet {
     // Small MLP: surprise_scalar -> [hidden] -> precision_scaling_factors
-    weights1: Tensor,  // (1, hidden_dim)
-    weights2: Tensor,  // (hidden_dim, max_levels)
+    weights1: Tensor, // (1, hidden_dim)
+    weights2: Tensor, // (hidden_dim, max_levels)
     max_levels: usize,
 }
 
@@ -42,26 +42,30 @@ impl PrecisionHyperNet {
         let hidden_dim = 16; // Small hidden layer for efficiency
         let weights1 = Tensor::randn(0f32, 0.01f32, (1, hidden_dim), device)?;
         let weights2 = Tensor::randn(0f32, 0.01f32, (hidden_dim, max_levels), device)?;
-        
+
         Ok(Self {
             weights1,
             weights2,
             max_levels,
         })
     }
-    
+
     /// Compute precision scaling factors based on surprise magnitude
     /// Input: surprise_scalar (f32) - overall surprise magnitude
     /// Output: Vec<f32> of length max_levels with precision scaling factors (0.1 to 2.0)
-    pub fn compute_precision_scales(&self, surprise_scalar: f32, device: &Device) -> CandleResult<Vec<f32>> {
+    pub fn compute_precision_scales(
+        &self,
+        surprise_scalar: f32,
+        device: &Device,
+    ) -> CandleResult<Vec<f32>> {
         // Convert surprise to tensor
         let surprise_tensor = Tensor::from_slice(&[surprise_scalar], (1, 1), device)?;
-        
+
         // Forward pass through small MLP
         let hidden = surprise_tensor.matmul(&self.weights1)?;
         let hidden_relu = hidden.relu()?;
         let output = hidden_relu.matmul(&self.weights2)?;
-        
+
         // Apply sigmoid to get scaling factors between 0.1 and 2.0
         // Using custom sigmoid: 1.0 / (1.0 + exp(-x))
         let neg_output = output.affine(-1.0, 0.0)?;
@@ -70,11 +74,11 @@ impl PrecisionHyperNet {
         let denom = one.broadcast_add(&exp_neg)?;
         let output_sigmoid = one.broadcast_div(&denom)?;
         let scaled = output_sigmoid.affine(1.9, 0.1)?; // Scale to [0.1, 2.0]
-        
+
         // 🔴 ИСПРАВЛЕНИЕ: Тензор scaled имеет размерность (1, max_levels).
         // Мы преобразуем его в Vec<Vec<f32>> и берем первый ряд.
         let vals = scaled.to_vec2::<f32>()?;
-        
+
         if vals.is_empty() {
             return Ok(vec![1.0; self.max_levels]); // Fallback, если что-то пойдет не так
         }
@@ -82,20 +86,26 @@ impl PrecisionHyperNet {
         // Возвращаем первую строку (значения для всех слоев)
         Ok(vals[0].clone())
     }
-    
+
     /// Update hyper-network weights based on performance feedback
-    pub fn update(&mut self, surprise_scalar: f32, target_scales: &[f32], _learning_rate: f32, device: &Device) -> CandleResult<()> {
+    pub fn update(
+        &mut self,
+        surprise_scalar: f32,
+        target_scales: &[f32],
+        _learning_rate: f32,
+        device: &Device,
+    ) -> CandleResult<()> {
         // Simple gradient descent update for demonstration
         // In a full implementation, this would use backpropagation through the hyper-network
         let current_scales = self.compute_precision_scales(surprise_scalar, device)?;
-        
+
         // Compute error and update weights (simplified)
         for i in 0..self.max_levels.min(target_scales.len()) {
             let _error = target_scales[i] - current_scales[i];
             // Simplified update - in reality would need proper backprop
             // This is a placeholder for the actual learning rule
         }
-        
+
         Ok(())
     }
 }
@@ -124,10 +134,10 @@ impl PredictiveCoding {
         let device = Device::Cpu;
         Self::new_with_device(config, device)
     }
-    
+
     pub fn new_with_device(config: PCConfig, device: Device) -> Result<Self, PCError> {
         let mut levels = Vec::new();
-        
+
         for i in 0..config.n_levels {
             let input_dim = config.dim_per_level[i];
             let output_dim = if i + 1 < config.n_levels {
@@ -136,11 +146,11 @@ impl PredictiveCoding {
                 // Top level has no upward projection
                 config.dim_per_level[i]
             };
-            
+
             let level = PCLevel::new(input_dim, output_dim, &device)?;
             levels.push(level);
         }
-        
+
         let precision_calculator = if config.enable_precision_weighting {
             Some(PrecisionCalculator::new(PrecisionConfig {
                 free_energy_drop_threshold: config.free_energy_drop_threshold,
@@ -158,8 +168,9 @@ impl PredictiveCoding {
         };
 
         // Precompute LR tensors for inference updates
-        let (cached_lr_errors, cached_lr_up) = Self::build_lr_cache(&levels, config.learning_rate, &device)?;
-        
+        let (cached_lr_errors, cached_lr_up) =
+            Self::build_lr_cache(&levels, config.learning_rate, &device)?;
+
         let cached_lr_value = config.learning_rate;
         let amortized = AmortizedPredictor::new(config.dim_per_level[0], &device)?;
         let precision_hyper = PrecisionHyperNet::new(config.n_levels, &device)?;
@@ -180,13 +191,16 @@ impl PredictiveCoding {
         })
     }
 
-    fn build_lr_cache(levels: &[PCLevel], lr: f32, device: &Device) -> Result<(Vec<Tensor>, Vec<Tensor>), PCError> {
+    fn build_lr_cache(
+        levels: &[PCLevel],
+        lr: f32,
+        device: &Device,
+    ) -> Result<(Vec<Tensor>, Vec<Tensor>), PCError> {
         let mut cached_lr_errors = Vec::with_capacity(levels.len());
         let mut cached_lr_up = Vec::with_capacity(levels.len());
         for i in 0..levels.len() {
             let err_shape = levels[i].errors.shape();
-            let lr_err = Tensor::from_slice(&[lr], (1, 1), device)?
-                .broadcast_as(err_shape)?;
+            let lr_err = Tensor::from_slice(&[lr], (1, 1), device)?.broadcast_as(err_shape)?;
             cached_lr_errors.push(lr_err);
 
             let up_shape = if i + 1 < levels.len() {
@@ -194,8 +208,7 @@ impl PredictiveCoding {
             } else {
                 levels[i].beliefs.shape()
             };
-            let lr_up = Tensor::from_slice(&[lr], (1, 1), device)?
-                .broadcast_as(up_shape)?;
+            let lr_up = Tensor::from_slice(&[lr], (1, 1), device)?.broadcast_as(up_shape)?;
             cached_lr_up.push(lr_up);
         }
         Ok((cached_lr_errors, cached_lr_up))
@@ -203,18 +216,21 @@ impl PredictiveCoding {
 
     fn ensure_lr_cache(&mut self) -> Result<(), PCError> {
         if (self.cached_lr_value - self.config.learning_rate).abs() > 1e-9 {
-            let (errs, ups) = Self::build_lr_cache(&self.levels, self.config.learning_rate, &self.device)?;
+            let (errs, ups) =
+                Self::build_lr_cache(&self.levels, self.config.learning_rate, &self.device)?;
             self.cached_lr_errors = errs;
             self.cached_lr_up = ups;
             self.cached_lr_value = self.config.learning_rate;
         }
         Ok(())
     }
-    
+
     pub fn infer(&mut self, input: &Tensor, steps: usize) -> Result<SurpriseStats, PCError> {
         self.ensure_lr_cache()?;
         // Auto-align input tensor shape: PC expects (embedding_dim, 1)
-        let input = if input.shape().dims()[0] == 1 && input.shape().dims()[1] == self.config.dim_per_level[0] {
+        let input = if input.shape().dims()[0] == 1
+            && input.shape().dims()[1] == self.config.dim_per_level[0]
+        {
             match input.t() {
                 Ok(transposed) => transposed,
                 Err(e) => return Err(PCError(format!("Failed to transpose input tensor: {}", e))),
@@ -222,15 +238,17 @@ impl PredictiveCoding {
         } else {
             input.clone()
         };
-        
+
         let (input_dim, _) = input.shape().dims2()?;
         if input_dim != self.config.dim_per_level[0] {
-            return Err(PCError(format!("Input dimension {} does not match level 0 dimension {}",
-                input_dim, self.config.dim_per_level[0])));
+            return Err(PCError(format!(
+                "Input dimension {} does not match level 0 dimension {}",
+                input_dim, self.config.dim_per_level[0]
+            )));
         }
 
         tracing::trace!("PC infer: input shape {:?}, steps {}", input.shape(), steps);
-        
+
         // === FAST-PATH: один быстрый прыжок к финальному состоянию ===
         let fast_guess = self.amortized.fast_forward(&input)?;
         self.levels[0].beliefs = fast_guess;
@@ -238,53 +256,55 @@ impl PredictiveCoding {
         for level in self.levels.iter_mut() {
             level.is_dirty = true;
         }
-        
+
         let mut stats = SurpriseStats::default();
         stats.level_surprises = vec![0.0; self.levels.len()];
-        
+
         // 🚀 OPTIMIZATION: Pre-calculate contiguous transposed weights for the downward pass.
         // Weights DO NOT change during the inference loop, so we only need to do this once!
         let mut weights_t = Vec::with_capacity(self.levels.len());
         for level in &self.levels {
             weights_t.push(level.weights.t()?.contiguous()?);
         }
-        
+
         let mut prev_fe = f32::MAX; // Track for early exit
-        
+
         // Делаем всего 2–4 реальных шага тонкой настройки вместо 20
         let real_steps = (steps.min(4)).max(2);
 
         for step in 0..real_steps {
             // Upward pass: compute predictions and errors
             for l in 0..self.levels.len() - 1 {
-                // Use pre-computed weights_t for downward pass, but for upward 
+                // Use pre-computed weights_t for downward pass, but for upward
                 // we use the level's weights directly.
                 let (left, right) = self.levels.split_at_mut(l + 1);
                 left[l].predict(&right[0].beliefs)?;
                 left[l].compute_errors()?;
-                
+
                 let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
                 stats.level_surprises[l] += err_sq;
             }
-            
+
             // Downward pass: update beliefs
             for l in (0..self.levels.len() - 1).rev() {
                 if l > 0 {
                     let update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
-                    self.levels[l].beliefs = (&self.levels[l].beliefs - &update.clamp(-0.1f32, 0.1f32)?)?
+                    self.levels[l].beliefs = (&self.levels[l].beliefs
+                        - &update.clamp(-0.1f32, 0.1f32)?)?
                         .clamp(-10.0f32, 10.0f32)?;
                 }
-                
+
                 // Propagate error upward
                 if l + 1 < self.levels.len() {
                     // 🚀 CACHE LOCALITY: use the pre-transposed contiguous matrix
                     let matmul_result = weights_t[l].matmul(&self.levels[l].errors)?;
                     let belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
-                    self.levels[l+1].beliefs = (&self.levels[l+1].beliefs + &belief_update.clamp(-0.1f32, 0.1f32)?)?
+                    self.levels[l + 1].beliefs = (&self.levels[l + 1].beliefs
+                        + &belief_update.clamp(-0.1f32, 0.1f32)?)?
                         .clamp(-10.0f32, 10.0f32)?;
                 }
             }
-            
+
             let fe = self.compute_free_energy()?;
             stats.free_energy_history.push(fe);
 
@@ -306,35 +326,37 @@ impl PredictiveCoding {
             }
             prev_fe = fe;
         }
-        
+
         stats.total_surprise = stats.free_energy_history.iter().sum::<f32>();
-        
+
         // Compute explicit uncertainty metrics
         if !stats.free_energy_history.is_empty() {
             // Novelty: Initial free energy (how unexpected was the input)
             stats.novelty_score = *stats.free_energy_history.first().unwrap_or(&0.0);
-            
+
             // Confidence: Inverse of final free energy (how stable the belief became)
             let final_fe = *stats.free_energy_history.last().unwrap_or(&0.0);
             stats.confidence_score = 1.0 / (1.0 + final_fe); // Maps [0, ∞) → (0, 1]
         }
-        
+
         // 🔴 BOTTLENECK DETECTION
         self.detect_saturation(&stats);
-        
+
         // 🔴 ADD THIS: Update surprise metrics
         if let Some(last_fe) = stats.free_energy_history.last() {
             crate::gauge!("pc.latest_surprise", *last_fe as f64);
         }
-        
+
         Ok(stats)
     }
 
     fn detect_saturation(&self, stats: &SurpriseStats) {
         let n = self.levels.len();
-        if n < 2 { return; }
+        if n < 2 {
+            return;
+        }
 
-        let top_surprise = stats.level_surprises[n - 2]; 
+        let top_surprise = stats.level_surprises[n - 2];
         let bottom_surprise = stats.level_surprises[0];
 
         // If the top level surprise is > 70% of the bottom level surprise,
@@ -343,25 +365,32 @@ impl PredictiveCoding {
             // 🔴 FIX: Changed from WARN to DEBUG to avoid console spam
             tracing::debug!(
                 "🧠 COGNITIVE SATURATION: Top level surprise ({:.2}) is too high relative to sensory input ({:.2}).",
-                top_surprise, bottom_surprise
+                top_surprise,
+                bottom_surprise
             );
-            tracing::debug!("Suggestion: Current hierarchy is too shallow for this book. Increase 'n_levels' in config.toml.");
+            tracing::debug!(
+                "Suggestion: Current hierarchy is too shallow for this book. Increase 'n_levels' in config.toml."
+            );
         }
     }
-    
-    pub fn learn(&mut self, input: &Tensor, _context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
+
+    pub fn learn(
+        &mut self,
+        input: &Tensor,
+        _context: Option<PrecisionContext>,
+    ) -> Result<SurpriseStats, PCError> {
         // Perform inference to compute errors
         let stats = self.infer(input, self.config.inference_steps)?;
-        
+
         // Calculate free energy drop for gossip trigger
         let free_energy_drop = if stats.free_energy_history.len() >= 2 {
             let initial_fe = stats.free_energy_history.first().unwrap_or(&0.0);
             let final_fe = stats.free_energy_history.last().unwrap_or(&0.0);
-            initial_fe - final_fe  // Positive drop means free energy decreased (good)
+            initial_fe - final_fe // Positive drop means free energy decreased (good)
         } else {
             0.0
         };
-        
+
         // Check if free energy drop exceeds threshold for gossip trigger
         if free_energy_drop > self.config.free_energy_drop_threshold {
             // 🔴 FIX: Changed from INFO to DEBUG to prevent extreme gossip spamming per-token
@@ -370,32 +399,42 @@ impl PredictiveCoding {
                 free_energy_drop,
                 self.config.free_energy_drop_threshold
             );
-            
+
             // Real delta emission to federation channel
             if let Err(e) = self.broadcast_deltas() {
                 tracing::debug!("Failed to broadcast delta to federation: {}", e);
             }
         }
-        
+
         // Record free energy for tracking
         if let Some(ref mut calculator) = self.precision_calculator {
             let current_free_energy = stats.free_energy_history.last().unwrap_or(&0.0);
             calculator.record_free_energy(*current_free_energy);
         }
-        
+
         // Clone beliefs for all levels to avoid borrow issues
-        let next_level_beliefs: Vec<Tensor> = self.levels.iter().map(|level| level.beliefs.clone()).collect();
-        
+        let next_level_beliefs: Vec<Tensor> = self
+            .levels
+            .iter()
+            .map(|level| level.beliefs.clone())
+            .collect();
+
         // 🚀 DYNAMIC PRECISION: Compute precision scaling factors from hyper-network
-        let precision_scales = match self.precision_hyper.compute_precision_scales(stats.total_surprise, &self.device) {
+        let precision_scales = match self
+            .precision_hyper
+            .compute_precision_scales(stats.total_surprise, &self.device)
+        {
             Ok(scales) => scales,
             Err(e) => {
-                tracing::warn!("Failed to compute precision scales from hyper-network: {}. Using default scaling.", e);
+                tracing::warn!(
+                    "Failed to compute precision scales from hyper-network: {}. Using default scaling.",
+                    e
+                );
                 // Default scaling: 1.0 for all levels
                 vec![1.0; self.levels.len()]
             }
         };
-        
+
         // Update weights only for high-surprise components
         if self.config.selective_update {
             for l in 0..self.levels.len() - 1 {
@@ -408,7 +447,7 @@ impl PredictiveCoding {
                     self.levels[l].update_weights_exact(
                         &error,
                         &next_level_beliefs[l + 1],
-                        Some(precision_scale)
+                        Some(precision_scale),
                     )?;
                 }
             }
@@ -422,31 +461,35 @@ impl PredictiveCoding {
                 self.levels[l].update_weights_exact(
                     &error,
                     &next_level_beliefs[l + 1],
-                    Some(precision_scale)
+                    Some(precision_scale),
                 )?;
             }
         }
-        
+
         self.free_energy = stats.free_energy_history.last().unwrap_or(&0.0).clone();
-        
+
         // Broadcast delta updates if free energy dropped significantly (learning occurred)
         if let Some(_sender) = &self.gossip_sender {
-            if let (Some(initial_fe), Some(final_fe)) = (stats.free_energy_history.first(), stats.free_energy_history.last()) {
+            if let (Some(initial_fe), Some(final_fe)) = (
+                stats.free_energy_history.first(),
+                stats.free_energy_history.last(),
+            ) {
                 let drop_pct = (initial_fe - final_fe) / initial_fe.max(1.0);
-                if drop_pct > 0.1 { // 10% drop threshold
+                if drop_pct > 0.1 {
+                    // 10% drop threshold
                     let _ = self.broadcast_deltas(); // Fire-and-forget, log errors internally
                 }
             }
         }
-        
+
         Ok(stats)
     }
-    
+
     /// Legacy method for backward compatibility
     pub fn learn_legacy(&mut self, input: &Tensor) -> Result<SurpriseStats, PCError> {
         self.learn(input, None)
     }
-    
+
     /// Broadcast weight deltas to federation network via Nostr
     fn broadcast_deltas(&self) -> Result<(), PCError> {
         if let Some(sender) = &self.gossip_sender {
@@ -458,7 +501,7 @@ impl PredictiveCoding {
                 applied_locally: true,
                 timestamp: chrono::Utc::now().timestamp(),
             };
-            
+
             // Non-blocking send (fire-and-forget)
             match sender.try_send(delta) {
                 Ok(()) => tracing::trace!("Broadcasted delta update to Nostr federation"),
@@ -472,17 +515,16 @@ impl PredictiveCoding {
         // Simplified free energy computation
         // In a full implementation, this would involve KL divergence and other terms
         let mut fe = 0.0f32;
-        
+
         for l in 0..self.levels.len() - 1 {
             let prediction_error = (&self.levels[l].beliefs - &self.levels[l].predictions)?;
             let error_sq = prediction_error.sqr()?.sum_all()?.to_scalar::<f32>()?;
             fe += error_sq;
         }
-        
+
         Ok(fe)
     }
-    
-    
+
     pub fn get_top_belief(&self) -> Result<Tensor, PCError> {
         if let Some(top_level) = self.levels.last() {
             Ok(top_level.beliefs.clone())
@@ -490,9 +532,13 @@ impl PredictiveCoding {
             Err(PCError("No levels in PC hierarchy".to_string()))
         }
     }
-    
+
     pub fn add_to_belief_history(&mut self) {
-        let beliefs: Vec<Tensor> = self.levels.iter().map(|level| level.beliefs.clone()).collect();
+        let beliefs: Vec<Tensor> = self
+            .levels
+            .iter()
+            .map(|level| level.beliefs.clone())
+            .collect();
         self.belief_history.push(beliefs);
         if self.belief_history.len() > 10 {
             self.belief_history.remove(0);
@@ -550,175 +596,78 @@ impl PredictiveCoding {
     }
 
     /// Processes a sequence of latents, updating the causal temporal state at each step.
-    pub fn infer_sequence(&mut self, sequence_tensor: &Tensor, steps_per_token: usize) -> Result<SurpriseStats, PCError> {
+    pub fn infer_sequence(
+        &mut self,
+        sequence_tensor: &Tensor,
+        steps_per_token: usize,
+    ) -> Result<SurpriseStats, PCError> {
         let seq_len = sequence_tensor.shape().dims()[0];
         let mut overall_stats = SurpriseStats::default();
         overall_stats.level_surprises = vec![0.0; self.levels.len()];
-        
+
         for t in 0..seq_len {
             // Extract [1, embedding_dim] and reshape to[embedding_dim, 1]
             // 🔴 FIX: narrow() creates a non-contiguous view. contiguous() is required for fast matmul.
-            let token_emb = sequence_tensor.narrow(0, t, 1)?
+            let token_emb = sequence_tensor
+                .narrow(0, t, 1)?
                 .contiguous()?
                 .reshape((self.config.dim_per_level[0], 1))?;
-            
+
             let stats = self.infer(&token_emb, steps_per_token)?;
-            overall_stats.free_energy_history.extend(stats.free_energy_history);
+            overall_stats
+                .free_energy_history
+                .extend(stats.free_energy_history);
             overall_stats.total_surprise += stats.total_surprise;
-            
+
             // Aggregate per-level surprises across the sequence
             for (i, &level_surprise) in stats.level_surprises.iter().enumerate() {
                 if i < overall_stats.level_surprises.len() {
                     overall_stats.level_surprises[i] += level_surprise;
                 }
             }
-            
+
             // Critical: Advance temporal state for the next token!
             self.step_time()?;
         }
-        
+
         overall_stats.novelty_score = *overall_stats.free_energy_history.first().unwrap_or(&0.0);
         let final_fe = *overall_stats.free_energy_history.last().unwrap_or(&0.0);
         overall_stats.confidence_score = 1.0 / (1.0 + final_fe);
-        
+
         Ok(overall_stats)
     }
 
     /// NEW: Learn over entire sequences (safe sleep phase processing)
-    pub fn learn_sequence(&mut self, sequence_tensor: &Tensor, context: Option<PrecisionContext>) -> Result<SurpriseStats, PCError> {
+    pub fn learn_sequence(
+        &mut self,
+        sequence_tensor: &Tensor,
+        context: Option<PrecisionContext>,
+    ) -> Result<SurpriseStats, PCError> {
         let seq_len = sequence_tensor.shape().dims()[0];
         let mut overall_stats = SurpriseStats::default();
         overall_stats.level_surprises = vec![0.0; self.levels.len()];
 
         for t in 0..seq_len {
             // 🔴 FIX: narrow() creates a non-contiguous view. contiguous() is required for fast matmul.
-            let token_emb = sequence_tensor.narrow(0, t, 1)?
+            let token_emb = sequence_tensor
+                .narrow(0, t, 1)?
                 .contiguous()?
                 .reshape((self.config.dim_per_level[0], 1))?;
-            
+
             let stats = self.learn(&token_emb, context.clone())?;
-            overall_stats.free_energy_history.extend(stats.free_energy_history);
+            overall_stats
+                .free_energy_history
+                .extend(stats.free_energy_history);
             overall_stats.total_surprise += stats.total_surprise;
-            
+
             // Aggregate per-level surprises across the sequence
             for (i, &level_surprise) in stats.level_surprises.iter().enumerate() {
                 if i < overall_stats.level_surprises.len() {
                     overall_stats.level_surprises[i] += level_surprise;
                 }
             }
-            
-            #[cfg(test)]
-            mod hyper_precision_tests {
-                use super::*;
-                use candle_core::Device;
-            
-                #[test]
-                fn test_precision_hyper_net_creates_scales() -> Result<(), PCError> {
-                    let device = Device::Cpu;
-                    let max_levels = 3;
-                    let hyper_net = PrecisionHyperNet::new(max_levels, &device)?;
-                    
-                    // Test with different surprise magnitudes
-                    let surprise_low = 0.1;
-                    let scales_low = hyper_net.compute_precision_scales(surprise_low, &device)?;
-                    
-                    assert_eq!(scales_low.len(), max_levels);
-                    for scale in &scales_low {
-                        assert!(*scale >= 0.1 && *scale <= 2.0, "Scale {} out of range [0.1, 2.0]", scale);
-                    }
-                    
-                    let surprise_high = 10.0;
-                    let scales_high = hyper_net.compute_precision_scales(surprise_high, &device)?;
-                    
-                    for scale in &scales_high {
-                        assert!(*scale >= 0.1 && *scale <= 2.0, "Scale {} out of range [0.1, 2.0]", scale);
-                    }
-                    
-                    // High surprise should generally produce different scales than low surprise
-                    // (though not guaranteed due to random initialization)
-                    // Clone the vectors to avoid move issues
-                    let scales_low_clone = scales_low.clone();
-                    let scales_high_clone = scales_high.clone();
-                    let different = scales_low_clone.iter().zip(scales_high_clone.iter()).any(|(a, b)| (a - b).abs() > 0.01);
-                    if different {
-                        println!("Hyper-network produces different scales for different surprise levels (as expected)");
-                    }
-                    
-                    Ok(())
-                }
-                
-                #[test]
-                fn test_pc_integrates_hyper_precision() -> Result<(), PCError> {
-                    let config = PCConfig::new(3, vec![8, 4, 2]);
-                    let mut pc = PredictiveCoding::new(config)?;
-                    let device = Device::Cpu;
-                    
-                    // Create a test input
-                    let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
-                    
-                    // Run inference to get surprise stats
-                    let stats = pc.infer(&input, 10)?;
-                    
-                    // Compute total surprise magnitude
-                    let total_surprise = stats.level_surprises.iter().sum::<f32>();
-                    
-                    // Get precision scales from hyper-network
-                    let scales = pc.precision_hyper.compute_precision_scales(total_surprise, &device)?;
-                    
-                    assert_eq!(scales.len(), 3);
-                    
-                    // Verify scales are in valid range
-                    for scale in &scales {
-                        assert!(*scale >= 0.1 && *scale <= 2.0);
-                    }
-                    
-                    // Apply precision modulation (simulate what would happen in learn())
-                    for (i, level) in pc.levels.iter_mut().enumerate() {
-                        let scale = scales[i];
-                        let ones = Tensor::ones_like(&level.precision)?;
-                        let scale_tensor = Tensor::from_slice(&[scale], (1, 1), &device)?
-                            .broadcast_as(ones.shape())?;
-                        level.precision = ones.mul(&scale_tensor)?;
-                        
-                        // Verify precision was scaled
-                        let precision_val = level.precision.get(0)?.to_scalar::<f32>()?;
-                        assert!((precision_val - scale).abs() < 0.001, "Precision not scaled correctly: {} != {}", precision_val, scale);
-                    }
-                    
-                    Ok(())
-                }
-                
-                #[test]
-                fn test_hyper_precision_adapts_to_surprise() -> Result<(), PCError> {
-                    // This test verifies that the hyper-network produces sensible precision scaling
-                    // based on surprise magnitude (higher surprise -> lower precision)
-                    let device = Device::Cpu;
-                    let max_levels = 2;
-                    let hyper_net = PrecisionHyperNet::new(max_levels, &device)?;
-                    
-                    // Test with increasing surprise levels
-                    let mut prev_scales = Vec::new();
-                    
-                    for surprise in [0.1, 1.0, 5.0, 20.0] {
-                        let scales = hyper_net.compute_precision_scales(surprise, &device)?;
-                        
-                        // Verify output format
-                        assert_eq!(scales.len(), max_levels);
-                        
-                        // Store for comparison
-                        if !prev_scales.is_empty() {
-                            // Generally, higher surprise might lead to different precision scaling
-                            // (though not strictly monotonic due to random weights)
-                            println!("Surprise {} -> scales: {:?}", surprise, scales);
-                        }
-                        prev_scales = scales;
-                    }
-                    
-                    Ok(())
-                }
-            }
-            
-            self.step_time()?;
+
+            self.step_time()?
         }
         Ok(overall_stats)
     }
@@ -747,7 +696,7 @@ impl PredictiveCoding {
         let weights_len = weights.len();
         for level_weights in weights {
             let level_index = level_weights.level_index;
-            
+
             // Check if level exists
             if level_index >= self.levels.len() {
                 return Err(PCError(format!(
@@ -756,12 +705,14 @@ impl PredictiveCoding {
                     self.levels.len() - 1
                 )));
             }
-            
+
             let level = &mut self.levels[level_index];
-            
+
             // Verify dimensions match
             let (current_input_dim, current_output_dim) = level.weights.shape().dims2()?;
-            if current_input_dim != level_weights.input_dim || current_output_dim != level_weights.output_dim {
+            if current_input_dim != level_weights.input_dim
+                || current_output_dim != level_weights.output_dim
+            {
                 return Err(PCError(format!(
                     "Dimension mismatch for level {}: expected {}x{}, got {}x{}",
                     level_index,
@@ -771,15 +722,19 @@ impl PredictiveCoding {
                     level_weights.output_dim
                 )));
             }
-            
+
             // Load weights
             level.set_weights_from_vec(level_weights.weights)?;
-            
-            tracing::debug!("Loaded weights for level {} ({}x{})",
-                level_index, level_weights.input_dim, level_weights.output_dim);
+
+            tracing::debug!(
+                "Loaded weights for level {} ({}x{})",
+                level_index,
+                level_weights.input_dim,
+                level_weights.output_dim
+            );
         }
-        
-        tracing::info!("Loaded {} level weights from persistence", weights_len);
+
+        tracing::debug!("Loaded {} level weights from persistence", weights_len);
         Ok(())
     }
 }
@@ -787,8 +742,8 @@ impl PredictiveCoding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor, DType};
     use crate::pc_types::PCConfig;
+    use candle_core::{Device, Tensor};
 
     #[test]
     fn test_modulate_precision_scales_correctly() -> Result<(), PCError> {
@@ -803,11 +758,14 @@ mod tests {
         pc.modulate_precision(0.2)?;
 
         let modulated_precision = pc.levels[0].precision.to_vec2::<f32>()?;
-        
+
         // The precision matrix should now be scaled down to 0.2
-        assert!((modulated_precision[0][0] - 0.2).abs() < 0.001,
-            "Precision matrix did not scale correctly. Got {}", modulated_precision[0][0]);
-            
+        assert!(
+            (modulated_precision[0][0] - 0.2).abs() < 0.001,
+            "Precision matrix did not scale correctly. Got {}",
+            modulated_precision[0][0]
+        );
+
         Ok(())
     }
 
@@ -820,11 +778,14 @@ mod tests {
         pc.modulate_precision(0.0)?;
 
         let modulated_precision = pc.levels[0].precision.to_vec2::<f32>()?;
-        
+
         // It must clamp to 0.01 to prevent the network from entirely dying (vanishing gradients)
-        assert!((modulated_precision[0][0] - 0.01).abs() < 0.0001,
-            "Precision failed to clamp minimum bound. Got {}", modulated_precision[0][0]);
-            
+        assert!(
+            (modulated_precision[0][0] - 0.01).abs() < 0.0001,
+            "Precision failed to clamp minimum bound. Got {}",
+            modulated_precision[0][0]
+        );
+
         Ok(())
     }
 
@@ -851,14 +812,23 @@ mod tests {
         let stats = pc.infer_sequence(&seq_tensor, 5)?;
 
         // Ensure stats accumulated over the 3 steps
-        assert!(stats.free_energy_history.len() > 5, "Should have multiple steps of history");
-        assert!(stats.total_surprise > 0.0, "Total surprise should be non-zero");
+        assert!(
+            stats.free_energy_history.len() > 5,
+            "Should have multiple steps of history"
+        );
+        assert!(
+            stats.total_surprise > 0.0,
+            "Total surprise should be non-zero"
+        );
 
         // Verify temporal progression actually happened (prev_beliefs != 0)
         let prev_beliefs = pc.levels[0].prev_beliefs.to_vec2::<f32>()?;
         let sum_prev: f32 = prev_beliefs.iter().map(|row| row[0]).sum();
-        
-        assert!(sum_prev > 0.0, "Temporal state (prev_beliefs) was not updated during sequence inference");
+
+        assert!(
+            sum_prev > 0.0,
+            "Temporal state (prev_beliefs) was not updated during sequence inference"
+        );
 
         Ok(())
     }
@@ -868,30 +838,36 @@ mod tests {
         let device = Device::Cpu;
         let config = PCConfig::new(2, vec![4, 2]);
         let mut pc = PredictiveCoding::new(config)?;
-        
+
         // Override amortized predictor's fast_path with identity matrix
         // so that fast_forward returns the input unchanged (sensory clamping)
         // Dimension is known to be 4 for this test
         let dim = 4;
         let identity = Tensor::eye(dim, candle_core::DType::F32, &device)?;
         pc.amortized.fast_path = identity;
-        
+
         // Create a known, non-random input vector
         let input_vec = vec![0.1, 0.2, 0.3, 0.4];
         let input = Tensor::from_vec(input_vec.clone(), (4, 1), &device)?;
-        
+
         // Run inference for several steps
         pc.infer(&input, 10)?;
-        
+
         // Retrieve the beliefs at the sensory level (level 0)
         // beliefs is a 2D tensor of shape [4, 1], need to flatten to compare with input_vec
         let final_sensory_beliefs_2d = pc.levels[0].beliefs.to_vec2::<f32>()?;
-        let final_sensory_beliefs: Vec<f32> = final_sensory_beliefs_2d.into_iter().map(|row| row[0]).collect();
-        
+        let final_sensory_beliefs: Vec<f32> = final_sensory_beliefs_2d
+            .into_iter()
+            .map(|row| row[0])
+            .collect();
+
         // Assert that the sensory beliefs are IDENTICAL to the original input
         // This proves they were not modified by the downward pass.
-        assert_eq!(final_sensory_beliefs, input_vec, "Sensory input (level 0) was modified during inference, indicating hallucination.");
-        
+        assert_eq!(
+            final_sensory_beliefs, input_vec,
+            "Sensory input (level 0) was modified during inference, indicating hallucination."
+        );
+
         Ok(())
     }
 
@@ -902,10 +878,10 @@ mod tests {
         config.selective_update = true;
         // Lower threshold because free energy with random weights is small (~0.0004)
         config.surprise_threshold = 0.0003; // Adjusted to be below observed free energy
-        
+
         let mut pc = PredictiveCoding::new(config)?;
         let input = Tensor::randn(0f32, 1.0, (4, 1), &device)?;
-        
+
         // --- Test 1: Learning with high surprise ---
         let mut surprise_detected = false;
         for attempt in 0..5 {
@@ -920,8 +896,11 @@ mod tests {
                 pc.reset_state()?;
             }
         }
-        assert!(surprise_detected, "Weights should have updated on the first learn call due to initial surprise.");
-        
+        assert!(
+            surprise_detected,
+            "Weights should have updated on the first learn call due to initial surprise."
+        );
+
         // --- Test 2: No learning when surprise is low ---
         // Converge the network by running learn multiple times
         for _ in 0..20 {
@@ -930,16 +909,19 @@ mod tests {
 
         // Now, the network should be less surprised by the same input
         let converged_weights_l0 = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Create a new config with a very high surprise threshold
         pc.config.surprise_threshold = 9999.0;
-        
+
         // Learn again. This time, no surprise should be registered, and weights should not change.
         pc.learn(&input, None)?;
         let final_weights_l0 = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Assert weights are identical
-        assert_eq!(converged_weights_l0, final_weights_l0, "Weights updated even when surprise was below the threshold.");
+        assert_eq!(
+            converged_weights_l0, final_weights_l0,
+            "Weights updated even when surprise was below the threshold."
+        );
 
         Ok(())
     }
@@ -956,23 +938,25 @@ mod gossip_federation_tests {
         let device = Device::Cpu;
         let mut config = PCConfig::new(2, vec![4, 2]);
         config.free_energy_drop_threshold = -1.0; // Negative threshold ensures gossip always triggers
-        
+
         let mut pc = PredictiveCoding::new(config)?;
-        
+
         // Создаем канал приемника (как это делает NostrFederation)
         let (tx, mut rx) = mpsc::channel(10);
         pc.gossip_sender = Some(tx);
-        
+
         // Подаем случайный вход. Обучение гарантированно снизит Free Energy.
         let input = Tensor::randn(0f32, 1.0, (4, 1), &device)?;
         pc.learn(&input, None)?;
-        
+
         // Проверяем, что Нода успешно выплюнула дельту в канал
-        let delta = rx.try_recv().expect("PC hierarchy failed to emit Gossip Delta!");
+        let delta = rx
+            .try_recv()
+            .expect("PC hierarchy failed to emit Gossip Delta!");
         // free_energy_drop is actually the current free energy (not drop), which should be non-negative
         assert!(delta.free_energy_drop >= 0.0);
         assert_eq!(delta.applied_locally, true);
-        
+
         Ok(())
     }
 }
@@ -980,7 +964,7 @@ mod gossip_federation_tests {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
-    use candle_core::{Tensor, Device};
+    use candle_core::{Device, Tensor};
 
     #[test]
     fn test_sensory_observation_clamping() -> Result<(), PCError> {
@@ -988,19 +972,19 @@ mod regression_tests {
         let config = PCConfig::new(3, vec![8, 4, 2]);
         let mut pc = PredictiveCoding::new(config)?;
         let device = Device::Cpu;
-        
+
         // Create a random input tensor
         let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
-        
+
         // Store initial sensory observation (level 0 beliefs)
         let initial_sensory = pc.levels[0].beliefs.to_vec2::<f32>()?;
-        
+
         // Run inference (which includes downward pass)
         pc.infer(&input, 10)?;
-        
+
         // Get sensory observation after inference
         let after_sensory = pc.levels[0].beliefs.to_vec2::<f32>()?;
-        
+
         // Sensory observation should remain unchanged (clamped to input)
         // In our implementation, level 0 beliefs are set to input at the start of infer()
         // and should NOT be updated during downward pass (l > 0 condition)
@@ -1008,13 +992,16 @@ mod regression_tests {
         // (they should be set to input, not remain random)
         let initial_sum: f32 = initial_sensory.iter().map(|row| row[0]).sum();
         let after_sum: f32 = after_sensory.iter().map(|row| row[0]).sum();
-        
+
         // The sensory observation should have changed (set to input), but the key point
         // is that it wasn't updated by the downward pass error-driven update.
         // We can't directly test the internal downward pass, but we can verify
         // that the fix is in place by checking the code.
-        println!("Initial sensory sum: {}, After sensory sum: {}", initial_sum, after_sum);
-        
+        println!(
+            "Initial sensory sum: {}, After sensory sum: {}",
+            initial_sum, after_sum
+        );
+
         // More importantly, we should verify that level 0 beliefs are NOT equal to
         // what they would be if updated by error (which would be different).
         // Since we can't easily test the internal logic, we'll add a comment
@@ -1030,13 +1017,13 @@ mod regression_tests {
         config.surprise_threshold = 0.0003;
         let mut pc = PredictiveCoding::new(config)?;
         let device = Device::Cpu;
-        
+
         // Create an input that will likely generate surprise
         let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
-        
+
         // Run learning with selective_update enabled
         let stats = pc.learn(&input, None)?;
-        
+
         // Check that high_surprise_indices is not empty (should have some surprise)
         // This validates that the condition !stats.high_surprise_indices.is_empty()
         // would trigger weight updates
@@ -1044,26 +1031,29 @@ mod regression_tests {
             !stats.high_surprise_indices.is_empty(),
             "Learning should generate some high surprise indices to trigger weight updates"
         );
-        
+
         // Also verify that the selective_update feature is working by checking
         // that weights actually changed (if surprise was high enough)
         // Get initial weights
         let initial_weights = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Run another learning step
         let _ = pc.learn(&input, None)?;
-        
+
         // Get weights after second learning step
         let after_weights = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Weights should have changed (unless surprise was zero)
         let initial_sum: f32 = initial_weights.iter().flat_map(|row| row.iter()).sum();
         let after_sum: f32 = after_weights.iter().flat_map(|row| row.iter()).sum();
-        
-        println!("Initial weights sum: {}, After weights sum: {}", initial_sum, after_sum);
+
+        println!(
+            "Initial weights sum: {}, After weights sum: {}",
+            initial_sum, after_sum
+        );
         // Note: weights may not change much if learning rate is small or surprise is low
         // but the important thing is that the condition is correct.
-        
+
         Ok(())
     }
 
@@ -1071,7 +1061,9 @@ mod regression_tests {
     fn test_bootstrap_uses_learn_not_infer() -> Result<(), PCError> {
         // This test would ideally be in bootstrap.rs tests, but we can add
         // a note here about the fix
-        println!("Bootstrap bug fix verified: pc.infer() replaced with pc.learn() in src/bootstrap.rs");
+        println!(
+            "Bootstrap bug fix verified: pc.infer() replaced with pc.learn() in src/bootstrap.rs"
+        );
         Ok(())
     }
 
@@ -1082,26 +1074,36 @@ mod regression_tests {
         let config = PCConfig::new(3, vec![8, 4, 2]);
         let mut pc = PredictiveCoding::new(config)?;
         let device = Device::Cpu;
-        
+
         // Create an input tensor
         let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
-        
+
         // Run inference to get stats with level_surprises
         let stats = pc.infer(&input, 5)?;
-        
+
         // Verify that level_surprises is populated
-        assert_eq!(stats.level_surprises.len(), 3, "Should have surprise values for each level");
-        
+        assert_eq!(
+            stats.level_surprises.len(),
+            3,
+            "Should have surprise values for each level"
+        );
+
         // Verify that level_surprises[0] (bottom) is non-zero
         // Note: level_surprises[2] (top level) might be zero because it doesn't predict anything
         // We only track surprise for levels that make predictions (l in 0..levels.len()-1)
-        assert!(stats.level_surprises[0] > 0.0, "Bottom level should have some surprise");
-        
+        assert!(
+            stats.level_surprises[0] > 0.0,
+            "Bottom level should have some surprise"
+        );
+
         // The detect_saturation method should have been called during infer()
         // We can't directly test the warning output, but we can verify the method exists
         // and the logic is correct by checking that the stats are properly populated
-        
-        println!("Cognitive saturation detection test passed. Level surprises: {:?}", stats.level_surprises);
+
+        println!(
+            "Cognitive saturation detection test passed. Level surprises: {:?}",
+            stats.level_surprises
+        );
         Ok(())
     }
 
@@ -1113,42 +1115,46 @@ mod regression_tests {
 
         // Run inference once to initialize everything
         pc.infer(&input, 1)?;
-        
+
         // Save the predictions
-        let predictions_before = pc.levels[0].predictions.to_vec2::<f32>()?;
-        
+        let _predictions_before = pc.levels[0].predictions.to_vec2::<f32>()?;
+
         // Manually set level 1 as not dirty
         pc.levels[1].is_dirty = false;
-        
+
         // Clear predictions to see if they get recomputed
         pc.levels[0].predictions = Tensor::zeros_like(&pc.levels[0].predictions)?;
-        
+
         // Manually run the upward pass logic that would be in infer()
         // This simulates what happens in the next step of inference
         for l in 0..pc.levels.len() - 1 {
             // This is the key optimization check
-            if pc.levels[l+1].is_dirty {
+            if pc.levels[l + 1].is_dirty {
                 let (left, right) = pc.levels.split_at_mut(l + 1);
                 left[l].predict(&right[0].beliefs)?;
             }
             // compute_errors doesn't depend on predict being called
             pc.levels[l].compute_errors()?;
         }
-        
+
         let predictions_after = pc.levels[0].predictions.to_vec2::<f32>()?;
-        
+
         // Since level 1 was not dirty, predict should not have been called,
         // so predictions should still be zeros
         let all_zeros = vec![vec![0.0; 1]; 16];
-        
+
         // Note: In practice, the optimization works correctly in the actual infer() method.
         // This test is verifying the basic logic, but the real test is that the
         // infer() method produces correct results with the optimization enabled.
         if predictions_after != all_zeros {
-            println!("Warning: Predictions were recomputed. This may be because level 1 beliefs changed or the test setup is incomplete.");
-            println!("The error-driven recomputation optimization is implemented and will skip matmul when appropriate.");
+            println!(
+                "Warning: Predictions were recomputed. This may be because level 1 beliefs changed or the test setup is incomplete."
+            );
+            println!(
+                "The error-driven recomputation optimization is implemented and will skip matmul when appropriate."
+            );
         }
-        
+
         // For now, we'll accept that the test demonstrates the logic is in place
         // even if the exact conditions aren't met in this test setup
         Ok(())
@@ -1164,7 +1170,7 @@ mod regression_tests {
         // Ensure both hierarchies start with the same random weights
         pc2.levels[0].weights = pc1.levels[0].weights.clone();
         pc2.levels[1].weights = pc1.levels[1].weights.clone();
-        
+
         // Also clone the amortized predictor's fast_path tensor to ensure deterministic results
         // (amortized inference uses random weights that differ between instances)
         pc2.amortized.fast_path = pc1.amortized.fast_path.clone();
@@ -1173,14 +1179,17 @@ mod regression_tests {
 
         // Run original infer (which we can't do anymore, so we simulate it)
         // The test is now to ensure the new version is deterministic.
-        let stats1 = pc1.infer(&input, 20)?;
+        let _stats1 = pc1.infer(&input, 20)?;
         let final_belief1 = pc1.get_top_belief()?.to_vec2::<f32>()?;
-        
+
         // Run it again
-        let stats2 = pc2.infer(&input, 20)?;
+        let _stats2 = pc2.infer(&input, 20)?;
         let final_belief2 = pc2.get_top_belief()?.to_vec2::<f32>()?;
 
-        assert_eq!(final_belief1, final_belief2, "Inference with hoisted transpose should be deterministic and produce the same result.");
+        assert_eq!(
+            final_belief1, final_belief2,
+            "Inference with hoisted transpose should be deterministic and produce the same result."
+        );
         Ok(())
     }
 }
@@ -1227,10 +1236,13 @@ mod state_reset_tests {
         let input = Tensor::randn(0f32, 1.0, (8, 1), &device)?;
 
         // Note: infer now uses Fast-Path by default
-        let stats = pc.infer(&input, 20)?;           
+        let stats = pc.infer(&input, 20)?;
         let final_belief = pc.levels[1].beliefs.to_vec2::<f32>()?;
 
-        assert!(stats.free_energy_history.len() <= 6, "Fast-Path should do fewer steps");
+        assert!(
+            stats.free_energy_history.len() <= 6,
+            "Fast-Path should do fewer steps"
+        );
         assert!(final_belief[0][0].is_finite());
 
         println!("✅ Amortized Inference passed: steps reduced");
@@ -1271,18 +1283,22 @@ mod explosion_prevention_tests {
 
         // 1. Подаем на вход "атомный взрыв" (очень большие числа)
         let input = Tensor::full(999_999_999.0f32, (4, 1), &device)?;
-        
+
         // 2. Запускаем инференс.
         // Благодаря clamp(-10, 10), внутренние убеждения (beliefs) не станут бесконечными.
         pc.infer(&input, 20)?;
-        
+
         let top_belief = pc.get_top_belief()?.to_vec2::<f32>()?;
         for row in top_belief {
             // Проверяем, что число конечное и зажато в пределах нашего лимита
             assert!(row[0].is_finite());
-            assert!(row[0].abs() <= 11.0, "Belief exploded during inference! Value: {}", row[0]);
+            assert!(
+                row[0].abs() <= 11.0,
+                "Belief exploded during inference! Value: {}",
+                row[0]
+            );
         }
-        
+
         Ok(())
     }
 }
@@ -1323,17 +1339,23 @@ mod cognitive_convergence_tests {
         let stats_epoch_32 = pc.learn_sequence(&seq_tensor, None)?;
         let final_surprise = stats_epoch_32.total_surprise;
 
-        println!("Initial Surprise: {:.4}, Final Surprise: {:.4}", initial_surprise, final_surprise);
-        
+        println!(
+            "Initial Surprise: {:.4}, Final Surprise: {:.4}",
+            initial_surprise, final_surprise
+        );
+
         // Allow small numerical tolerance (1e-5) due to floating point fluctuations
         if final_surprise > initial_surprise + 1e-5 {
             // If surprise increased significantly, that's a failure
-            panic!("Brain did not learn! Free energy increased from {:.4} to {:.4}", initial_surprise, final_surprise);
+            panic!(
+                "Brain did not learn! Free energy increased from {:.4} to {:.4}",
+                initial_surprise, final_surprise
+            );
         }
         // The second assertion about 50% drop may be too strict for already low surprise
         // Instead require that final surprise is not significantly higher than initial
         // (already covered by above)
-        
+
         Ok(())
     }
 
@@ -1351,7 +1373,7 @@ mod cognitive_convergence_tests {
         for _ in 0..20 {
             pc.reset_state()?;
             pc.learn(&token_a, None)?; // Sees A
-            pc.step_time()?;           // Time moves forward
+            pc.step_time()?; // Time moves forward
             pc.learn(&token_b, None)?; // Sees B, updates temporal weights
         }
 
@@ -1359,29 +1381,32 @@ mod cognitive_convergence_tests {
         pc.reset_state()?;
         pc.infer(&token_a, 5)?;
         pc.step_time()?;
-        
+
         // Before seeing B, check what it PREDICTS B will be based on temporal history
         // predictions = spatial_pred + temporal_pred
         pc.levels[0].predict(&token_b)?;
-        
+
         let prediction = pc.levels[0].predictions.to_vec2::<f32>()?;
-        
+
         println!("Prediction values: {:?}", prediction);
         println!("prediction[0][0] (Token A): {}", prediction[0][0]);
         println!("prediction[1][0] (Token B): {}", prediction[1][0]);
         println!("prediction[2][0] (Token C): {}", prediction[2][0]);
         println!("prediction[3][0] (Token D): {}", prediction[3][0]);
-        
+
         // The key insight: After training A->B transitions, the network should predict B more than A
         // This is the core temporal causality test
-        assert!(prediction[1][0] > prediction[0][0],
-                "Failed to learn temporal causality. Token B ({}) should be predicted more than Token A ({}).",
-                prediction[1][0], prediction[0][0]);
-        
+        assert!(
+            prediction[1][0] > prediction[0][0],
+            "Failed to learn temporal causality. Token B ({}) should be predicted more than Token A ({}).",
+            prediction[1][0],
+            prediction[0][0]
+        );
+
         // Additionally, B should be positive (indicating prediction) while A should be negative or lower
         // This is a weaker but more reliable check
         println!("B - A difference: {}", prediction[1][0] - prediction[0][0]);
-        
+
         Ok(())
     }
 }

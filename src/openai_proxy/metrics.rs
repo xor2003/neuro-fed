@@ -23,7 +23,7 @@ impl ProxyMetrics {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn average_processing_time_ms(&self) -> f64 {
         if self.total_requests == 0 {
             0.0
@@ -31,7 +31,7 @@ impl ProxyMetrics {
             self.total_processing_time_ms as f64 / self.total_requests as f64
         }
     }
-    
+
     pub fn cache_hit_rate(&self) -> f64 {
         let total = self.cache_hits + self.cache_misses;
         if total == 0 {

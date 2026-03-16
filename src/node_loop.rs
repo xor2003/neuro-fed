@@ -3,16 +3,16 @@
 // Includes graceful shutdown (CTRL+C) and Dream Phase for offline consolidation
 // 🔴 FIX: Eliminated head-of-line blocking by using direct channel receivers and spawning tasks
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::types::{UserInput, FileEvent, NodeError, NostrEvent};
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::sleep_phase::SleepManager;
+use crate::types::{FileEvent, NodeError, NostrEvent, UserInput};
 
 #[allow(dead_code)]
 pub struct NodeLoop {
@@ -87,18 +87,23 @@ impl NodeLoop {
             stop_signal.store(true, Ordering::Relaxed);
         });
 
-        tracing::info!("Node loop started with dream phase interval: {:?}", self.dream_phase_interval);
+        tracing::info!(
+            "Node loop started with dream phase interval: {:?}",
+            self.dream_phase_interval
+        );
 
         // 🔴 FIX: Proper tokio::select! avoiding head-of-line blocking
         loop {
-            if self.stop_signal.load(Ordering::Relaxed) { break; }
-            
+            if self.stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+
             tokio::select! {
                 // Direct channel receive - no polling intervals
                 Some(input) = self.rx_user_input.recv() => {
                     let last_activity = Arc::clone(&self.last_activity_time);
                     let pc_hierarchy = self.pc_hierarchy.clone();
-                    
+
                     // Spawn task to process without blocking the select loop
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_user_input_async(input, pc_hierarchy).await {
@@ -109,7 +114,7 @@ impl NodeLoop {
                 }
                 Some(event) = self.rx_file_events.recv() => {
                     let last_activity = Arc::clone(&self.last_activity_time);
-                    
+
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_file_event_async(event).await {
                             tracing::error!("Error processing file event: {}", e);
@@ -119,7 +124,7 @@ impl NodeLoop {
                 }
                 Some(event) = self.rx_nostr_events.recv() => {
                     let last_activity = Arc::clone(&self.last_activity_time);
-                    
+
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_nostr_event_async(event).await {
                             tracing::error!("Error processing Nostr event: {}", e);
@@ -138,13 +143,13 @@ impl NodeLoop {
                     tokio::spawn(async move {
                         let last_activity = *last_activity_clone.read().await;
                         let inactivity_duration = std::time::Instant::now().duration_since(last_activity);
-                        
+
                         if inactivity_duration >= interval_clone {
                             tracing::info!(
                                 "Inactivity detected ({:?}), triggering sleep phase for memory consolidation",
                                 inactivity_duration
                             );
-                            
+
                             if let Some(sleep_mgr) = sleep_mgr_clone {
                                 if let Err(e) = sleep_mgr.process_sleep_cycle().await {
                                     tracing::error!("Sleep cycle failed: {}", e);
@@ -153,7 +158,7 @@ impl NodeLoop {
                                 let _pc_write = pc.write().await;
                                 tracing::info!("Basic dream phase running (offline weight consolidation)");
                             }
-                            
+
                             // Reset activity time to prevent immediate retrigger
                             *last_activity_clone.write().await = std::time::Instant::now();
                         }
@@ -169,7 +174,7 @@ impl NodeLoop {
                         *activity = Instant::now();
                     });
                 }
-                
+
                 // Periodic wake-up to check stop signal when no events are pending
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     // Just a periodic check - no action needed
@@ -209,7 +214,6 @@ impl NodeLoop {
         Ok(())
     }
 
-
     /// Stop the node loop gracefully
     pub fn stop(&self) {
         tracing::info!("Stopping node loop gracefully...");
@@ -224,18 +228,12 @@ impl NodeLoop {
 }
 
 mod tests {
-    
-    
-    
-    
-    
-    
 
     #[tokio::test]
     async fn test_node_loop_creation() {
         use super::*;
         use tokio::sync::mpsc;
-        
+
         let (_tx_user_input, rx_user_input) = mpsc::channel(10);
         let (_tx_file_events, rx_file_events) = mpsc::channel(10);
         let (_tx_nostr_events, rx_nostr_events) = mpsc::channel(10);
@@ -248,18 +246,18 @@ mod tests {
     #[tokio::test]
     async fn test_node_loop_start_stop() {
         use super::*;
-        use tokio::sync::mpsc;
         use std::sync::Arc;
-        use std::time::Duration;
         use std::sync::atomic::Ordering;
-        
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
         let (tx_user_input, rx_user_input) = mpsc::channel(10);
         let (tx_file_events, rx_file_events) = mpsc::channel(10);
         let (tx_nostr_events, rx_nostr_events) = mpsc::channel(10);
 
         let mut node_loop = NodeLoop::new(rx_user_input, rx_file_events, rx_nostr_events);
         let stop_signal: Arc<std::sync::atomic::AtomicBool> = Arc::clone(&node_loop.stop_signal);
-        
+
         let handle = tokio::spawn(async move {
             node_loop.start().await.unwrap();
         });
@@ -268,11 +266,14 @@ mod tests {
         drop(tx_user_input);
         drop(tx_file_events);
         drop(tx_nostr_events);
-        
+
         tokio::time::sleep(Duration::from_millis(100)).await;
         stop_signal.store(true, Ordering::Relaxed);
-        
+
         // Add timeout to prevent hanging
-        tokio::time::timeout(Duration::from_millis(500), handle).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

@@ -1,11 +1,11 @@
 // src/knowledge_filter.rs
 // Knowledge Filtering with Precision Weighting (π) implementation for NeuroFed Node
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::process::Stdio;
-use tokio::time::{timeout, Duration};
-use serde::{Deserialize, Serialize};
+use tokio::time::{Duration, timeout};
 
 /// Precision weighting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,14 +103,14 @@ impl FreeEnergyTracker {
         if self.history.len() < 2 {
             return None;
         }
-        
+
         let oldest = self.history.front()?;
         let latest = self.history.back()?;
-        
+
         if *oldest == 0.0 {
             return None;
         }
-        
+
         Some((oldest - latest) / oldest) // Percentage drop
     }
 
@@ -131,7 +131,10 @@ pub struct CodeVerifier {
 
 impl CodeVerifier {
     pub fn new(enabled: bool) -> Self {
-        Self { enabled, execution_timeout_secs: 5 } // 5 second hard limit
+        Self {
+            enabled,
+            execution_timeout_secs: 5,
+        } // 5 second hard limit
     }
 
     /// ASYNCHRONOUS execution with timeout protection using spawn_blocking
@@ -139,16 +142,18 @@ impl CodeVerifier {
         if !self.enabled {
             return Ok("Simulation disabled. Assuming success.".to_string());
         }
-        
+
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let file_path = format!(".neurofed_sim_env_{}.py", timestamp);
-        
+
         // Write the script asynchronously
-        tokio::fs::write(&file_path, code).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(&file_path, code)
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Spawn blocking task to run python (blocking call in separate thread)
         let file_path_clone = file_path.clone();
@@ -156,8 +161,9 @@ impl CodeVerifier {
             std::process::Command::new("python3")
                 .arg(&file_path_clone)
                 .output()
-        }).await;
-        
+        })
+        .await;
+
         // Cleanup temp file (best effort)
         let _ = tokio::fs::remove_file(&file_path).await;
 
@@ -165,13 +171,17 @@ impl CodeVerifier {
             Ok(Ok(out)) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if out.status.success() { Ok(stdout) } else { Err(stderr) }
-            },
+                if out.status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(stderr)
+                }
+            }
             Ok(Err(e)) => Err(format!("Execution failed: {}", e)),
             Err(e) => Err(format!("Join error: {}", e)),
         }
     }
-    
+
     /// Legacy compatibility wrapper (SYNC - uses internal runtime)
     pub fn verify_code_execution(&self, code: &str) -> Result<bool, String> {
         if !self.enabled {
@@ -183,7 +193,10 @@ impl CodeVerifier {
             Err(e) => return Err(format!("Failed to create runtime: {}", e)),
         };
         rt.block_on(async {
-            self.execute_python_simulator(code).await.map(|_| true).or_else(|_| Ok(false))
+            self.execute_python_simulator(code)
+                .await
+                .map(|_| true)
+                .or_else(|_| Ok(false))
         })
     }
 
@@ -192,38 +205,44 @@ impl CodeVerifier {
         if !self.enabled {
             return Ok("Simulation disabled. Assuming success.".to_string());
         }
-        
+
         // Combine code and tests
         let combined_script = format!("{}\n\n# --- GENERATED TESTS ---\n{}", code, tests);
-        
+
         // Execute with timeout protection
         self.execute_python_simulator(&combined_script).await
     }
 
     /// Pre-execution Symbolic Check: Validates Python AST (Abstract Syntax Tree)
     pub async fn verify_syntax_ast(&self, code: &str) -> Result<(), String> {
-        if !self.enabled { return Ok(()); }
-        
+        if !self.enabled {
+            return Ok(());
+        }
+
         let python_script = "import ast, sys\ntry:\n  ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n  print(f'SyntaxError: {e}')\n  sys.exit(1)";
-        
+
         let code_clone = code.to_string();
-        let result = timeout(Duration::from_secs(self.execution_timeout_secs), tokio::task::spawn_blocking(move || -> Result<std::process::Output, std::io::Error> {
-            let mut child = std::process::Command::new("python3")
-                .arg("-c")
-                .arg(python_script)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(code_clone.as_bytes())?;
-            }
-            
-            let output = child.wait_with_output()?;
-            Ok(output)
-        })).await;
-        
+        let result = timeout(
+            Duration::from_secs(self.execution_timeout_secs),
+            tokio::task::spawn_blocking(move || -> Result<std::process::Output, std::io::Error> {
+                let mut child = std::process::Command::new("python3")
+                    .arg("-c")
+                    .arg(python_script)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(code_clone.as_bytes())?;
+                }
+
+                let output = child.wait_with_output()?;
+                Ok(output)
+            }),
+        )
+        .await;
+
         match result {
             Ok(Ok(Ok(out))) => {
                 if !out.status.success() {
@@ -232,10 +251,13 @@ impl CodeVerifier {
                     return Err(format!("{} {}", stdout_err, stderr_err).trim().to_string());
                 }
                 Ok(())
-            },
+            }
             Ok(Ok(Err(e))) => Err(format!("Execution failed: {}", e)),
             Ok(Err(_)) => Err("Python task panicked".to_string()),
-            Err(_) => Err(format!("Execution TIMEOUT: AST check took longer than {} seconds.", self.execution_timeout_secs)),
+            Err(_) => Err(format!(
+                "Execution TIMEOUT: AST check took longer than {} seconds.",
+                self.execution_timeout_secs
+            )),
         }
     }
 }
@@ -266,7 +288,7 @@ impl NostrZapTracker {
         if !self.enabled {
             return Ok(0);
         }
-        
+
         // For now, return a mock number of zaps
         // In actual implementation, this would query Nostr relays for zaps on the event
         let mock_zaps = if event_id.contains("trusted") { 5 } else { 1 };
@@ -324,7 +346,10 @@ impl PrecisionCalculator {
                 precision = self.config.max_precision;
                 source = InformationSource::HighValueLearning;
                 confidence = 0.9;
-                metadata.push(("free_energy_drop".to_string(), format!("{:.2}%", drop * 100.0)));
+                metadata.push((
+                    "free_energy_drop".to_string(),
+                    format!("{:.2}%", drop * 100.0),
+                ));
             }
         }
 
@@ -360,7 +385,10 @@ impl PrecisionCalculator {
                         metadata.push(("nostr_zap_consensus".to_string(), "achieved".to_string()));
                     }
                     Ok(false) => {
-                        metadata.push(("nostr_zap_consensus".to_string(), "insufficient".to_string()));
+                        metadata.push((
+                            "nostr_zap_consensus".to_string(),
+                            "insufficient".to_string(),
+                        ));
                     }
                     Err(e) => {
                         metadata.push(("nostr_zap_error".to_string(), e));
@@ -390,7 +418,8 @@ impl PrecisionCalculator {
 
     /// Calculate precision for a batch of contexts
     pub fn calculate_precision_batch(&self, contexts: &[PrecisionContext]) -> Vec<PrecisionResult> {
-        contexts.iter()
+        contexts
+            .iter()
             .map(|context| self.calculate_precision(context))
             .collect()
     }
@@ -413,16 +442,16 @@ impl PrecisionCalculator {
         // Simple sigmoid-based scaling: high surprise → lower precision (more exploration)
         // low surprise → higher precision (more exploitation)
         // This mimics the behavior of hyper-networks for precision
-        
+
         // Clamp surprise to reasonable range
         let clamped_surprise = surprise_scalar.clamp(0.0, 10.0);
-        
+
         // Sigmoid transformation: 1.0 / (1.0 + exp(-x))
         // We want: surprise=0 → precision~1.0, surprise=10 → precision~0.1
         // Transform: scale = 1.9 / (1.0 + exp(clamped_surprise - 5.0)) + 0.1
         let exp_term = (clamped_surprise - 5.0).exp();
         let scale = 1.9 / (1.0 + exp_term) + 0.1;
-        
+
         // Clamp to final range
         scale.clamp(0.1, 2.0)
     }
@@ -487,7 +516,7 @@ mod tests {
         let calculator = PrecisionCalculator::with_default_config();
         let context = PrecisionContext::new();
         let result = calculator.calculate_precision(&context);
-        
+
         assert_eq!(result.precision, 0.3);
         assert_eq!(result.source, InformationSource::GeneralInformation);
         assert!(result.precision >= 0.1 && result.precision <= 1.0);
@@ -496,13 +525,13 @@ mod tests {
     #[test]
     fn test_free_energy_tracker() {
         let mut tracker = FreeEnergyTracker::new(5);
-        
+
         tracker.record(10.0);
         tracker.record(8.0);
         tracker.record(6.0);
         tracker.record(4.0);
         tracker.record(2.0);
-        
+
         let drop = tracker.calculate_drop().unwrap();
         assert!(drop > 0.0); // Should be positive drop
         assert!(tracker.has_significant_drop(0.5)); // 80% drop > 50% threshold
@@ -511,33 +540,32 @@ mod tests {
     #[test]
     fn test_precision_with_ground_truth() {
         let calculator = PrecisionCalculator::with_default_config();
-        let context = PrecisionContext::new()
-            .with_ground_truth(true);
-        
+        let context = PrecisionContext::new().with_ground_truth(true);
+
         let result = calculator.calculate_precision(&context);
-        
+
         assert_eq!(result.precision, 1.0);
         assert_eq!(result.source, InformationSource::GroundTruth);
     }
-    
+
     #[test]
     fn test_precision_clamping() {
         let mut config = PrecisionConfig::default();
         config.default_precision = 2.0; // Above max
         config.min_precision = 0.0;
         config.max_precision = 1.0;
-        
+
         let calculator = PrecisionCalculator::new(config);
         let context = PrecisionContext::new();
         let result = calculator.calculate_precision(&context);
-        
+
         assert_eq!(result.precision, 1.0); // Should be clamped to max
     }
-    
+
     #[tokio::test]
     async fn test_python_simulator_external_grounding() {
         let verifier = CodeVerifier::new(true);
-        
+
         // 1. Test Valid Code
         let valid_code = "print('Hello World')";
         let result = verifier.execute_python_simulator(valid_code).await;
@@ -550,13 +578,16 @@ mod tests {
         assert!(err_result.is_err());
         assert!(err_result.unwrap_err().contains("ZeroDivisionError"));
     }
-    
+
     #[tokio::test]
     async fn test_simulator_handles_no_output() {
         let verifier = CodeVerifier::new(true);
         let silent_code = "x = 1\ny = 2\nz = x + y";
         let result = verifier.execute_python_simulator(silent_code).await;
-        assert!(result.is_ok(), "Code without print statements should still succeed.");
+        assert!(
+            result.is_ok(),
+            "Code without print statements should still succeed."
+        );
         assert_eq!(result.unwrap().trim(), "");
     }
 }
@@ -575,29 +606,33 @@ mod integration_tests {
         config.enable_precision_weighting = true;
         config.free_energy_drop_threshold = 0.3;
         config.default_precision = 0.3;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // First inference to establish baseline free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
         let initial_free_energy = *infer_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Learn with default context (no precision factors)
         let context = None;
         let learn_stats = pc.learn(&input, context).unwrap();
         let after_learning_free_energy = *learn_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = after_learning_free_energy - initial_free_energy;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         // Verify precision calculator exists
         assert!(pc.precision_calculator.is_some());
-        
+
         println!("Integration test passed: Precision weighting integrated with PC hierarchy");
     }
 
@@ -608,29 +643,32 @@ mod integration_tests {
         config.enable_precision_weighting = true;
         config.free_energy_drop_threshold = 0.1; // Low threshold for testing
         config.default_precision = 0.3;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
         let initial_free_energy = *infer_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Create a context with ground truth (should give π = 1.0)
-        let context = Some(PrecisionContext::new()
-            .with_ground_truth(true));
-        
+        let context = Some(PrecisionContext::new().with_ground_truth(true));
+
         // Learn with ground truth context
         let learn_stats = pc.learn(&input, context).unwrap();
         let after_learning_free_energy = *learn_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = after_learning_free_energy - initial_free_energy;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         println!("Integration test passed: Precision weighting with ground truth context");
     }
 
@@ -642,29 +680,32 @@ mod integration_tests {
         config.enable_code_verification = true;
         config.free_energy_drop_threshold = 0.1;
         config.default_precision = 0.3;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
         let initial_free_energy = *infer_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Create a context with simple code snippet (should verify successfully)
-        let context = Some(PrecisionContext::new()
-            .with_code_snippet("let x = 1 + 1;".to_string()));
-        
+        let context = Some(PrecisionContext::new().with_code_snippet("let x = 1 + 1;".to_string()));
+
         // Learn with code verification context
         let learn_stats = pc.learn(&input, context).unwrap();
         let after_learning_free_energy = *learn_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = after_learning_free_energy - initial_free_energy;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         println!("Integration test passed: Precision weighting with code verification");
     }
 
@@ -677,29 +718,33 @@ mod integration_tests {
         config.min_zaps_for_consensus = 2;
         config.free_energy_drop_threshold = 0.1;
         config.default_precision = 0.3;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
         let initial_free_energy = *infer_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Create a context with "trusted" event ID (mock returns 5 zaps > min_zaps)
-        let context = Some(PrecisionContext::new()
-            .with_nostr_event_id("trusted_event_123".to_string()));
-        
+        let context =
+            Some(PrecisionContext::new().with_nostr_event_id("trusted_event_123".to_string()));
+
         // Learn with Nostr zap context
         let learn_stats = pc.learn(&input, context).unwrap();
         let after_learning_free_energy = *learn_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = after_learning_free_energy - initial_free_energy;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         println!("Integration test passed: Precision weighting with Nostr zap tracking");
     }
 
@@ -710,18 +755,18 @@ mod integration_tests {
         config.enable_precision_weighting = true;
         config.free_energy_drop_threshold = 0.5; // 50% drop threshold
         config.default_precision = 0.3;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // First learning iteration
         let context1 = None;
         let stats1 = pc.learn(&input, context1).unwrap();
         let free_energy1 = *stats1.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Simulate a large free energy drop by manually recording
         if let Some(ref mut calculator) = pc.precision_calculator {
             // Record high initial free energy
@@ -729,16 +774,20 @@ mod integration_tests {
             // Record low current free energy (simulating 60% drop)
             calculator.record_free_energy(40.0);
         }
-        
+
         // Second learning iteration with context
         let context2 = None;
         let stats2 = pc.learn(&input, context2).unwrap();
         let free_energy2 = *stats2.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = free_energy2 - free_energy1;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         println!("Integration test passed: Precision weighting with free energy drop tracking");
     }
 
@@ -747,31 +796,34 @@ mod integration_tests {
         // Create a PC hierarchy with precision weighting disabled
         let mut config = PCConfig::new(2, vec![10, 5]);
         config.enable_precision_weighting = false;
-        
+
         let mut pc = PredictiveCoding::new(config).unwrap();
-        
+
         // Create random input data with correct shape (10 rows, 1 column)
         let device = Device::Cpu;
         let input = Tensor::randn(0f32, 1.0, (10, 1), &device).unwrap();
-        
+
         // Record initial free energy
         let infer_stats = pc.infer(&input, 10).unwrap();
         let initial_free_energy = *infer_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Learn with context (should be ignored since precision weighting is disabled)
-        let context = Some(PrecisionContext::new()
-            .with_ground_truth(true));
-        
+        let context = Some(PrecisionContext::new().with_ground_truth(true));
+
         let learn_stats = pc.learn(&input, context).unwrap();
         let after_learning_free_energy = *learn_stats.free_energy_history.last().unwrap_or(&0.0);
-        
+
         // Free energy may fluctuate, but change should be bounded
         let change = after_learning_free_energy - initial_free_energy;
-        assert!(change.abs() < 10.0, "Free energy change too large: {}", change);
-        
+        assert!(
+            change.abs() < 10.0,
+            "Free energy change too large: {}",
+            change
+        );
+
         // Precision calculator should be None
         assert!(pc.precision_calculator.is_none());
-        
+
         println!("Integration test passed: Precision weighting disabled works correctly");
     }
 }
@@ -783,12 +835,12 @@ mod test_harness_verification_tests {
     #[tokio::test]
     async fn test_execute_with_tests_success() {
         let verifier = CodeVerifier::new(true);
-        
+
         let code = "def multiply(a, b):\n    return a * b";
         let assertions = "assert multiply(3, 4) == 12, 'Math failed'\nprint('All tests passed!')";
-        
+
         let result = verifier.execute_with_tests(code, assertions).await;
-        
+
         assert!(result.is_ok(), "Test harness should pass correct logic");
         assert!(result.unwrap().contains("All tests passed!"));
     }
@@ -796,18 +848,25 @@ mod test_harness_verification_tests {
     #[tokio::test]
     async fn test_execute_with_tests_catches_hallucination() {
         let verifier = CodeVerifier::new(true);
-        
+
         // LLM generates code that doesn't crash, but does the wrong thing
         let code = "def multiply(a, b):\n    return a + b"; // Accidental addition
         let assertions = "assert multiply(3, 4) == 12, 'Math failed'";
-        
+
         let result = verifier.execute_with_tests(code, assertions).await;
-        
+
         // The CodeVerifier MUST fail this, providing the AssertionError stderr
         assert!(result.is_err(), "Test harness MUST fail incorrect logic");
         let err_msg = result.unwrap_err();
-        assert!(err_msg.contains("AssertionError"), "Error missing AssertionError flag: {}", err_msg);
-        assert!(err_msg.contains("Math failed"), "Error missing custom assertion message");
+        assert!(
+            err_msg.contains("AssertionError"),
+            "Error missing AssertionError flag: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("Math failed"),
+            "Error missing custom assertion message"
+        );
     }
 }
 
@@ -823,16 +882,28 @@ mod precision_math_tests {
         // Scenario 1: Zero Surprise (The brain perfectly predicted the input).
         // It should exploit this state, meaning precision should be HIGH (near 2.0)
         let exploit_scale = calc.hyper_precision(0.0);
-        assert!(exploit_scale > 1.8, "Zero surprise should yield high precision. Got {}", exploit_scale);
+        assert!(
+            exploit_scale > 1.8,
+            "Zero surprise should yield high precision. Got {}",
+            exploit_scale
+        );
 
         // Scenario 2: Massive Surprise (The brain was completely wrong).
         // It needs to explore, meaning precision should drop drastically to allow large weight updates (near 0.1)
         let explore_scale = calc.hyper_precision(10.0);
-        assert!(explore_scale < 0.2, "Massive surprise should yield low precision. Got {}", explore_scale);
+        assert!(
+            explore_scale < 0.2,
+            "Massive surprise should yield low precision. Got {}",
+            explore_scale
+        );
 
         // Scenario 3: Medium Surprise (At the inflection point of 5.0)
         // It should be exactly in the middle of the sigmoid.
         let mid_scale = calc.hyper_precision(5.0);
-        assert!((mid_scale - 1.05).abs() < 0.01, "Sigmoid midpoint math is incorrect. Got {}", mid_scale);
+        assert!(
+            (mid_scale - 1.05).abs() < 0.01,
+            "Sigmoid midpoint math is incorrect. Got {}",
+            mid_scale
+        );
     }
 }

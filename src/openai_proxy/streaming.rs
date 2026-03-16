@@ -1,6 +1,6 @@
 // src/openai_proxy/streaming.rs
-use serde_json::Value;
 use futures::stream::Stream;
+use serde_json::Value;
 
 /// Streaming response chunk
 #[derive(Debug, Clone, serde::Serialize)]
@@ -28,7 +28,7 @@ impl StreamManager {
     pub fn new() -> Self {
         Self {}
     }
-    
+
     pub fn create_stream(&self) -> impl Stream<Item = StreamChunk> {
         // Placeholder: returns empty stream
         futures::stream::empty()

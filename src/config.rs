@@ -1,9 +1,9 @@
 // src/config.rs
 // Configuration management for NeuroPC Node
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::privacy_networks::PrivacyNetworkConfig;
@@ -249,7 +249,13 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
-    pub fn new(embedding_dim: usize, batch_size: usize, max_epochs: usize, learning_rate: f32, document_paths: Vec<String>) -> Self {
+    pub fn new(
+        embedding_dim: usize,
+        batch_size: usize,
+        max_epochs: usize,
+        learning_rate: f32,
+        document_paths: Vec<String>,
+    ) -> Self {
         Self {
             embedding_dim,
             batch_size,
@@ -293,7 +299,7 @@ impl NodeConfig {
         if !path.exists() {
             return Err(NodeError::FileNotFoundError(path.display().to_string()));
         }
-        
+
         // Use config crate which supports multiple formats (TOML, JSON, YAML, etc.)
         // Create a default configuration and merge with file
         let default_config = Self::default();
@@ -301,16 +307,19 @@ impl NodeConfig {
             .add_source(config::Config::try_from(&default_config)?)
             .add_source(config::File::from(path))
             .build()?;
-        
+
         config_builder
             .try_deserialize()
             .map(|config: Self| {
-                info!("Loaded config from {} (format detected automatically)", path.display());
+                info!(
+                    "Loaded config from {} (format detected automatically)",
+                    path.display()
+                );
                 config
             })
             .map_err(|e| NodeError::ConfigParseError(e.to_string()))
     }
-    
+
     /// Load configuration from "config.toml" if it exists, otherwise return default configuration.
     /// This is the recommended way to get configuration for the application.
     pub fn load_or_default() -> Self {
@@ -321,12 +330,15 @@ impl NodeConfig {
                 config
             }
             Err(e) => {
-                warn!("Failed to load configuration from {}: {}. Using default configuration.", CONFIG_FILE, e);
+                warn!(
+                    "Failed to load configuration from {}: {}. Using default configuration.",
+                    CONFIG_FILE, e
+                );
                 Self::default()
             }
         }
     }
-    
+
     pub fn save_to_file(&self, path: &str) -> Result<(), NodeError> {
         let path_obj = Path::new(path);
         let config_str = if let Some(ext) = path_obj.extension() {
@@ -344,7 +356,7 @@ impl NodeConfig {
             serde_json::to_string_pretty(self)
                 .map_err(|e| NodeError::SerializationError(e.to_string()))?
         };
-        
+
         match fs::write(path, config_str) {
             Ok(_) => {
                 info!("Saved config to {}", path);
@@ -353,20 +365,24 @@ impl NodeConfig {
             Err(e) => Err(NodeError::FileNotFoundError(e.to_string())),
         }
     }
-    
+
     pub fn validate(&self) -> Result<(), NodeError> {
         if self.model_path.is_empty() {
-            return Err(NodeError::InvalidConfig("Model path cannot be empty".to_string()));
+            return Err(NodeError::InvalidConfig(
+                "Model path cannot be empty".to_string(),
+            ));
         }
-        
+
         if self.context_size == 0 {
-            return Err(NodeError::InvalidConfig("Context size must be > 0".to_string()));
+            return Err(NodeError::InvalidConfig(
+                "Context size must be > 0".to_string(),
+            ));
         }
-        
+
         if self.nostr_config.relay_urls.is_empty() {
             warn!("No Nostr relays configured");
         }
-        
+
         Ok(())
     }
 }
@@ -401,7 +417,7 @@ impl Default for MLConfig {
             embedding_dim: 768,
             use_gpu: true,
             // --- 🔴 NEW: Defaults ---
-            reserved_cores: 1, // Always leave 1 core free for the OS
+            reserved_cores: 1,           // Always leave 1 core free for the OS
             low_priority_learning: true, // Run learning in the background
         }
     }
@@ -471,7 +487,7 @@ impl Default for BootstrapConfig {
         Self {
             embedding_dim: 1024,
             batch_size: 32,
-            max_epochs: 100,  // Increased from 10 to ensure better decoder convergence
+            max_epochs: 100, // Increased from 10 to ensure better decoder convergence
             learning_rate: 0.001,
             document_paths: vec!["human-eval/".to_string()],
         }
@@ -481,38 +497,38 @@ impl Default for BootstrapConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_config_serialization() {
         let config = NodeConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: NodeConfig = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(config.model_path, deserialized.model_path);
         assert_eq!(config.context_size, deserialized.context_size);
     }
-    
+
     #[test]
     fn test_config_validation() {
         let mut config = NodeConfig::default();
         assert!(config.validate().is_ok());
-        
+
         config.model_path = "".to_string();
         assert!(config.validate().is_err());
     }
-    
+
     #[test]
     fn test_config_file_operations() {
         let config = NodeConfig::default();
         let test_path = "test_config.json";
-        
+
         // Save config
         assert!(config.save_to_file(test_path).is_ok());
-        
+
         // Load config
         let loaded_config = NodeConfig::load_from_file(test_path).unwrap();
         assert_eq!(config.model_path, loaded_config.model_path);
-        
+
         // Clean up
         std::fs::remove_file(test_path).unwrap();
     }

@@ -2,10 +2,10 @@
 // Common types used across the NeuroFed Node
 // NOTE: Configuration types (NodeConfig, PCConfig, etc.) are now centralized in config.rs
 
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInput {
@@ -58,7 +58,11 @@ pub struct NodeError {
 
 impl std::fmt::Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "NodeError[{}]: {} (type: {:?})", self.id, self.message, self.error_type)
+        write!(
+            f,
+            "NodeError[{}]: {} (type: {:?})",
+            self.id, self.message, self.error_type
+        )
     }
 }
 
@@ -204,10 +208,14 @@ impl std::error::Error for MLError {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ThoughtOp {
     Define,
+    Initialize, // <-- НОВОЕ
+    Validate,   // <-- НОВОЕ
     Iterate,
     Check,
+    Decide,     // <-- НОВОЕ
     Compute,
     Aggregate,
+    HandleError,// <-- НОВОЕ
     Return,
     Explain,
     EOF,
@@ -218,10 +226,14 @@ impl std::fmt::Display for ThoughtOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ThoughtOp::Define => write!(f, "DEFINE_FUNCTION"),
+            ThoughtOp::Initialize => write!(f, "INITIALIZE_VARIABLE"),
+            ThoughtOp::Validate => write!(f, "VALIDATE_INPUT"),
             ThoughtOp::Iterate => write!(f, "ITERATE_COLLECTION"),
             ThoughtOp::Check => write!(f, "CHECK_CONDITION"),
+            ThoughtOp::Decide => write!(f, "DECIDE_BRANCH"),
             ThoughtOp::Compute => write!(f, "COMPUTE_MATH"),
             ThoughtOp::Aggregate => write!(f, "AGGREGATE_RESULTS"),
+            ThoughtOp::HandleError => write!(f, "HANDLE_ERROR"),
             ThoughtOp::Return => write!(f, "RETURN_VALUE"),
             ThoughtOp::Explain => write!(f, "EXPLAIN"),
             ThoughtOp::EOF => write!(f, "EOF"),
@@ -291,10 +303,14 @@ impl Default for CognitiveDictionary {
             next_id: 0,
         };
         dict.add_op(ThoughtOp::Define);
+        dict.add_op(ThoughtOp::Initialize);
+        dict.add_op(ThoughtOp::Validate);
         dict.add_op(ThoughtOp::Iterate);
         dict.add_op(ThoughtOp::Check);
+        dict.add_op(ThoughtOp::Decide);
         dict.add_op(ThoughtOp::Compute);
         dict.add_op(ThoughtOp::Aggregate);
+        dict.add_op(ThoughtOp::HandleError);
         dict.add_op(ThoughtOp::Return);
         dict.add_op(ThoughtOp::Explain);
         dict.add_op(ThoughtOp::EOF);
@@ -313,7 +329,7 @@ impl CognitiveDictionary {
         self.next_id += 1;
         id
     }
-    
+
     pub fn get_op(&self, id: u32) -> ThoughtOp {
         self.id_to_op.get(&id).cloned().unwrap_or(ThoughtOp::EOF)
     }
@@ -326,7 +342,9 @@ impl CognitiveDictionary {
     pub fn discover_chunks(&mut self, episodes: &[Episode]) -> usize {
         let mut bigrams: HashMap<(u32, u32), usize> = HashMap::new();
         for ep in episodes {
-            if !ep.success { continue; }
+            if !ep.success {
+                continue;
+            }
             for window in ep.thought_sequence.windows(2) {
                 *bigrams.entry((window[0], window[1])).or_insert(0) += 1;
             }
@@ -334,7 +352,8 @@ impl CognitiveDictionary {
 
         let mut new_chunks = 0;
         for ((id1, id2), count) in bigrams {
-            if count >= 3 { // Threshold for chunking
+            if count >= 3 {
+                // Threshold for chunking
                 // Skip chunking if either thought is EOF (terminal marker)
                 if self.get_op(id1) == ThoughtOp::EOF || self.get_op(id2) == ThoughtOp::EOF {
                     continue;
@@ -342,10 +361,13 @@ impl CognitiveDictionary {
                 let name1 = self.get_op(id1).to_string();
                 let name2 = self.get_op(id2).to_string();
                 let new_concept = format!("{}_{}", name1, name2);
-                
+
                 let dynamic_op = ThoughtOp::Dynamic(new_concept);
                 if !self.op_to_id.contains_key(&dynamic_op) {
-                    tracing::info!("✨ Chunk Discovery: Created new thought pattern: {}", dynamic_op);
+                    tracing::info!(
+                        "✨ Chunk Discovery: Created new thought pattern: {}",
+                        dynamic_op
+                    );
                     self.add_op(dynamic_op);
                     new_chunks += 1;
                 }
@@ -379,7 +401,7 @@ mod tests {
     #[test]
     fn test_cognitive_dictionary_initialization() {
         let dict = CognitiveDictionary::default();
-        assert_eq!(dict.len(), 8, "Dictionary should have 8 core ops");
+        assert_eq!(dict.len(), 12, "Dictionary should have 12 core ops");
         assert!(dict.op_to_id.contains_key(&ThoughtOp::Define));
     }
 }
@@ -410,13 +432,19 @@ mod cognitive_dictionary_tests {
 
         let initial_len = dict.len();
         let chunks_added = dict.discover_chunks(&episodes);
-        
+
         // Should discover 1 new chunk: DEFINE_FUNCTION_CHECK_CONDITION (Check+EOF is skipped because EOF is terminal)
-        assert_eq!(chunks_added, 1, "Should discover 1 new chunk (Define+Check) because EOF chunks are skipped");
+        assert_eq!(
+            chunks_added, 1,
+            "Should discover 1 new chunk (Define+Check) because EOF chunks are skipped"
+        );
         assert_eq!(dict.len(), initial_len + 1);
-        
+
         let new_op1 = ThoughtOp::Dynamic("DEFINE_FUNCTION_CHECK_CONDITION".into());
-        assert!(dict.op_to_id.contains_key(&new_op1), "The combined chunk must exist in the dictionary");
+        assert!(
+            dict.op_to_id.contains_key(&new_op1),
+            "The combined chunk must exist in the dictionary"
+        );
         // The second chunk (CHECK_CONDITION_EOF) is skipped because EOF chunks are not created
     }
 }
@@ -431,17 +459,22 @@ mod types_architecture_tests {
             goal: "Write a binary search tree".to_string(),
             entities: HashMap::new(),
             constraints: vec!["O(log n)".to_string()],
-            assumptions: vec!["The array is already sorted".to_string(), "Failed previously on empty array".to_string()],
+            assumptions: vec![
+                "The array is already sorted".to_string(),
+                "Failed previously on empty array".to_string(),
+            ],
             tests: "assert bst([1,2,3], 2) == 1".to_string(),
             raw_query: "Provide a BST".to_string(),
         };
 
         let context = state.get_pc_context();
-        
+
         // The PC context must include both the goal and the corrective assumptions
         // to ensure it learns from its past failures.
         assert!(context.contains("Goal: Write a binary search tree"));
-        assert!(context.contains("Corrected Assumptions: The array is already sorted; Failed previously on empty array"));
+        assert!(context.contains(
+            "Corrected Assumptions: The array is already sorted; Failed previously on empty array"
+        ));
     }
 }
 
@@ -468,7 +501,7 @@ mod openai_compatibility_tests {
         };
 
         let serialized = serde_json::to_value(&tool).unwrap();
-        
+
         // Assertions for OpenAI spec requirements
         assert_eq!(serialized["type"], "function");
         assert_eq!(serialized["function"]["name"], "get_weather");
@@ -492,7 +525,7 @@ mod openai_compatibility_tests {
 
         assert_eq!(tool_call.id, "call_123");
         assert_eq!(tool_call.function.name, "solve_math");
-        
+
         // CRITICAL: Ensure arguments is a String, not a Map
         assert_eq!(tool_call.function.arguments, "{\"query\": \"sqrt(144)\"}");
     }
@@ -509,8 +542,11 @@ mod openai_compatibility_tests {
         });
 
         let res: Result<Tool, _> = serde_json::from_value(raw_json);
-        assert!(res.is_ok(), "Should successfully parse even without optional fields");
-        
+        assert!(
+            res.is_ok(),
+            "Should successfully parse even without optional fields"
+        );
+
         let tool = res.unwrap();
         assert!(tool.function.description.is_none());
         assert!(tool.function.parameters.is_none());
@@ -530,7 +566,11 @@ mod openai_compatibility_tests {
         }"#;
 
         let res: Result<ToolCall, _> = serde_json::from_str(raw_json);
-        
-        assert!(res.is_ok(), "Regression check failed: ToolCall failed to parse JSON with arguments string. Error: {:?}", res.err());
+
+        assert!(
+            res.is_ok(),
+            "Regression check failed: ToolCall failed to parse JSON with arguments string. Error: {:?}",
+            res.err()
+        );
     }
 }

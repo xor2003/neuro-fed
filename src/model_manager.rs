@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
 use crate::types::DeviceType;
@@ -82,7 +82,9 @@ impl std::fmt::Display for ModelManagerError {
         match self {
             ModelManagerError::DownloadError(msg) => write!(f, "Download error: {}", msg),
             ModelManagerError::FileError(msg) => write!(f, "File error: {}", msg),
-            ModelManagerError::MemoryDetectionError(msg) => write!(f, "Memory detection error: {}", msg),
+            ModelManagerError::MemoryDetectionError(msg) => {
+                write!(f, "Memory detection error: {}", msg)
+            }
             ModelManagerError::ModelLoadError(msg) => write!(f, "Model load error: {}", msg),
             ModelManagerError::InvalidModelError(msg) => write!(f, "Invalid model error: {}", msg),
             ModelManagerError::NetworkError(msg) => write!(f, "Network error: {}", msg),
@@ -111,9 +113,9 @@ impl ModelManager {
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap();
-        
+
         let download_dir = "models".to_string();
-        
+
         Self {
             models,
             client,
@@ -124,7 +126,10 @@ impl ModelManager {
     }
 
     /// Set progress callback for download progress
-    pub fn set_progress_callback(&mut self, callback: impl Fn(DownloadProgress) + Send + Sync + 'static) {
+    pub fn set_progress_callback(
+        &mut self,
+        callback: impl Fn(DownloadProgress) + Send + Sync + 'static,
+    ) {
         self.progress_callback = Some(Arc::new(Mutex::new(callback)));
     }
 
@@ -143,19 +148,18 @@ impl ModelManager {
         info!("Available memory: {} MB", available_memory);
 
         // Find best matching model
-        let mut suitable_models: Vec<_> = self.models.values()
+        let mut suitable_models: Vec<_> = self
+            .models
+            .values()
             .filter(|model| {
-                available_memory >= model.min_memory_mb && 
-                available_memory <= model.max_memory_mb
+                available_memory >= model.min_memory_mb && available_memory <= model.max_memory_mb
             })
             .cloned()
             .collect();
 
         if suitable_models.is_empty() {
             // Return smallest model if no perfect match
-            suitable_models = self.models.values()
-                .cloned()
-                .collect();
+            suitable_models = self.models.values().cloned().collect();
             suitable_models.sort_by_key(|m| m.min_memory_mb);
         }
 
@@ -165,9 +169,9 @@ impl ModelManager {
             b_score.cmp(&a_score)
         });
 
-        suitable_models.first()
-            .cloned()
-            .ok_or_else(|| ModelManagerError::ConfigurationError("No suitable models available".to_string()))
+        suitable_models.first().cloned().ok_or_else(|| {
+            ModelManagerError::ConfigurationError("No suitable models available".to_string())
+        })
     }
 
     /// Detect available system memory
@@ -176,33 +180,30 @@ impl ModelManager {
         if let Ok(memory) = self.detect_memory_linux().await {
             return Ok(memory);
         }
-        
+
         if let Ok(memory) = self.detect_memory_macos().await {
             return Ok(memory);
         }
-        
+
         if let Ok(memory) = self.detect_memory_windows().await {
             return Ok(memory);
         }
-        
+
         Err("Failed to detect available memory on this platform".to_string())
     }
 
     /// Detect memory on Linux
     async fn detect_memory_linux(&self) -> Result<u64, String> {
         use tokio::process::Command;
-        
-        let output = match Command::new("free")
-            .arg("-m")
-            .output()
-            .await {
+
+        let output = match Command::new("free").arg("-m").output().await {
             Ok(output) => output,
             Err(e) => return Err(e.to_string()),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
-        
+
         if lines.len() < 2 {
             return Err("Invalid free command output".to_string());
         }
@@ -213,16 +214,16 @@ impl ModelManager {
         }
 
         let available_str = mem_line.get(3).unwrap_or(&"0");
-        available_str.parse::<u64>().map_err(|_| "Failed to parse available memory".to_string())
+        available_str
+            .parse::<u64>()
+            .map_err(|_| "Failed to parse available memory".to_string())
     }
 
     /// Detect memory on macOS
     async fn detect_memory_macos(&self) -> Result<u64, String> {
         use tokio::process::Command;
-        
-        let output = match Command::new("vm_stat")
-            .output()
-            .await {
+
+        let output = match Command::new("vm_stat").output().await {
             Ok(output) => output,
             Err(e) => return Err(e.to_string()),
         };
@@ -230,7 +231,7 @@ impl ModelManager {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut pages_free = 0;
         let mut pages_active = 0;
-        
+
         for line in stdout.lines() {
             if line.contains("free pages:") {
                 if let Some(num) = line.split_whitespace().nth(1) {
@@ -255,26 +256,30 @@ impl ModelManager {
     /// Detect memory on Windows
     async fn detect_memory_windows(&self) -> Result<u64, String> {
         use tokio::process::Command;
-        
+
         let output = match Command::new("wmic")
             .arg("OS")
             .arg("get")
             .arg("FreePhysicalMemory")
             .output()
-            .await {
+            .await
+        {
             Ok(output) => output,
             Err(e) => return Err(e.to_string()),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
-        
+
         if lines.len() < 2 {
             return Err("Invalid wmic output".to_string());
         }
 
         let free_memory_str = lines[1].trim();
-        free_memory_str.parse::<u64>().map(|kb| kb / 1024).map_err(|_| "Failed to parse free memory".to_string())
+        free_memory_str
+            .parse::<u64>()
+            .map(|kb| kb / 1024)
+            .map_err(|_| "Failed to parse free memory".to_string())
     }
 
     /// Check if model is already downloaded
@@ -289,14 +294,16 @@ impl ModelManager {
 
     /// Download a model with progress tracking
     pub async fn download_model(&self, model_name: &str) -> Result<(), ModelManagerError> {
-        let model = self.models.get(model_name)
-            .ok_or_else(|| ModelManagerError::InvalidModelError(format!("Model {} not found", model_name)))?;
+        let model = self.models.get(model_name).ok_or_else(|| {
+            ModelManagerError::InvalidModelError(format!("Model {} not found", model_name))
+        })?;
 
         if self.is_model_downloaded(model_name).await {
             info!("Model {} already downloaded", model_name);
         } else {
             info!("Starting download for model: {}", model_name);
-            self.download_file(&model.download_url, Path::new(&model.local_path)).await?;
+            self.download_file(&model.download_url, Path::new(&model.local_path))
+                .await?;
             info!("Model {} downloaded successfully", model_name);
         }
 
@@ -326,7 +333,9 @@ impl ModelManager {
             return Err(ModelManagerError::FileError(e.to_string()));
         }
 
-        let response = self.client.get(url)
+        let response = self
+            .client
+            .get(url)
             .send()
             .await
             .map_err(|e| ModelManagerError::NetworkError(e.to_string()))?;
@@ -343,9 +352,11 @@ impl ModelManager {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ModelManagerError::NetworkError(e.to_string()))?;
-            
+
             downloaded += chunk.len() as u64;
-            file.write_all(&chunk).await.map_err(|e| ModelManagerError::FileError(e.to_string()))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| ModelManagerError::FileError(e.to_string()))?;
 
             // Calculate progress
             let percentage = if total_size > 0 {
@@ -382,16 +393,22 @@ impl ModelManager {
             }
         }
 
-        file.sync_all().await.map_err(|e| ModelManagerError::FileError(e.to_string()))?;
-        
-        info!("File downloaded successfully ({} MB)", downloaded / 1024 / 1024);
+        file.sync_all()
+            .await
+            .map_err(|e| ModelManagerError::FileError(e.to_string()))?;
+
+        info!(
+            "File downloaded successfully ({} MB)",
+            downloaded / 1024 / 1024
+        );
         Ok(())
     }
 
     /// Load a model using candle-core
     pub async fn load_model(&self, model_name: &str) -> Result<AutoModel, ModelManagerError> {
-        let _model = self.models.get(model_name)
-            .ok_or_else(|| ModelManagerError::InvalidModelError(format!("Model {} not found", model_name)))?;
+        let _model = self.models.get(model_name).ok_or_else(|| {
+            ModelManagerError::InvalidModelError(format!("Model {} not found", model_name))
+        })?;
 
         if !self.is_model_downloaded(model_name).await {
             self.download_model(model_name).await.map_err(|e| {
@@ -415,14 +432,15 @@ impl ModelManager {
 
     /// Get model configuration for ML engine
     pub fn get_model_config(&self, model_name: &str) -> Result<AutoConfig, ModelManagerError> {
-        let _model = self.models.get(model_name)
-            .ok_or_else(|| ModelManagerError::InvalidModelError(format!("Model {} not found", model_name)))?;
+        let _model = self.models.get(model_name).ok_or_else(|| {
+            ModelManagerError::InvalidModelError(format!("Model {} not found", model_name))
+        })?;
 
         // Create configuration based on model characteristics
         let config = AutoConfig {
-            hidden_size: 4096, // Example value
-            num_layers: 32,     // Example value
-            vocab_size: 32000,  // Example value
+            hidden_size: 4096,             // Example value
+            num_layers: 32,                // Example value
+            vocab_size: 32000,             // Example value
             max_position_embeddings: 2048, // Example value
         };
 
@@ -431,8 +449,9 @@ impl ModelManager {
 
     /// Get tokenizer for a model
     pub fn get_tokenizer(&self, model_name: &str) -> Result<AutoTokenizer, ModelManagerError> {
-        let _model = self.models.get(model_name)
-            .ok_or_else(|| ModelManagerError::InvalidModelError(format!("Model {} not found", model_name)))?;
+        let _model = self.models.get(model_name).ok_or_else(|| {
+            ModelManagerError::InvalidModelError(format!("Model {} not found", model_name))
+        })?;
 
         // Create tokenizer based on model characteristics
         let tokenizer = AutoTokenizer {
@@ -452,8 +471,9 @@ impl ModelManager {
 
     /// Get device configuration for a model
     pub fn get_device_config(&self, model_name: &str) -> Result<DeviceType, ModelManagerError> {
-        let model = self.models.get(model_name)
-            .ok_or_else(|| ModelManagerError::InvalidModelError(format!("Model {} not found", model_name)))?;
+        let model = self.models.get(model_name).ok_or_else(|| {
+            ModelManagerError::InvalidModelError(format!("Model {} not found", model_name))
+        })?;
 
         // Determine device based on model size and available memory
         let device_type = if model.min_memory_mb > 8192 {
@@ -547,7 +567,7 @@ mod tests {
     async fn test_model_manager_creation() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         assert_eq!(manager.models.len(), 1);
         assert!(manager.models.contains_key("tinyllama-1.1b-chat"));
     }
@@ -556,7 +576,7 @@ mod tests {
     async fn test_memory_detection() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         let memory = manager.detect_available_memory().await;
         assert!(memory.is_ok());
         assert!(memory.unwrap() > 0);
@@ -566,11 +586,11 @@ mod tests {
     async fn test_model_recommendation() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         let recommended = manager.get_recommended_model().await;
         assert!(recommended.is_ok());
         let model = recommended.unwrap();
-        
+
         assert!(model.name == "qwen2.5-1.5b-instruct" || model.name == "tinyllama-1.1b-chat");
     }
 
@@ -578,7 +598,7 @@ mod tests {
     async fn test_model_download() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         // This would normally download, but we'll mock for testing
         // Since we cannot mock the HTTP client, we'll test that the function
         // returns either Ok (if file already exists) or Err (if network fails).
@@ -593,7 +613,7 @@ mod tests {
     async fn test_model_loading() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         let result = manager.load_model("qwen2.5-1.5b").await;
         assert!(result.is_err()); // Should fail due to missing file
     }

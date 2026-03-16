@@ -1,36 +1,38 @@
 // src/main.rs
+use anyhow::Result;
+use candle_core::Device;
+use neuro_fed_node::{
+    bootstrap::BootstrapManager,
+    brain_manager::BrainManager,
+    config::{self, NodeConfig},
+    federation::nostr_federation::NostrFederation,
+    federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy},
+    metrics,
+    ml_engine::MLEngine,
+    node_loop::NodeLoop,
+    openai_proxy::calibration::CalibrationStore,
+    openai_proxy::components::ProxyConfig,
+    openai_proxy::{OpenAiProxy, create_router},
+    payment_verifier::PaymentVerifier,
+    pc_decoder::ThoughtDecoder,
+    pc_hierarchy::PredictiveCoding,
+    persistence::PCPersistence,
+    pow_verifier::PoWVerifier,
+    semantic_cache::SemanticCache,
+    sleep_phase::SleepManager,
+    types::CognitiveDictionary,
+    types::{DeviceType, Episode, StudyState},
+    ui,
+};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::VecDeque;
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{mpsc, RwLock};
-use anyhow::Result;
-use thread_priority::*; // <--- NEW IMPORT
-use neuro_fed_node::{
-    config::{self, NodeConfig}, ml_engine::MLEngine, pc_hierarchy::PredictiveCoding,
-    types::{DeviceType, Episode, StudyState},
-    persistence::PCPersistence,
-    sleep_phase::SleepManager,
-    node_loop::NodeLoop,
-    openai_proxy::{OpenAiProxy, create_router},
-    openai_proxy::components::ProxyConfig,
-    openai_proxy::calibration::CalibrationStore,
-    pc_decoder::ThoughtDecoder,
-    types::CognitiveDictionary,
-    semantic_cache::SemanticCache,
-    metrics,
-    ui,
-    bootstrap::BootstrapManager,
-    federation::nostr_federation::NostrFederation,
-    brain_manager::BrainManager,
-    federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy},
-    payment_verifier::PaymentVerifier,
-    pow_verifier::PoWVerifier,
-};
-use std::collections::VecDeque;
-use candle_core::Device;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc::channel;
 use std::time::Duration;
+use thread_priority::*; // <--- NEW IMPORT
+use tokio::sync::mpsc::channel;
+use tokio::sync::{RwLock, mpsc};
 use walkdir::WalkDir;
 
 /// Динамический выбор устройства на основе конфигурации
@@ -46,7 +48,9 @@ fn select_device(config: &NodeConfig) -> Device {
             return dev;
         }
 
-        tracing::warn!("GPU requested but no compatible NVIDIA/AMD/Metal device found. Falling back to CPU.");
+        tracing::warn!(
+            "GPU requested but no compatible NVIDIA/AMD/Metal device found. Falling back to CPU."
+        );
         Device::Cpu
     } else {
         Device::Cpu
@@ -63,9 +67,11 @@ async fn main() -> Result<()> {
 
     // --- 🔴 NEW: Smart N-1 CPU Allocation and Priority ---
     let total_cpus = std::thread::available_parallelism()?.get();
-    
+
     // Calculate N - reserved cores (ensure we have at least 1)
-    let target_cpus = total_cpus.saturating_sub(config.ml_config.reserved_cores).max(1);
+    let target_cpus = total_cpus
+        .saturating_sub(config.ml_config.reserved_cores)
+        .max(1);
     let low_priority = config.ml_config.low_priority_learning;
 
     rayon::ThreadPoolBuilder::new()
@@ -83,25 +89,37 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         "🧠 Brain scaling: Using {} out of {} CPU cores (Reserved: {}, Low Priority: {}).",
-        target_cpus, total_cpus, config.ml_config.reserved_cores, low_priority
+        target_cpus,
+        total_cpus,
+        config.ml_config.reserved_cores,
+        low_priority
     );
     // -----------------------------------------------------
 
     // Create global shutdown signal for graceful termination
     let stop_signal = Arc::new(AtomicBool::new(false));
     let _stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
-    
+
     // Create global shutdown signal for graceful termination
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_signal_for_bootstrap = stop_signal.clone(); // Clone for the manager
-    
+
     // 1. Инициализация Базы Данных и Персистентности
-    let persistence = Arc::new(PCPersistence::new(config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db")).await?);
-    
+    let persistence = Arc::new(
+        PCPersistence::new(
+            config
+                .pc_config
+                .persistence_db_path
+                .as_deref()
+                .unwrap_or("./neurofed.db"),
+        )
+        .await?,
+    );
+
     // 2. Динамический выбор устройства
     let device = select_device(&config);
     tracing::info!("Using device: {:?}", device);
-    
+
     // 3. Инициализация основных AI-компонентов с tokio::sync::RwLock
     let device_type = DeviceType {
         name: config.ml_config.device_type.clone(),
@@ -112,27 +130,29 @@ async fn main() -> Result<()> {
     let embedding_dim = ml_engine.read().await.embedding_dim();
 
     let mut pc_config = config.pc_config.clone();
-    
+
     // --- 🔴 NEW: Configuration Sanitizing Logic ---
     // Ensure dim_per_level array matches n_levels to prevent crashes
     let n_levels = pc_config.n_levels;
     let dims_len = pc_config.dim_per_level.len();
-    
+
     if dims_len < n_levels {
         tracing::warn!(
             "PC config mismatch: n_levels is {} but only {} dimensions are specified. Padding with default values.",
-            n_levels, dims_len
+            n_levels,
+            dims_len
         );
         let last_dim = *pc_config.dim_per_level.last().unwrap_or(&512);
         pc_config.dim_per_level.resize(n_levels, last_dim);
     } else if dims_len > n_levels {
         tracing::warn!(
             "PC config mismatch: n_levels is {} but {} dimensions are specified. Truncating.",
-            n_levels, dims_len
+            n_levels,
+            dims_len
         );
         pc_config.dim_per_level.truncate(n_levels);
     }
-    
+
     // Ограничение роста уровней (Capping) для стабильности памяти
     let max_dim = 4096; // Жесткий предел
     if !pc_config.dim_per_level.is_empty() {
@@ -143,23 +163,33 @@ async fn main() -> Result<()> {
             *dim = (*dim).min(max_dim);
         }
     }
-    
+
     // Check database for existing weights and adjust config if needed
-    let db_missing = !std::path::Path::new(config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db")).exists();
+    let db_missing = !std::path::Path::new(
+        config
+            .pc_config
+            .persistence_db_path
+            .as_deref()
+            .unwrap_or("./neurofed.db"),
+    )
+    .exists();
     let has_weights = if !db_missing {
         persistence.has_any_weights().await.unwrap_or(false)
     } else {
         false
     };
-    
+
     if has_weights && !db_missing {
         match persistence.load_all_levels().await {
             Ok(saved_weights) => {
                 if !saved_weights.is_empty() {
                     let saved_levels_count = saved_weights.len();
                     if saved_levels_count != pc_config.n_levels {
-                        tracing::warn!("DB has {} levels but config has {}. Overriding config to match DB.",
-                            saved_levels_count, pc_config.n_levels);
+                        tracing::warn!(
+                            "DB has {} levels but config has {}. Overriding config to match DB.",
+                            saved_levels_count,
+                            pc_config.n_levels
+                        );
                         pc_config.n_levels = saved_levels_count;
                         // Update dim_per_level accordingly - keep existing dimensions or pad with defaults
                         while pc_config.dim_per_level.len() < saved_levels_count {
@@ -169,39 +199,51 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            Err(e) => tracing::warn!("Failed to load weights from database during config check: {}", e),
+            Err(e) => tracing::warn!(
+                "Failed to load weights from database during config check: {}",
+                e
+            ),
         }
     }
-    
+
     let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config.clone())?));
-    
+
     // 🧬 KNOWLEDGE INJECTION: If starting fresh, steal intelligence from the LLM
     if db_missing || !has_weights {
         tracing::info!("🧬 Attempting to inject pre-trained LLM genetics into PC Level 0...");
         let engine = ml_engine.read().await;
-        
+
         let target_rows = pc_config.dim_per_level[0];
-        let target_cols = if pc_config.n_levels > 1 { pc_config.dim_per_level[1] } else { target_rows };
-        
+        let target_cols = if pc_config.n_levels > 1 {
+            pc_config.dim_per_level[1]
+        } else {
+            target_rows
+        };
+
         // Extract weights from an early feed-forward block to act as the primary feature extractor
-        if let Ok(knowledge) = engine.extract_pretrained_weights("blk.0.ffn_down.weight", target_rows, target_cols) {
+        if let Ok(knowledge) =
+            engine.extract_pretrained_weights("blk.0.ffn_down.weight", target_rows, target_cols)
+        {
             if let Ok(mut knowledge_dev) = knowledge.to_device(&device) {
                 // 🔴 FIX: Make contiguous and Scale weights to prevent Gradient Explosion!
                 knowledge_dev = knowledge_dev.contiguous().unwrap_or(knowledge_dev);
-                
+
                 if let Ok(sqr) = knowledge_dev.sqr() {
                     if let Ok(sum_t) = sqr.sum_all() {
                         if let Ok(sum_sq) = sum_t.to_scalar::<f32>() {
                             let elements = (target_rows * target_cols) as f32;
                             let rms = (sum_sq / elements).sqrt();
                             let target_rms = (1.0 / target_rows as f32).sqrt();
-                            
+
                             // Scale the variance so it safely fits what the Predictive Coding layer expects
                             if rms > 0.0 {
                                 let scale = (target_rms / rms) as f64;
                                 if let Ok(scaled) = knowledge_dev.affine(scale, 0.0) {
                                     knowledge_dev = scaled;
-                                    tracing::info!("⚖️ Scaled injected weights by {:.4} to match PC initialization variance (preventing explosion)", scale);
+                                    tracing::info!(
+                                        "⚖️ Scaled injected weights by {:.4} to match PC initialization variance (preventing explosion)",
+                                        scale
+                                    );
                                 }
                             }
                         }
@@ -220,7 +262,10 @@ async fn main() -> Result<()> {
     let cognitive_dict = if !db_missing {
         match persistence.load_dictionary().await {
             Ok(Some(dict)) => {
-                tracing::info!("✅ Successfully loaded CognitiveDictionary from persistence ({} ops)", dict.len());
+                tracing::info!(
+                    "✅ Successfully loaded CognitiveDictionary from persistence ({} ops)",
+                    dict.len()
+                );
                 Arc::new(RwLock::new(dict))
             }
             Ok(None) => {
@@ -228,7 +273,10 @@ async fn main() -> Result<()> {
                 Arc::new(RwLock::new(CognitiveDictionary::default()))
             }
             Err(e) => {
-                tracing::warn!("Failed to load CognitiveDictionary: {}, creating default", e);
+                tracing::warn!(
+                    "Failed to load CognitiveDictionary: {}, creating default",
+                    e
+                );
                 Arc::new(RwLock::new(CognitiveDictionary::default()))
             }
         }
@@ -237,12 +285,17 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(CognitiveDictionary::default()))
     };
 
-    
-    let top_belief_dim = *pc_hierarchy.read().await.config.dim_per_level.last().unwrap_or(&embedding_dim);
+    let top_belief_dim = *pc_hierarchy
+        .read()
+        .await
+        .config
+        .dim_per_level
+        .last()
+        .unwrap_or(&embedding_dim);
     let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
         top_belief_dim,
         cognitive_dict.read().await.len(),
-        &device
+        &device,
     )?));
 
     // 🔴 Create shared StudyState for tracking document study progress
@@ -263,12 +316,17 @@ async fn main() -> Result<()> {
         pc_hierarchy.clone(),
         thought_decoder.clone(),
         cognitive_dict.clone(),
-        episodic_memory.clone()
+        episodic_memory.clone(),
     ));
 
     let mut node_loop = NodeLoop::new_with_pc_hierarchy(
-        user_input_rx, file_events_rx, nostr_events_rx,
-        pc_hierarchy.clone(), Some(sleep_manager), Some(episodic_memory.clone()), None
+        user_input_rx,
+        file_events_rx,
+        nostr_events_rx,
+        pc_hierarchy.clone(),
+        Some(sleep_manager),
+        Some(episodic_memory.clone()),
+        None,
     );
 
     tokio::spawn(async move {
@@ -286,7 +344,7 @@ async fn main() -> Result<()> {
         cache_size: config.proxy_config.max_cache_size,
         timeout_seconds: 30,
     };
-    
+
     // Create semantic cache if enabled
     let semantic_cache = if proxy_config.enable_cache {
         let similarity_threshold = config.proxy_config.semantic_similarity_threshold;
@@ -296,7 +354,7 @@ async fn main() -> Result<()> {
             similarity_threshold,
             Some(persistence.clone()),
         );
-        
+
         // Load existing cache entries from database
         if !db_missing {
             match cache.load_from_db(&persistence).await {
@@ -304,7 +362,7 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::warn!("Failed to load semantic cache: {}", e),
             }
         }
-        
+
         Some(Arc::new(RwLock::new(cache)))
     } else {
         None
@@ -325,13 +383,12 @@ async fn main() -> Result<()> {
                 tracing::warn!("Failed to load CalibrationStore: {}, creating default", e);
                 Arc::new(RwLock::new(CalibrationStore::default()))
             }
-        
         }
     } else {
         tracing::info!("Database missing, creating default CalibrationStore");
         Arc::new(RwLock::new(CalibrationStore::default()))
     };
-    
+
     let proxy = Arc::new(OpenAiProxy::new(
         config.clone(),
         proxy_config,
@@ -381,14 +438,15 @@ async fn main() -> Result<()> {
         Some(pow_verifier),
     );
     let _brain_manager = if config.brain_sharing_config.enabled {
-        match BrainManager::new(config.brain_sharing_config.clone(), nostr_federation.clone()) {
+        match BrainManager::new(
+            config.brain_sharing_config.clone(),
+            nostr_federation.clone(),
+        ) {
             Ok(mgr) => Some(mgr),
             Err(e) => {
                 tracing::warn!("BrainManager init failed: {}", e);
                 None
             }
-            
-            
         }
     } else {
         None
@@ -396,7 +454,11 @@ async fn main() -> Result<()> {
     let app = create_router(proxy.clone()).merge(ui::create_router(proxy));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080");
-    let db_path = config.pc_config.persistence_db_path.as_deref().unwrap_or("./neurofed.db");
+    let db_path = config
+        .pc_config
+        .persistence_db_path
+        .as_deref()
+        .unwrap_or("./neurofed.db");
     // Clone for shutdown handler
     let pc_hierarchy_for_shutdown = pc_hierarchy.clone();
     let persistence_for_shutdown = persistence.clone();
@@ -406,14 +468,14 @@ async fn main() -> Result<()> {
     let semantic_cache_for_shutdown = semantic_cache.clone();
     let shutdown = async move {
         tracing::info!("[DEBUG] Shutdown handler initialized and waiting for Ctrl+C...");
-        
+
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("CTRL+C received, starting graceful shutdown...");
             stop_signal_for_shutdown.store(true, Ordering::SeqCst); // <--- TRIGGER IT
-            
+
             // Immediate test log
             tracing::info!("[DEBUG] Ctrl+C handler triggered, starting save operations");
-            
+
             // 1. Save PC weights
             tracing::info!("Saving PC weights...");
             match pc_hierarchy_for_shutdown.read().await.get_level_weights() {
@@ -421,31 +483,50 @@ async fn main() -> Result<()> {
                     let total_levels = weights.len();
                     let mut saved_count = 0;
                     let mut error_count = 0;
-                    
+
                     tracing::info!("Found {} PC levels to save", total_levels);
-                    
+
                     for level in weights {
-                        tracing::info!("Saving level {} weights ({}x{} matrix)...",
-                            level.level_index, level.input_dim, level.output_dim);
-                        
+                        tracing::info!(
+                            "Saving level {} weights ({}x{} matrix)...",
+                            level.level_index,
+                            level.input_dim,
+                            level.output_dim
+                        );
+
                         if let Err(e) = persistence_for_shutdown.save_level_weights(&level).await {
-                            tracing::error!("Failed to save level {} weights: {}", level.level_index, e);
+                            tracing::error!(
+                                "Failed to save level {} weights: {}",
+                                level.level_index,
+                                e
+                            );
                             error_count += 1;
                         } else {
-                            tracing::info!("Successfully saved level {} weights", level.level_index);
+                            tracing::info!(
+                                "Successfully saved level {} weights",
+                                level.level_index
+                            );
                             saved_count += 1;
                         }
                     }
-                    
+
                     if error_count == 0 {
-                        tracing::info!("✅ Successfully saved all {} PC weight levels", saved_count);
+                        tracing::info!(
+                            "✅ Successfully saved all {} PC weight levels",
+                            saved_count
+                        );
                     } else {
-                        tracing::warn!("⚠️ Saved {}/{} PC weight levels, {} failed", saved_count, total_levels, error_count);
+                        tracing::warn!(
+                            "⚠️ Saved {}/{} PC weight levels, {} failed",
+                            saved_count,
+                            total_levels,
+                            error_count
+                        );
                     }
                 }
                 Err(e) => tracing::error!("❌ Failed to extract PC weights: {}", e),
             }
-            
+
             // 2. Save CognitiveDictionary
             tracing::info!("Saving CognitiveDictionary...");
             match cognitive_dict_for_shutdown.read().await.clone() {
@@ -457,38 +538,46 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             // 3. Save CalibrationStore
             tracing::info!("Saving CalibrationStore...");
             match calibration_store_for_shutdown.read().await.clone() {
                 store => {
-                    if let Err(e) = persistence_for_shutdown.save_calibration_store(&store).await {
+                    if let Err(e) = persistence_for_shutdown
+                        .save_calibration_store(&store)
+                        .await
+                    {
                         tracing::error!("Failed to save CalibrationStore: {}", e);
                     } else {
                         tracing::info!("✅ Successfully saved CalibrationStore");
                     }
                 }
             }
-            
+
             // 4. Save semantic cache if enabled
             if let Some(cache) = semantic_cache_for_shutdown {
                 tracing::info!("Saving semantic cache...");
-                match cache.read().await.save_all_to_db(&persistence_for_shutdown).await {
+                match cache
+                    .read()
+                    .await
+                    .save_all_to_db(&persistence_for_shutdown)
+                    .await
+                {
                     Ok(()) => tracing::info!("✅ Successfully saved semantic cache"),
                     Err(e) => tracing::error!("Failed to save semantic cache: {}", e),
                 }
             } else {
                 tracing::info!("Semantic cache not enabled, skipping");
             }
-            
+
             // 5. TODO: Save trust graph peers
             tracing::info!("Trust graph peers saving not yet implemented");
-            
+
             // 6. TODO: Save delta history
             tracing::info!("Delta history saving not yet implemented");
-            
+
             tracing::info!("Shutdown preparation complete. Terminating process...");
-            
+
             // Small delay to ensure logs are flushed
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             tracing::info!("[DEBUG] Final log before exit");
@@ -499,7 +588,7 @@ async fn main() -> Result<()> {
     };
     let db_missing = !std::path::Path::new(db_path).exists();
     let has_weights = persistence.has_any_weights().await.unwrap_or(false);
-    
+
     // Load existing weights if available
     if has_weights && !db_missing {
         tracing::info!("Loading existing PC weights from database...");
@@ -508,7 +597,10 @@ async fn main() -> Result<()> {
                 if !saved_weights.is_empty() {
                     let weights_clone = saved_weights.clone();
                     match pc_hierarchy.write().await.load_level_weights(saved_weights) {
-                        Ok(()) => tracing::info!("Successfully loaded {} level weights from persistence", weights_clone.len()),
+                        Ok(()) => tracing::info!(
+                            "Successfully loaded {} level weights from persistence",
+                            weights_clone.len()
+                        ),
                         Err(e) => tracing::warn!("Failed to load PC weights: {}", e),
                     }
                 } else {
@@ -518,7 +610,7 @@ async fn main() -> Result<()> {
             Err(e) => tracing::warn!("Failed to load weights from database: {}", e),
         }
     }
-    
+
     // 🔴 FIX: Load Thought Decoder
     if !db_missing {
         if let Ok(Some((gate, vocab))) = persistence.load_decoder().await {
@@ -530,21 +622,32 @@ async fn main() -> Result<()> {
         }
     }
 
-
     // 🔴 RUN DIAGNOSTICS: Check if the brain is an empty shell
-    let is_decoder_random = thought_decoder.read().await.check_if_random().unwrap_or(true);
+    let is_decoder_random = thought_decoder
+        .read()
+        .await
+        .check_if_random()
+        .unwrap_or(true);
     let mut is_pc_random = false;
     if let Some(level_0) = pc_hierarchy.read().await.levels.first() {
         is_pc_random = level_0.check_if_random().unwrap_or(true);
     }
-    
+
     if is_decoder_random || is_pc_random {
         tracing::warn!("============================================================");
         tracing::warn!("🧠 DIAGNOSTIC ALERT: BRAIN AMNESIA DETECTED");
-        if is_pc_random { tracing::warn!(" -> Level 0 Perception Matrix is untrained (Random)."); }
-        if is_decoder_random { tracing::warn!(" -> Thought Decoder is untrained (Random)."); }
-        tracing::warn!("The node will generate completely random, out-of-order thought trajectories until it learns.");
-        tracing::warn!("💡 TROUBLESHOOTING: Drop text files in your 'study/' folder, or temporarily set `bootstrap_on_start = true` in config.toml.");
+        if is_pc_random {
+            tracing::warn!(" -> Level 0 Perception Matrix is untrained (Random).");
+        }
+        if is_decoder_random {
+            tracing::warn!(" -> Thought Decoder is untrained (Random).");
+        }
+        tracing::warn!(
+            "The node will generate completely random, out-of-order thought trajectories until it learns."
+        );
+        tracing::warn!(
+            "💡 TROUBLESHOOTING: Drop text files in your 'study/' folder, or temporarily set `bootstrap_on_start = true` in config.toml."
+        );
         tracing::warn!("============================================================");
     } else {
         tracing::info!("🧠 DIAGNOSTIC: Brain weights look mature and structurally formed.");
@@ -563,7 +666,12 @@ async fn main() -> Result<()> {
         bootstrap.shutdown_signal = stop_signal_for_bootstrap; // <--- WIRE IT UP
 
         let force_training = config.force_synthetic_training_on_boot;
-        let training_needed = should_run_synthetic_training(force_training, is_decoder_random, db_missing, has_weights);
+        let training_needed = should_run_synthetic_training(
+            force_training,
+            is_decoder_random,
+            db_missing,
+            has_weights,
+        );
 
         tokio::spawn(async move {
             if training_needed {
@@ -572,14 +680,22 @@ async fn main() -> Result<()> {
                     tracing::warn!("Bootstrap synthetic training failed: {}", e);
                 }
             } else {
-                tracing::info!("Synthetic bootstrap training skipped: brain already trained and force flag is off.");
+                tracing::info!(
+                    "Synthetic bootstrap training skipped: brain already trained and force flag is off."
+                );
             }
         });
     } else if config.bootstrap_on_start {
         if has_weights && !db_missing {
-            tracing::info!("Bootstrap skipped: existing DB with weights found at {}", db_path);
+            tracing::info!(
+                "Bootstrap skipped: existing DB with weights found at {}",
+                db_path
+            );
         } else if !has_weights && !db_missing {
-            tracing::info!("Bootstrap scheduled: DB exists but contains no weights at {}", db_path);
+            tracing::info!(
+                "Bootstrap scheduled: DB exists but contains no weights at {}",
+                db_path
+            );
         }
     }
 
@@ -593,7 +709,7 @@ async fn main() -> Result<()> {
         let cognitive_dict_clone = cognitive_dict.clone();
         let pc_hierarchy_clone = pc_hierarchy.clone();
         let bootstrap_config_clone = config.bootstrap_config.clone();
-        
+
         let study_state_clone = study_state.clone();
         tokio::spawn(async move {
             if let Err(e) = start_file_watcher(
@@ -605,11 +721,16 @@ async fn main() -> Result<()> {
                 pc_hierarchy_clone,
                 bootstrap_config_clone,
                 study_state_clone,
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("File watcher failed: {}", e);
             }
         });
-        tracing::info!("📁 Started persistent event-driven study system watching: {}", watch_path_for_log);
+        tracing::info!(
+            "📁 Started persistent event-driven study system watching: {}",
+            watch_path_for_log
+        );
     } else {
         tracing::info!("📁 No document paths configured for persistent study system");
     }
@@ -632,11 +753,11 @@ async fn start_file_watcher(
     bootstrap_config: config::BootstrapConfig,
     study_state: Arc<RwLock<StudyState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use notify::event::{CreateKind, ModifyKind, EventKind};
+    use notify::event::{CreateKind, EventKind, ModifyKind};
     use std::path::Path;
-    
+
     let (tx, mut rx) = channel(100);
-    
+
     // Create watcher
     let mut watcher = RecommendedWatcher::new(
         move |res| {
@@ -646,16 +767,16 @@ async fn start_file_watcher(
         },
         notify::Config::default(),
     )?;
-    
+
     let path = Path::new(&watch_path);
     if !path.exists() {
         tracing::warn!("Watch path does not exist, creating: {}", watch_path);
         std::fs::create_dir_all(path)?;
     }
-    
+
     watcher.watch(path, RecursiveMode::Recursive)?;
     tracing::info!("🔍 File watcher started for: {}", watch_path);
-    
+
     // Create bootstrap manager for processing files
     let bootstrap = BootstrapManager::new(
         ml_engine,
@@ -665,17 +786,20 @@ async fn start_file_watcher(
         bootstrap_config,
         study_state.clone(), // <--- ADD STUDY STATE
     );
-    
+
     // Process existing files first
     tracing::info!("📚 Processing existing files in study directory (recursively)...");
-    
+
     // --- 🔴 MODIFIED BLOCK START ---
     if path.is_dir() {
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
                 let file_path = entry.path();
                 tracing::debug!("Processing existing file: {:?}", file_path);
-                if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&file_path, &persistence).await {
+                if let Ok(Some(chunks)) = bootstrap
+                    .process_and_check_file(&file_path, &persistence)
+                    .await
+                {
                     if let Err(e) = bootstrap.study_file_chunks(&file_path, chunks).await {
                         tracing::warn!("Failed to study file {:?}: {}", file_path, e);
                     }
@@ -684,20 +808,22 @@ async fn start_file_watcher(
         }
     }
     // --- 🔴 MODIFIED BLOCK END ---
-    
+
     // Watch for new events
     while let Some(event) = rx.recv().await {
         match event.kind {
-            EventKind::Create(CreateKind::File) |
-            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_)) => {
+            EventKind::Create(CreateKind::File)
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_)) => {
                 for path in event.paths {
                     if path.is_file() {
                         tracing::info!("📄 Detected new/modified file: {:?}", path);
-                        
+
                         // Small delay to ensure file is fully written
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        
-                        if let Ok(Some(chunks)) = bootstrap.process_and_check_file(&path, &persistence).await {
+
+                        if let Ok(Some(chunks)) =
+                            bootstrap.process_and_check_file(&path, &persistence).await
+                        {
                             if let Err(e) = bootstrap.study_file_chunks(&path, chunks).await {
                                 tracing::warn!("Failed to study file {:?}: {}", path, e);
                             } else {
@@ -710,7 +836,7 @@ async fn start_file_watcher(
             _ => {}
         }
     }
-    
+
     Ok(())
 }
 
@@ -744,7 +870,7 @@ mod main_architecture_tests {
     use super::*;
     use neuro_fed_node::config::NodeConfig;
     use neuro_fed_node::types::DeviceType;
-    
+
     #[tokio::test]
     async fn test_knowledge_injection_compatibility() -> anyhow::Result<()> {
         let config = NodeConfig::default();
@@ -752,28 +878,34 @@ mod main_architecture_tests {
             println!("Skipping injection test: model file missing.");
             return Ok(());
         }
-        
+
         let device = Device::Cpu;
-        let device_type = DeviceType { name: "cpu".into(), ..Default::default() };
+        let device_type = DeviceType {
+            name: "cpu".into(),
+            ..Default::default()
+        };
         let engine = MLEngine::new(&config.model_path, device_type)?;
-        
+
         // Emulate config creation
         let pc_config = neuro_fed_node::config::PCConfig::new(2, vec![2048, 1024]);
         let mut pc = PredictiveCoding::new(pc_config)?;
-        
+
         let initial_weights = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Perform Injection
         let knowledge = engine.extract_pretrained_weights("blk.0.ffn_down.weight", 2048, 1024)?;
         pc.levels[0].weights = knowledge.to_device(&device)?;
-        
+
         let injected_weights = pc.levels[0].weights.to_vec2::<f32>()?;
-        
+
         // Ensure weights actually changed and dimensions were respected
-        assert_ne!(initial_weights, injected_weights, "Knowledge injection failed to overwrite random weights");
+        assert_ne!(
+            initial_weights, injected_weights,
+            "Knowledge injection failed to overwrite random weights"
+        );
         assert_eq!(injected_weights.len(), 2048);
         assert_eq!(injected_weights[0].len(), 1024);
-        
+
         Ok(())
     }
 

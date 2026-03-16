@@ -1,9 +1,9 @@
 // src/openai_proxy/types.rs
+use crate::types::{FunctionCall, Tool, ToolCall};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use crate::types::{FunctionCall, Tool, ToolCall};
 
 /// Error types for OpenAI proxy operations
 #[derive(Debug, Error)]

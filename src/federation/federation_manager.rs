@@ -1,14 +1,14 @@
 // src/federation_manager.rs
 // Federation manager for wallet vs. no-wallet federation modes
 
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, debug};
-use async_trait::async_trait;
+use tracing::{debug, info};
 
-use crate::nostr_federation::{NostrFederation, NostrEvent, EventKind};
+use crate::nostr_federation::{EventKind, NostrEvent, NostrFederation};
 use crate::types::{FederationRequest, FederationResponse, PaymentVerification, PoWVerification};
 
 /// Federation strategy selection
@@ -102,20 +102,28 @@ impl FederationManager {
         request: FederationRequest,
     ) -> Result<FederationResponse, FederationError> {
         info!("Processing federation request: {:?}", request.request_type);
-        
+
         // Verify based on strategy
         match &self.config.strategy {
-            FederationStrategy::WalletMode { min_sats, required_confirmations } => {
-                self.verify_payment(&request, *min_sats, *required_confirmations).await?;
+            FederationStrategy::WalletMode {
+                min_sats,
+                required_confirmations,
+            } => {
+                self.verify_payment(&request, *min_sats, *required_confirmations)
+                    .await?;
             }
-            FederationStrategy::NoWalletMode { difficulty, timeout_seconds } => {
-                self.verify_pow(&request, *difficulty, *timeout_seconds).await?;
+            FederationStrategy::NoWalletMode {
+                difficulty,
+                timeout_seconds,
+            } => {
+                self.verify_pow(&request, *difficulty, *timeout_seconds)
+                    .await?;
             }
         }
 
         // Process the request (delegate to Nostr federation)
         let response = self.send_federation_response(&request).await?;
-        
+
         Ok(response)
     }
 
@@ -127,24 +135,24 @@ impl FederationManager {
         required_confirmations: u32,
     ) -> Result<(), FederationError> {
         debug!("Verifying payment for request {}", request.id);
-        
-        let verifier = self.payment_verifier.as_ref()
-            .ok_or_else(|| FederationError::ConfigError("Payment verifier not configured".to_string()))?;
-        
-        let verification = verifier.verify_zap(
-            &request.payment_proof,
-            min_sats,
-            required_confirmations,
-        ).await
-        .map_err(|e| FederationError::PaymentVerificationFailed(e.to_string()))?;
-        
+
+        let verifier = self.payment_verifier.as_ref().ok_or_else(|| {
+            FederationError::ConfigError("Payment verifier not configured".to_string())
+        })?;
+
+        let verification = verifier
+            .verify_zap(&request.payment_proof, min_sats, required_confirmations)
+            .await
+            .map_err(|e| FederationError::PaymentVerificationFailed(e.to_string()))?;
+
         if verification.verified {
             info!("Payment verified: {} sats", verification.amount_sats);
             Ok(())
         } else {
-            Err(FederationError::PaymentVerificationFailed(
-                format!("Payment verification failed: {:?}", verification.reason)
-            ))
+            Err(FederationError::PaymentVerificationFailed(format!(
+                "Payment verification failed: {:?}",
+                verification.reason
+            )))
         }
     }
 
@@ -156,24 +164,31 @@ impl FederationManager {
         timeout_seconds: u64,
     ) -> Result<(), FederationError> {
         debug!("Verifying PoW for request {}", request.id);
-        
-        let verifier = self.pow_verifier.as_ref()
-            .ok_or_else(|| FederationError::ConfigError("PoW verifier not configured".to_string()))?;
-        
-        let verification = verifier.verify_pow(
-            &request.pow_proof,
-            difficulty,
-            Duration::from_secs(timeout_seconds),
-        ).await
-        .map_err(|e| FederationError::PoWVerificationFailed(e.to_string()))?;
-        
+
+        let verifier = self.pow_verifier.as_ref().ok_or_else(|| {
+            FederationError::ConfigError("PoW verifier not configured".to_string())
+        })?;
+
+        let verification = verifier
+            .verify_pow(
+                &request.pow_proof,
+                difficulty,
+                Duration::from_secs(timeout_seconds),
+            )
+            .await
+            .map_err(|e| FederationError::PoWVerificationFailed(e.to_string()))?;
+
         if verification.verified {
-            info!("PoW verified: nonce={}, hash={}", verification.nonce, verification.hash);
+            info!(
+                "PoW verified: nonce={}, hash={}",
+                verification.nonce, verification.hash
+            );
             Ok(())
         } else {
-            Err(FederationError::PoWVerificationFailed(
-                format!("PoW verification failed: {:?}", verification.reason)
-            ))
+            Err(FederationError::PoWVerificationFailed(format!(
+                "PoW verification failed: {:?}",
+                verification.reason
+            )))
         }
     }
 
@@ -194,7 +209,9 @@ impl FederationManager {
                 .as_secs(),
         };
 
-        self.nostr_federation.publish_event(event).await
+        self.nostr_federation
+            .publish_event(event)
+            .await
             .map_err(|e| FederationError::NostrError(e.to_string()))?;
 
         Ok(FederationResponse {
@@ -227,7 +244,7 @@ pub trait PaymentVerifier: Send + Sync {
         min_sats: u64,
         required_confirmations: u32,
     ) -> Result<PaymentVerification, Box<dyn std::error::Error>>;
-    
+
     async fn check_balance(&self, pubkey: &str) -> Result<u64, Box<dyn std::error::Error>>;
 }
 
@@ -240,18 +257,21 @@ pub trait PoWVerifier: Send + Sync {
         difficulty: u32,
         timeout: Duration,
     ) -> Result<PoWVerification, Box<dyn std::error::Error>>;
-    
-    async fn generate_pow_challenge(&self, data: &str) -> Result<String, Box<dyn std::error::Error>>;
+
+    async fn generate_pow_challenge(
+        &self,
+        data: &str,
+    ) -> Result<String, Box<dyn std::error::Error>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
     use crate::nostr_federation::{NostrConfig, NostrFederation};
     use crate::types::{PaymentVerification, PoWVerification};
     use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     struct MockPaymentVerifier;
     #[async_trait]
@@ -268,7 +288,7 @@ mod tests {
                 reason: None,
             })
         }
-        
+
         async fn check_balance(&self, _pubkey: &str) -> Result<u64, Box<dyn std::error::Error>> {
             Ok(5000)
         }
@@ -290,8 +310,11 @@ mod tests {
                 reason: None,
             })
         }
-        
-        async fn generate_pow_challenge(&self, _data: &str) -> Result<String, Box<dyn std::error::Error>> {
+
+        async fn generate_pow_challenge(
+            &self,
+            _data: &str,
+        ) -> Result<String, Box<dyn std::error::Error>> {
             Ok("challenge".to_string())
         }
     }
@@ -301,7 +324,7 @@ mod tests {
         let nostr_config = NostrConfig::default();
         let nostr_fed = Arc::new(NostrFederation::new(nostr_config));
         let payment_verifier = Arc::new(MockPaymentVerifier);
-        
+
         let config = FederationManagerConfig {
             strategy: FederationStrategy::WalletMode {
                 min_sats: 100,
@@ -309,14 +332,9 @@ mod tests {
             },
             ..Default::default()
         };
-        
-        let manager = FederationManager::new(
-            config,
-            nostr_fed,
-            Some(payment_verifier),
-            None,
-        );
-        
+
+        let manager = FederationManager::new(config, nostr_fed, Some(payment_verifier), None);
+
         let request = FederationRequest {
             id: "test-1".to_string(),
             request_type: "test".to_string(),
@@ -325,7 +343,7 @@ mod tests {
             timestamp: SystemTime::now(),
             metadata: Default::default(),
         };
-        
+
         let result = manager.process_federation_request(request).await;
         assert!(result.is_ok());
     }
@@ -335,7 +353,7 @@ mod tests {
         let nostr_config = NostrConfig::default();
         let nostr_fed = Arc::new(NostrFederation::new(nostr_config));
         let pow_verifier = Arc::new(MockPoWVerifier);
-        
+
         let config = FederationManagerConfig {
             strategy: FederationStrategy::NoWalletMode {
                 difficulty: 5,
@@ -343,14 +361,9 @@ mod tests {
             },
             ..Default::default()
         };
-        
-        let manager = FederationManager::new(
-            config,
-            nostr_fed,
-            None,
-            Some(pow_verifier),
-        );
-        
+
+        let manager = FederationManager::new(config, nostr_fed, None, Some(pow_verifier));
+
         let request = FederationRequest {
             id: "test-2".to_string(),
             request_type: "test".to_string(),
@@ -359,7 +372,7 @@ mod tests {
             timestamp: SystemTime::now(),
             metadata: Default::default(),
         };
-        
+
         let result = manager.process_federation_request(request).await;
         assert!(result.is_ok());
     }

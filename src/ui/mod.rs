@@ -2,11 +2,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header, HeaderMap},
+    http::{HeaderMap, header},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 
 use crate::openai_proxy::OpenAiProxy;
@@ -40,10 +40,12 @@ async fn ui_styles() -> Response {
     static_response(STYLES_CSS, "text/css; charset=utf-8")
 }
 
-async fn ui_metrics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<crate::openai_proxy::metrics::ProxyMetrics> {
+async fn ui_metrics(
+    State(proxy): State<Arc<OpenAiProxy>>,
+) -> Json<crate::openai_proxy::metrics::ProxyMetrics> {
     // 1. Get lock-free metrics from the global METRICS store
     let _telemetry = crate::metrics::METRICS.get_snapshot();
-    
+
     // 2. Get StudyState with a TRY lock to prevent UI freezing
     let study = match proxy.study_state.try_read() {
         Ok(s) => s.clone(),
@@ -140,9 +142,7 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
     })
 }
 
-async fn get_brain_introspection(
-    State(proxy): State<Arc<OpenAiProxy>>,
-) -> Json<serde_json::Value> {
+async fn get_brain_introspection(State(proxy): State<Arc<OpenAiProxy>>) -> Json<serde_json::Value> {
     // Try to get read locks on both PC hierarchy and ML engine
     let pc = match proxy.pc_hierarchy.try_read() {
         Ok(pc) => pc,
@@ -150,20 +150,20 @@ async fn get_brain_introspection(
             return Json(serde_json::json!({
                 "status": "error",
                 "message": "PC hierarchy is busy (locked)"
-            }))
+            }));
         }
     };
-    
+
     let engine = match proxy.local_engine.try_read() {
         Ok(engine) => engine,
         Err(_) => {
             return Json(serde_json::json!({
                 "status": "error",
                 "message": "ML engine is busy (locked)"
-            }))
+            }));
         }
     };
-    
+
     // 1. Get the current belief at the top of the hierarchy
     if let Ok(top_belief) = pc.get_top_belief() {
         // 2. Decode what this math vector means in English words!
@@ -178,13 +178,11 @@ async fn get_brain_introspection(
             }));
         }
     }
-    
+
     Json(serde_json::json!({"status": "idle or empty"}))
 }
 
-async fn get_brain_statistics(
-    State(proxy): State<Arc<OpenAiProxy>>,
-) -> Json<serde_json::Value> {
+async fn get_brain_statistics(State(proxy): State<Arc<OpenAiProxy>>) -> Json<serde_json::Value> {
     // Try to get read lock on PC hierarchy
     let pc = match proxy.pc_hierarchy.try_read() {
         Ok(pc) => pc,
@@ -192,31 +190,31 @@ async fn get_brain_statistics(
             return Json(serde_json::json!({
                 "status": "error",
                 "message": "PC hierarchy is busy (locked)"
-            }))
+            }));
         }
     };
-    
+
     let mut level_stats = Vec::new();
-    
+
     // Analyze each level
     for (i, level) in pc.levels.iter().enumerate() {
         // Get weights matrix
         if let Ok(weights_vec) = level.weights.to_vec2::<f32>() {
             let rows = weights_vec.len();
             let cols = if rows > 0 { weights_vec[0].len() } else { 0 };
-            
+
             // Calculate statistics
             let mut dead_neurons = 0;
             let mut hyper_active_neurons = 0;
             let mut total_abs = 0.0;
             let mut max_abs = 0.0;
             let mut min_abs = f32::MAX;
-            
+
             // Analyze each column (neuron)
             for col in 0..cols {
                 let mut col_sum = 0.0;
                 let mut col_max = 0.0;
-                
+
                 for row in 0..rows {
                     let val = weights_vec[row][col].abs();
                     col_sum += val;
@@ -224,16 +222,16 @@ async fn get_brain_statistics(
                         col_max = val;
                     }
                 }
-                
+
                 let col_avg = col_sum / rows as f32;
                 total_abs += col_sum;
-                
+
                 if col_avg < 0.001 {
                     dead_neurons += 1;
                 } else if col_max > 1.0 {
                     hyper_active_neurons += 1;
                 }
-                
+
                 if col_max > max_abs {
                     max_abs = col_max;
                 }
@@ -241,9 +239,13 @@ async fn get_brain_statistics(
                     min_abs = col_avg;
                 }
             }
-            
-            let avg_activation = if cols > 0 { total_abs / (rows * cols) as f32 } else { 0.0 };
-            
+
+            let avg_activation = if cols > 0 {
+                total_abs / (rows * cols) as f32
+            } else {
+                0.0
+            };
+
             level_stats.push(serde_json::json!({
                 "level": i,
                 "dimensions": format!("{}x{}", rows, cols),
@@ -256,7 +258,7 @@ async fn get_brain_statistics(
             }));
         }
     }
-    
+
     Json(serde_json::json!({
         "status": "success",
         "total_levels": pc.levels.len(),

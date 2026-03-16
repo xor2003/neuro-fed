@@ -15,6 +15,7 @@ use crate::pc_decoder::ThoughtDecoder;
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::persistence::PCPersistence;
 use crate::types::{CognitiveDictionary, ThoughtOp, StudyState, LastStudyTask};
+use crate::learning_log::append_learning_detail;
 
 // NEW: For Parquet support
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -144,10 +145,19 @@ impl BootstrapManager {
                 }
                 
                 let paragraphs = chunk_text(&raw_text);
+                if ext == "jsonl" {
+                    let discovery_msg = format!(
+                        "JSONL discovery: line {} -> {}",
+                        idx + 1,
+                        raw_text
+                    );
+                    tracing::info!("{}", discovery_msg);
+                    append_learning_detail(&discovery_msg);
+                }
                 tracing::debug!("📖 Chunk {} has {} paragraphs", idx, paragraphs.len());
                 
                 for (paragraph_idx, chunk) in paragraphs.iter().enumerate() {
-                    if chunk.len() > 50 {
+                    if chunk.len() > 50 || ext == "jsonl" {
                         let preview = if chunk.len() > 100 {
                             let end = 100.min(chunk.len());
                             format!("{}...", &chunk[..end])
@@ -162,20 +172,36 @@ impl BootstrapManager {
                         // Clear temporal state between chunks to prevent "thought bleeding"
                         pc.reset_state()?;
                         
-                        if let Ok(stats) = pc.learn_sequence(&sequence_tensor, None) {
-                            // Calculate study efficiency: How much Level 0 noise was converted into higher-level concepts
+                        let learn_result = pc.learn_sequence(&sequence_tensor, None);
+                        if let Ok(stats) = &learn_result {
                             let n_levels = stats.level_surprises.len();
                             if n_levels >= 2 {
                                 let top_l = n_levels.saturating_sub(2);
                                 let abstraction_ratio = 1.0 - (stats.level_surprises[top_l] / stats.level_surprises[0].max(1.0));
-                                
-                                // Efficiency: How much Level 0 noise was converted into Level 2 concepts
+
                                 if abstraction_ratio < 0.2 {
                                     warn!("📉 Low Study Efficiency ({:.1}%). Ideas are too complex for {} layers.", abstraction_ratio * 100.0, n_levels);
                                 } else {
                                     tracing::debug!("📊 Study Efficiency: {:.1}% (abstraction ratio)", abstraction_ratio * 100.0);
                                 }
                             }
+                            if ext == "jsonl" {
+                                let learned_msg = format!(
+                                    "JSONL line {} learned (loss {:.4})",
+                                    idx + 1,
+                                    stats.total_surprise
+                                );
+                                tracing::info!("{}", learned_msg);
+                                append_learning_detail(&learned_msg);
+                            }
+                        }
+                        if ext == "jsonl" && learn_result.is_err() {
+                            let fail_msg = format!(
+                                "JSONL line {} learning failed",
+                                idx + 1
+                            );
+                            tracing::warn!("{}", fail_msg);
+                            append_learning_detail(&fail_msg);
                         }
                     }
                 }
@@ -348,6 +374,8 @@ impl BootstrapManager {
         let main_pc_lock = self.pc_hierarchy.clone();
         let shutdown = self.shutdown_signal.clone();
         let study_state_clone = self.study_state.clone(); // Clone for the background task
+        let decoder_arc = self.thought_decoder.clone();
+        let dict_arc = self.dict.clone();
 
         // 1. Get base configuration and initial weights to clone
         let base_weights = main_pc_lock.read().await.get_level_weights()?;
@@ -392,6 +420,8 @@ impl BootstrapManager {
         // We use spawn_blocking so Tokio doesn't freeze while Rayon does the math.
         let shutdown_clone = shutdown.clone();
         let study_state_clone_for_blocking = study_state_clone.clone();
+        let decoder_arc_for_blocking = decoder_arc.clone();
+        let dict_arc_for_blocking = dict_arc.clone();
         let all_learned_weights = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -416,18 +446,88 @@ impl BootstrapManager {
 
                 for p in segment {
                     if shutdown_clone.load(Ordering::Relaxed) { return None; }
-                    
-                    // 1. Process Task
+
                     let sequence_tensor = rt.block_on(async {
                         local_engine.process_text_sequence(&p).await
                     }).ok()?;
-                    
-                    // 2. 🚀 RESET STATE: Critical for quality. 
-                    // Each core treats every JSONL line as a fresh "Chapter"
+
                     local_pc.reset_state().ok()?;
-                    
-                    // 3. Learn
-                    let _ = local_pc.learn_sequence(&sequence_tensor, None);
+
+                    let learn_result = local_pc.learn_sequence(&sequence_tensor, None);
+                    if let Ok(stats) = &learn_result {
+                        let full_input = p.clone();
+                        let belief = local_pc.levels.first().unwrap().beliefs.clone();
+
+                        let decoded_output = {
+                            let decoder_guard = decoder_arc_for_blocking.blocking_read();
+                            let dict_guard = dict_arc_for_blocking.blocking_read();
+                            match decoder_guard.decode_sequence(&belief, 8, 4) {
+                                Ok(seq) if !seq.is_empty() => {
+                                    let thoughts: Vec<String> = seq
+                                        .iter()
+                                        .map(|id| dict_guard.get_op(*id).to_string())
+                                        .collect();
+                                    if thoughts.is_empty() {
+                                        "<decoder_empty>".to_string()
+                                    } else {
+                                        thoughts.join(" -> ")
+                                    }
+                                }
+                                Ok(_) => "<decoder_empty>".to_string(),
+                                Err(e) => format!("<decoder_error: {}>", e),
+                            }
+                        };
+
+                        let mut trajectory_parts = Vec::new();
+                        if !stats.free_energy_history.is_empty() {
+                            let start = stats.free_energy_history.first().unwrap();
+                            let end = stats.free_energy_history.last().unwrap();
+                            let delta = end - start;
+                            trajectory_parts.push(format!("FE {:.2}→{:.2} (Δ{:.2})", start, end, delta));
+                        }
+                        if !decoded_output.starts_with('<') || decoded_output == "<decoder_empty>" {
+                            trajectory_parts.push(format!("Plan: {}", decoded_output));
+                        }
+                        for (i, &surprise) in stats.level_surprises.iter().enumerate() {
+                            if surprise > 0.1 {
+                                trajectory_parts.push(format!("L{}:{:.2}", i, surprise));
+                            }
+                        }
+                        let trajectory = if trajectory_parts.is_empty() {
+                            "steady".to_string()
+                        } else {
+                            trajectory_parts.join(" | ")
+                        };
+
+                        let results = format!(
+                            "novelty={:.2} confidence={:.2} level_surprises=[{}]",
+                            stats.novelty_score,
+                            stats.confidence_score,
+                            stats.level_surprises
+                                .iter()
+                                .map(|s| format!("{:.2}", s))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+
+                        let learning_msg = format!(
+                            "Bootstrap learning\nInput: {}\nOutput: {}\nTrajectory: {}\nLoss: {:.4}\nResults: {}",
+                            full_input,
+                            decoded_output,
+                            trajectory,
+                            stats.total_surprise,
+                            results
+                        );
+                        append_learning_detail(&learning_msg);
+                        tracing::info!("🧠 Learned paragraph (loss {:.4})", stats.total_surprise);
+                    } else {
+                        let fail_msg = format!(
+                            "Bootstrap learning failed for paragraph: {}",
+                            p
+                        );
+                        append_learning_detail(&fail_msg);
+                        tracing::warn!("{}", fail_msg);
+                    }
                     
                     // Update progress counter
                     let processed = processed_counter.fetch_add(1, Ordering::Relaxed) + 1;

@@ -1,8 +1,8 @@
 // src/chat/handlers.rs
-use axum::{extract::State, Json, http::StatusCode, response::IntoResponse};
-use std::sync::Arc;
 use crate::openai_proxy::OpenAiProxy;
 use crate::openai_proxy::types::OpenAiRequest;
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use std::sync::Arc;
 
 pub async fn handle_chat_completion(
     State(proxy): State<Arc<OpenAiProxy>>,
@@ -14,12 +14,18 @@ pub async fn handle_chat_completion(
     }
 }
 
-pub async fn handle_completion(State(proxy): State<Arc<OpenAiProxy>>, Json(req): Json<OpenAiRequest>) -> impl IntoResponse {
+pub async fn handle_completion(
+    State(proxy): State<Arc<OpenAiProxy>>,
+    Json(req): Json<OpenAiRequest>,
+) -> impl IntoResponse {
     let _ = (proxy, req);
     StatusCode::NOT_IMPLEMENTED
 }
 
-pub async fn handle_embeddings(State(proxy): State<Arc<OpenAiProxy>>, Json(req): Json<OpenAiRequest>) -> impl IntoResponse {
+pub async fn handle_embeddings(
+    State(proxy): State<Arc<OpenAiProxy>>,
+    Json(req): Json<OpenAiRequest>,
+) -> impl IntoResponse {
     let _ = (proxy, req);
     StatusCode::NOT_IMPLEMENTED
 }

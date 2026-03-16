@@ -1,10 +1,10 @@
+use candle_core::Device;
 use neuro_fed_node::bootstrap::BootstrapManager;
 use neuro_fed_node::config::BootstrapConfig;
 use neuro_fed_node::ml_engine::MLEngine;
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
-use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
-use neuro_fed_node::types::{DeviceType, CognitiveDictionary, StudyState};
-use candle_core::Device;
+use neuro_fed_node::pc_hierarchy::{PCConfig, PredictiveCoding};
+use neuro_fed_node::types::{CognitiveDictionary, DeviceType, StudyState};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,18 +12,21 @@ use tokio::sync::RwLock;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("Testing bootstrap system with synthetic training...");
-    
+
     // Create ML Engine (dummy for testing)
     let device_type = DeviceType {
         name: "CPU".to_string(),
         description: "CPU device".to_string(),
         supported: true,
     };
-    let ml_engine = Arc::new(RwLock::new(MLEngine::new("models/tinyllama.Q2_K.gguf", device_type)?));
-    
+    let ml_engine = Arc::new(RwLock::new(MLEngine::new(
+        "models/tinyllama.Q2_K.gguf",
+        device_type,
+    )?));
+
     // Create Cognitive Dictionary
     let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
-    
+
     // Create PC Hierarchy
     let pc_config = PCConfig::new(3, vec![512, 256, 128]);
     let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config)?));
@@ -31,22 +34,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create Thought Decoder
     let belief_dim = 512;
     let vocab_size = dict.read().await.len();
-    let thought_decoder = Arc::new(RwLock::new(
-        ThoughtDecoder::new(belief_dim, vocab_size, &Device::Cpu)?
-    ));
-    
+    let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
+        belief_dim,
+        vocab_size,
+        &Device::Cpu,
+    )?));
+
     // Create BootstrapConfig
     let bootstrap_config = BootstrapConfig::new(
-        512,  // embedding_dim
-        32,   // batch_size
-        100,  // max_epochs
-        0.01, // learning_rate
+        512,    // embedding_dim
+        32,     // batch_size
+        100,    // max_epochs
+        0.01,   // learning_rate
         vec![], // document_paths (empty for synthetic training)
     );
-    
+
     // Create StudyState for tracking progress
     let study_state = Arc::new(RwLock::new(StudyState::default()));
-    
+
     // Create BootstrapManager
     let bootstrapper = BootstrapManager::new(
         ml_engine,
@@ -56,7 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bootstrap_config,
         study_state,
     );
-    
+
     println!("Running bootstrap synthetic training...");
     match bootstrapper.run_synthetic_training().await {
         Ok(_) => {

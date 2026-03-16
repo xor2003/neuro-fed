@@ -10,11 +10,11 @@ impl SemanticCache {
     pub fn new() -> Self {
         Self {}
     }
-    
+
     pub fn get(&self, _key: &str) -> Option<Value> {
         None
     }
-    
+
     pub fn put(&mut self, _key: String, _value: Value) {
         // Placeholder
     }

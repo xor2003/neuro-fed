@@ -9,20 +9,22 @@
 //! 6. Brain sharing functionality
 //! 7. Federation modes (Wallet vs. No-Wallet)
 
+use neuro_fed_node::brain_manager::BrainManager;
 use neuro_fed_node::config::{BrainSharingConfig, NodeConfig};
+use neuro_fed_node::federation_manager::{
+    FederationManager, FederationManagerConfig, FederationStrategy,
+};
 use neuro_fed_node::ml_engine::MLEngine;
 use neuro_fed_node::model_manager::ModelManager;
-use neuro_fed_node::types::DeviceType;
-use neuro_fed_node::nostr_federation::{NostrFederation, NostrConfig};
-use neuro_fed_node::brain_manager::BrainManager;
-use neuro_fed_node::federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy};
+use neuro_fed_node::nostr_federation::{NostrConfig, NostrFederation};
 use neuro_fed_node::payment_verifier::PaymentVerifier;
 use neuro_fed_node::pow_verifier::PoWVerifier;
+use neuro_fed_node::types::DeviceType;
 use neuro_fed_node::types::FederationRequest;
-use std::sync::Arc;
-use tokio;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
+use tokio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,16 +34,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. Creating ModelManager...");
     let config = NodeConfig::default();
     let manager = ModelManager::new(config);
-    
+
     // Show available memory (if detection works)
     match manager.detect_available_memory().await {
         Ok(memory_mb) => println!("   Available system memory: {} MB", memory_mb),
         Err(e) => println!("   Memory detection failed: {}", e),
     }
-    
+
     // Get recommended model
     match manager.get_recommended_model().await {
-        Ok(model) => println!("   Recommended model: {} ({} MB)", model.name, model.size_mb),
+        Ok(model) => println!(
+            "   Recommended model: {} ({} MB)",
+            model.name, model.size_mb
+        ),
         Err(e) => println!("   Model recommendation failed: {}", e),
     }
 
@@ -55,9 +60,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             println!("   Failed to create engine with ModelManager: {:?}", e);
             println!("   Falling back to direct initialization...");
-            
+
             // Fallback to direct initialization
-            MLEngine::new("models/llama-3-8b-instruct", DeviceType { name: "cpu".to_string(), description: "CPU".to_string(), supported: true })?
+            MLEngine::new(
+                "models/llama-3-8b-instruct",
+                DeviceType {
+                    name: "cpu".to_string(),
+                    description: "CPU".to_string(),
+                    supported: true,
+                },
+            )?
         }
     };
 
@@ -70,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Process some example texts
     println!("\n4. Processing example texts...");
-    
+
     let texts = vec![
         "The quick brown fox jumps over the lazy dog.",
         "Artificial intelligence is transforming healthcare, finance, and education.",
@@ -81,17 +93,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (i, text) in texts.iter().enumerate() {
         println!("\n   Text {}: '{}...'", i + 1, &text[..30].trim_end());
-        
+
         match engine.process_text(text).await {
             Ok(embedding) => {
                 let shape = embedding.shape();
                 println!("   Embedding shape: {:?}", shape);
-                
+
                 // Extract a few values for demonstration
                 if let Ok(values) = embedding.flatten_all()?.to_vec1::<f32>() {
                     if values.len() >= 3 {
-                        println!("   First 3 values: [{:.4}, {:.4}, {:.4}]", 
-                                 values[0], values[1], values[2]);
+                        println!(
+                            "   First 3 values: [{:.4}, {:.4}, {:.4}]",
+                            values[0], values[1], values[2]
+                        );
                     }
                 }
             }
@@ -103,48 +117,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Demonstrate caching
     println!("\n5. Demonstrating caching...");
-    
+
     let test_text = "This text will be processed twice to demonstrate caching.";
-    
+
     // First processing (not cached)
     let start = std::time::Instant::now();
     let _embedding1 = engine.process_text(test_text).await?;
     let first_duration = start.elapsed();
-    
+
     // Second processing (should be cached)
     let start = std::time::Instant::now();
     let _embedding2 = engine.process_text(test_text).await?;
     let second_duration = start.elapsed();
-    
+
     println!("   First processing: {:?}", first_duration);
     println!("   Second processing (cached): {:?}", second_duration);
-    
+
     if second_duration < first_duration {
-        println!("   Caching provided {:.1}x speedup", 
-                 first_duration.as_secs_f64() / second_duration.as_secs_f64());
+        println!(
+            "   Caching provided {:.1}x speedup",
+            first_duration.as_secs_f64() / second_duration.as_secs_f64()
+        );
     }
 
     // 6. Clear cache and process again
     println!("\n6. Clearing cache...");
     engine.clear_cache();
-    
+
     let start = std::time::Instant::now();
     let _embedding3 = engine.process_text(test_text).await?;
     let third_duration = start.elapsed();
-    
+
     println!("   Processing after cache clear: {:?}", third_duration);
 
     // 7. Demonstrate different device types (if supported)
     println!("\n7. Device type demonstration:");
-    
+
     let device_types = [
-        DeviceType { name: "cpu".to_string(), description: "CPU".to_string(), supported: true },
-        DeviceType { name: "cuda".to_string(), description: "CUDA GPU".to_string(), supported: false },
-        DeviceType { name: "metal".to_string(), description: "Metal GPU".to_string(), supported: false },
-        DeviceType { name: "vulkan".to_string(), description: "Vulkan GPU".to_string(), supported: false },
-        DeviceType { name: "auto".to_string(), description: "Best Available".to_string(), supported: true },
+        DeviceType {
+            name: "cpu".to_string(),
+            description: "CPU".to_string(),
+            supported: true,
+        },
+        DeviceType {
+            name: "cuda".to_string(),
+            description: "CUDA GPU".to_string(),
+            supported: false,
+        },
+        DeviceType {
+            name: "metal".to_string(),
+            description: "Metal GPU".to_string(),
+            supported: false,
+        },
+        DeviceType {
+            name: "vulkan".to_string(),
+            description: "Vulkan GPU".to_string(),
+            supported: false,
+        },
+        DeviceType {
+            name: "auto".to_string(),
+            description: "Best Available".to_string(),
+            supported: true,
+        },
     ];
-    
+
     for device_type in device_types.iter() {
         match MLEngine::new("models/qwen2.5-1.5b-instruct", device_type.clone()) {
             Ok(_engine) => {
@@ -158,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Demonstrate brain sharing functionality
     println!("\n8. Brain sharing demonstration:");
-    
+
     // Create a brain manager configuration
     let brain_sharing_config = BrainSharingConfig {
         enabled: true,
@@ -172,17 +208,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_untrusted_authors: false,
         max_brain_size: 1024 * 1024 * 1024, // 1GB
     };
-    
+
     // Create Nostr federation (placeholder)
     let nostr_config = NostrConfig::default();
     let nostr_federation = NostrFederation::new(nostr_config);
     let nostr_federation_arc = Arc::new(nostr_federation);
-    
+
     // Create brain manager
     match BrainManager::new(brain_sharing_config, nostr_federation_arc.clone()) {
         Ok(mut brain_manager) => {
             println!("   Brain manager created successfully");
-            
+
             // Note: The new brain manager API requires a PredictiveCoding instance for export
             // and a PathBuf for import. Since we don't have a PC instance in this example,
             // we'll just demonstrate the API structure.
@@ -190,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("     - export_local_brain(pc_hierarchy, description) -> PathBuf");
             println!("     - import_and_merge_brain(pc_hierarchy, import_path) -> Result<()>");
             println!("   (Skipping actual calls as they require PredictiveCoding instance)");
-            
+
             // Show that brain storage directory was created
             println!("   Brain storage directory: ./brains");
         }
@@ -201,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Demonstrate Federation Modes (Wallet vs. No-Wallet)
     println!("\n9. Federation Modes Demonstration:");
-    
+
     // Create federation configuration
     let federation_config = neuro_fed_node::config::FederationConfig {
         strategy: "wallet".to_string(), // or "no_wallet"
@@ -223,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_retries: 3,
         request_timeout_seconds: 30,
     };
-    
+
     // Create FederationManagerConfig
     let federation_manager_config = FederationManagerConfig {
         strategy: FederationStrategy::WalletMode {
@@ -234,35 +270,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_retries: 3,
         request_timeout_seconds: 30,
     };
-    
+
     // Create verifiers based on strategy
     let payment_verifier = match &federation_manager_config.strategy {
-        FederationStrategy::WalletMode { min_sats, required_confirmations } => {
+        FederationStrategy::WalletMode {
+            min_sats,
+            required_confirmations,
+        } => {
             println!("   Creating PaymentVerifier for Wallet Mode...");
-            println!("     Minimum sats: {}, Required confirmations: {}", min_sats, required_confirmations);
+            println!(
+                "     Minimum sats: {}, Required confirmations: {}",
+                min_sats, required_confirmations
+            );
             Some(Arc::new(PaymentVerifier::new(
                 federation_config.wallet.payment_relays.clone(),
                 "npub1examplepublickey".to_string(),
                 Some(federation_config.wallet.private_key.clone()),
-            )) as Arc<dyn neuro_fed_node::federation_manager::PaymentVerifier>)
+            ))
+                as Arc<
+                    dyn neuro_fed_node::federation_manager::PaymentVerifier,
+                >)
         }
-        FederationStrategy::NoWalletMode { difficulty, timeout_seconds } => {
-            println!("   No-Wallet Mode selected (difficulty: {}, timeout: {}s)", difficulty, timeout_seconds);
+        FederationStrategy::NoWalletMode {
+            difficulty,
+            timeout_seconds,
+        } => {
+            println!(
+                "   No-Wallet Mode selected (difficulty: {}, timeout: {}s)",
+                difficulty, timeout_seconds
+            );
             None
         }
     };
-    
+
     let pow_verifier = match &federation_manager_config.strategy {
-        FederationStrategy::NoWalletMode { difficulty, timeout_seconds } => {
+        FederationStrategy::NoWalletMode {
+            difficulty,
+            timeout_seconds,
+        } => {
             println!("   Creating PoWVerifier for No-Wallet Mode...");
             Some(Arc::new(PoWVerifier::new(
                 federation_config.pow.hash_algorithm.clone(),
                 federation_config.pow.max_nonce,
-            )) as Arc<dyn neuro_fed_node::federation_manager::PoWVerifier>)
+            ))
+                as Arc<dyn neuro_fed_node::federation_manager::PoWVerifier>)
         }
         FederationStrategy::WalletMode { .. } => None,
     };
-    
+
     // Create brain manager for federation (need to create a new config since brain_sharing_config was moved)
     let brain_sharing_config2 = BrainSharingConfig {
         enabled: true,
@@ -276,15 +331,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_untrusted_authors: false,
         max_brain_size: 1024 * 1024 * 1024, // 1GB
     };
-    
-    let brain_manager = match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone()) {
+
+    let brain_manager = match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone())
+    {
         Ok(bm) => Arc::new(bm),
         Err(e) => {
             println!("   Failed to create brain manager for federation: {}", e);
             return Ok(());
         }
     };
-    
+
     // Create FederationManager
     println!("   Creating FederationManager...");
     let mut federation_manager = FederationManager::new(
@@ -293,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payment_verifier,
         pow_verifier,
     );
-    
+
     // Demonstrate processing a federation request
     println!("   Demonstrating federation request processing...");
     let federation_request = FederationRequest {
@@ -307,14 +363,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("requester_pubkey".to_string(), "npub1requester".to_string()),
         ]),
     };
-    
-    match federation_manager.process_federation_request(federation_request.clone()).await {
+
+    match federation_manager
+        .process_federation_request(federation_request.clone())
+        .await
+    {
         Ok(response) => {
             println!("   Federation request processed successfully:");
             println!("     Response ID: {}", response.id);
             println!("     Success: {}", response.success);
             println!("     Message: {}", response.message);
-            
+
             // Note: send_federation_response is private, so we can't call it directly
             println!("   Federation response would be sent via Nostr federation");
         }
@@ -323,7 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("   This is expected in demo mode without actual verification.");
         }
     }
-    
+
     // Demonstrate switching federation strategies
     println!("\n   Demonstrating strategy switching...");
     let new_strategy = FederationStrategy::NoWalletMode {
@@ -332,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     federation_manager.switch_strategy(new_strategy);
     println!("     Switched to No-Wallet mode successfully");
-    
+
     // Create a new federation request for No-Wallet mode
     let pow_request = FederationRequest {
         id: "test-request-pow".to_string(),
@@ -345,54 +404,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("difficulty".to_string(), "4".to_string()),
         ]),
     };
-    
+
     println!("   Processing No-Wallet federation request...");
-    match federation_manager.process_federation_request(pow_request.clone()).await {
+    match federation_manager
+        .process_federation_request(pow_request.clone())
+        .await
+    {
         Ok(response) => println!("     No-Wallet request processed: {:?}", response),
         Err(e) => println!("     No-Wallet request failed (expected): {}", e),
     }
 
     // 8. Privacy Network Integration Example
     println!("\n8. Privacy Network Integration Example...");
-    use neuro_fed_node::privacy_networks::{PrivacyNetworkManager, PrivacyNetworkConfig, PrivacyNetwork};
-    
+    use neuro_fed_node::privacy_networks::{
+        PrivacyNetwork, PrivacyNetworkConfig, PrivacyNetworkManager,
+    };
+
     // Create privacy network configuration
     let privacy_config = PrivacyNetworkConfig::default();
     println!("   Created default privacy network configuration");
     println!("   Default network: {:?}", privacy_config.default_network);
     println!("   Enable fallback: {}", privacy_config.enable_fallback);
     println!("   Max latency: {} ms", privacy_config.max_latency_ms);
-    
+
     // Initialize privacy network manager
     let mut privacy_manager = PrivacyNetworkManager::new(privacy_config);
     match privacy_manager.initialize().await {
         Ok(_) => println!("   Privacy network manager initialized successfully"),
         Err(e) => println!("   Privacy network manager initialization failed: {}", e),
     }
-    
+
     // Connect to default network
     match privacy_manager.connect().await {
-        Ok(_) => println!("   Connected to privacy network: {:?}", privacy_manager.current_network),
+        Ok(_) => println!(
+            "   Connected to privacy network: {:?}",
+            privacy_manager.current_network
+        ),
         Err(e) => println!("   Connection failed: {}", e),
     }
-    
+
     // Get network status
     let status = privacy_manager.get_status().await;
     println!("   Network status: {:?}", status);
-    
+
     // Demonstrate network switching
     println!("   Demonstrating network switching...");
     match privacy_manager.switch_network(PrivacyNetwork::Tor).await {
         Ok(_) => println!("   Switched to Tor network"),
         Err(e) => println!("   Network switch failed: {}", e),
     }
-    
+
     // Get latency
     match privacy_manager.get_latency().await {
         Ok(latency) => println!("   Network latency: {:?}", latency),
         Err(e) => println!("   Latency measurement failed: {}", e),
     }
-    
+
     // Disconnect
     match privacy_manager.disconnect().await {
         Ok(_) => println!("   Disconnected from privacy network"),
@@ -406,20 +473,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_example_creation() {
         // Simple test to verify the example compiles and basic functionality works
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
-        
+
         // This should not panic
         let _ = manager.detect_available_memory().await;
-        
+
         // Create engine (may fail if no models are available, which is okay for test)
-        let _ = MLEngine::new_with_manager(
-            Arc::new(manager),
-            "llama-3-8b-instruct"
-        ).await;
+        let _ = MLEngine::new_with_manager(Arc::new(manager), "llama-3-8b-instruct").await;
     }
 }

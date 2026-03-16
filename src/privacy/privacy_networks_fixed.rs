@@ -5,9 +5,9 @@
 //! The `PrivacyNetworkManager` handles network connections, switching,
 //! and fallback mechanisms between networks.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
 use tracing::info;
 
 /// Privacy network types supported by the system
@@ -67,7 +67,6 @@ pub struct PrivacyNetworkConfig {
     pub enable_anonymity: bool,
 }
 
-
 /// Errors that can occur in privacy network operations
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum PrivacyNetworkError {
@@ -101,20 +100,23 @@ impl PrivacyNetworkManager {
             PrivacyNetwork::Tor,
             PrivacyNetwork::I2p,
         ];
-        
+
         Self {
             current_network: config.default_network,
             config,
             fallback_order,
         }
     }
-    
+
     /// Initialize the privacy network manager
     pub async fn initialize(&mut self) -> Result<(), PrivacyNetworkError> {
-        info!("Initializing privacy network manager with default network: {}", self.current_network);
+        info!(
+            "Initializing privacy network manager with default network: {}",
+            self.current_network
+        );
         Ok(())
     }
-    
+
     /// Connect to the current network
     pub async fn connect(&mut self) -> Result<(), PrivacyNetworkError> {
         match self.current_network {
@@ -124,11 +126,14 @@ impl PrivacyNetworkManager {
             }
             _ => {
                 // Other networks not implemented yet
-                Err(PrivacyNetworkError::NotSupported(format!("Network {:?} not implemented", self.current_network)))
+                Err(PrivacyNetworkError::NotSupported(format!(
+                    "Network {:?} not implemented",
+                    self.current_network
+                )))
             }
         }
     }
-    
+
     /// Disconnect from the current network
     pub async fn disconnect(&mut self) -> Result<(), PrivacyNetworkError> {
         match self.current_network {
@@ -136,19 +141,22 @@ impl PrivacyNetworkManager {
             _ => Ok(()), // Other networks don't need disconnection handling yet
         }
     }
-    
+
     /// Switch to a different network
-    pub async fn switch_network(&mut self, network: PrivacyNetwork) -> Result<(), PrivacyNetworkError> {
+    pub async fn switch_network(
+        &mut self,
+        network: PrivacyNetwork,
+    ) -> Result<(), PrivacyNetworkError> {
         // Disconnect from current network
         self.disconnect().await?;
-        
+
         // Update current network
         self.current_network = network;
-        
+
         // Connect to new network
         self.connect().await
     }
-    
+
     /// Get current network status
     pub async fn get_status(&self) -> PrivacyNetworkStatus {
         match self.current_network {
@@ -156,13 +164,13 @@ impl PrivacyNetworkManager {
             _ => PrivacyNetworkStatus::Disconnected,
         }
     }
-    
+
     /// Perform automatic network switching based on latency and availability
     pub async fn auto_switch(&mut self) -> Result<(), PrivacyNetworkError> {
         if !self.config.enable_fallback {
             return Ok(());
         }
-        
+
         let current_latency = self.get_latency().await;
         if let Ok(latency) = current_latency {
             if latency.as_millis() > self.config.max_latency_ms as u128 {
@@ -171,7 +179,7 @@ impl PrivacyNetworkManager {
                     if network == self.current_network {
                         continue;
                     }
-                    
+
                     match network {
                         PrivacyNetwork::Direct => {
                             return self.switch_network(network).await;
@@ -184,39 +192,52 @@ impl PrivacyNetworkManager {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get current network latency
     pub async fn get_latency(&self) -> Result<Duration, PrivacyNetworkError> {
         match self.current_network {
             PrivacyNetwork::Direct => Ok(Duration::from_millis(1)),
-            _ => Err(PrivacyNetworkError::NotSupported(format!("Network {:?} not implemented", self.current_network))),
+            _ => Err(PrivacyNetworkError::NotSupported(format!(
+                "Network {:?} not implemented",
+                self.current_network
+            ))),
         }
     }
-    
+
     /// Send data through the current network
     pub async fn send(&self, _data: &[u8], _destination: &str) -> Result<(), PrivacyNetworkError> {
         match self.current_network {
             PrivacyNetwork::Direct => {
                 // For direct connections, we would use regular networking
                 // This is a placeholder implementation
-                Err(PrivacyNetworkError::NotSupported("Direct network sending not implemented".to_string()))
+                Err(PrivacyNetworkError::NotSupported(
+                    "Direct network sending not implemented".to_string(),
+                ))
             }
-            _ => Err(PrivacyNetworkError::NotSupported(format!("Network {:?} not implemented", self.current_network))),
+            _ => Err(PrivacyNetworkError::NotSupported(format!(
+                "Network {:?} not implemented",
+                self.current_network
+            ))),
         }
     }
-    
+
     /// Receive data from the current network
     pub async fn receive(&self) -> Result<Vec<u8>, PrivacyNetworkError> {
         match self.current_network {
             PrivacyNetwork::Direct => {
                 // For direct connections, we would use regular networking
                 // This is a placeholder implementation
-                Err(PrivacyNetworkError::NotSupported("Direct network receiving not implemented".to_string()))
+                Err(PrivacyNetworkError::NotSupported(
+                    "Direct network receiving not implemented".to_string(),
+                ))
             }
-            _ => Err(PrivacyNetworkError::NotSupported(format!("Network {:?} not implemented", self.current_network))),
+            _ => Err(PrivacyNetworkError::NotSupported(format!(
+                "Network {:?} not implemented",
+                self.current_network
+            ))),
         }
     }
 }

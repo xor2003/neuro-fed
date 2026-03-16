@@ -32,7 +32,7 @@ pub struct SurpriseStats {
     pub level_surprises: Vec<f32>, // Track which level is struggling
     pub free_energy_history: Vec<f32>,
     pub high_surprise_indices: Vec<usize>,
-    
+
     // AI Architecture Improvements: Explicit Latent Uncertainty
     /// Novelty: How unexpected was this input initially? (Initial Free Energy)
     pub novelty_score: f32,

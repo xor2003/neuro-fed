@@ -1,9 +1,9 @@
 // src/metrics.rs
 // Централизованный модуль для управления метриками и наблюдаемости.
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use once_cell::sync::Lazy;
 
 // --- Ключи Метрик (константы для избежания "магических строк") ---
 
@@ -50,7 +50,9 @@ impl MetricsStore {
     /// Увеличивает счетчик на указанное значение
     pub fn increment_counter(&self, key: &str, value: u64) {
         let mut storage = self.storage.write().unwrap();
-        let entry = storage.entry(key.to_string()).or_insert(MetricValue::Counter(0));
+        let entry = storage
+            .entry(key.to_string())
+            .or_insert(MetricValue::Counter(0));
         match entry {
             MetricValue::Counter(c) => *c += value,
             _ => *entry = MetricValue::Counter(value), // сброс, если тип не совпадает
@@ -66,7 +68,8 @@ impl MetricsStore {
     /// Получает снимок всех метрик
     pub fn get_snapshot(&self) -> HashMap<String, String> {
         let storage = self.storage.read().unwrap();
-        storage.iter()
+        storage
+            .iter()
             .map(|(k, v)| {
                 let value_str = match v {
                     MetricValue::Counter(c) => c.to_string(),
@@ -115,15 +118,15 @@ macro_rules! histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_metrics_store_works() {
         init_metrics();
-        
+
         // Увеличиваем счетчик
         increment_counter!("test.counter", 10);
         increment_counter!("test.counter", 5);
-        
+
         // Устанавливаем gauge
         gauge!("test.gauge", 42.5);
 

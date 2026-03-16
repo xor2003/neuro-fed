@@ -1,12 +1,12 @@
 // src/sleep_phase.rs
 // Offline Consolidation: Fast-to-Slow memory transfer and Chunk Discovery
 
+use crate::{learning_log::append_learning_detail, pc_decoder::ThoughtDecoder};
+use crate::pc_hierarchy::PredictiveCoding;
+use crate::types::{CognitiveDictionary, Episode};
+use candle_core::{Device, Tensor};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::pc_hierarchy::PredictiveCoding;
-use crate::pc_decoder::ThoughtDecoder;
-use crate::types::{CognitiveDictionary, Episode};
-use candle_core::{Tensor, Device};
 use tokio::task;
 
 pub struct SleepManager {
@@ -23,13 +23,18 @@ impl SleepManager {
         dict: Arc<RwLock<CognitiveDictionary>>,
         episodic_memory: Arc<RwLock<std::collections::VecDeque<Episode>>>,
     ) -> Self {
-        Self { pc_hierarchy, decoder, dict, episodic_memory }
+        Self {
+            pc_hierarchy,
+            decoder,
+            dict,
+            episodic_memory,
+        }
     }
 
     /// Triggers offline consolidation
     pub async fn process_sleep_cycle(&self) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("🌙 Entering SLEEP PHASE: Consolidating memory...");
-        
+
         let episodes = {
             let mut memory = self.episodic_memory.write().await;
             if memory.is_empty() {
@@ -48,20 +53,30 @@ impl SleepManager {
         };
 
         if new_chunks > 0 {
-            tracing::info!("🧠 Discovered {} new thought chunks! Expanding Decoder Matrix...", new_chunks);
+            tracing::info!(
+                "🧠 Discovered {} new thought chunks! Expanding Decoder Matrix...",
+                new_chunks
+            );
             let mut decoder = self.decoder.write().await;
-            decoder.resize_vocab(new_dict_len).map_err(|e| e.to_string())?;
+            decoder
+                .resize_vocab(new_dict_len)
+                .map_err(|e| e.to_string())?;
             drop(decoder);
         }
 
         let mut total_loss = 0.0;
         let mut learned_count = 0;
+        let mut detail_logs = Vec::new();
 
         for ep in episodes.into_iter().filter(|e| e.success) {
-            if ep.query_sequence.is_empty() { continue; }
+            if ep.query_sequence.is_empty() {
+                continue;
+            }
             let seq_len = ep.query_sequence.len();
             let dim = ep.query_sequence[0].len();
-            if dim == 0 { continue; }
+            if dim == 0 {
+                continue;
+            }
 
             let flat_data: Vec<f32> = ep.query_sequence.iter().flatten().copied().collect();
             let embed_tensor = Tensor::from_vec(flat_data, (seq_len, dim), &Device::Cpu)?;
@@ -73,19 +88,40 @@ impl SleepManager {
 
             if ep.novelty > 2.0 {
                 pc.checkpoint_weights().map_err(|e| e.to_string())?;
-                let stats = pc.learn_sequence(&embed_tensor, None).map_err(|e| e.to_string())?;
+                let stats = pc
+                    .learn_sequence(&embed_tensor, None)
+                    .map_err(|e| e.to_string())?;
                 if stats.total_surprise.is_nan() || stats.total_surprise > 1000.0 {
                     pc.rollback_weights().map_err(|e| e.to_string())?;
                 }
             } else {
-                pc.infer_sequence(&embed_tensor, 5).map_err(|e| e.to_string())?;
+                pc.infer_sequence(&embed_tensor, 5)
+                    .map_err(|e| e.to_string())?;
             }
 
             let belief = pc.levels.last().unwrap().beliefs.flatten_all()?;
 
-        if let Ok(loss) = decoder.train_step(&belief, &ep.thought_sequence, 0.05) {
+            if let Ok(loss) = decoder.train_step(&belief, &ep.thought_sequence, 0.05) {
                 total_loss += loss;
                 learned_count += 1;
+                let trajectory = {
+                    let dict = self.dict.read().await;
+                    ep.thought_sequence
+                        .iter()
+                        .map(|&id| dict.get_op(id).to_string())
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                };
+                detail_logs.push(format!(
+                    "Input Question: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nLoss: {:.4}",
+                    ep.raw_query,
+                    ep.generated_code,
+                    trajectory,
+                    ep.thought_sequence,
+                    ep.confidence,
+                    ep.novelty,
+                    loss
+                ));
             }
 
             drop(decoder);
@@ -93,8 +129,22 @@ impl SleepManager {
             task::yield_now().await;
         }
 
+        if !detail_logs.is_empty() {
+            detail_logs.push(format!(
+                "Sleep Summary: episodes={}, learned_chunks={}, total_loss={:.4}",
+                learned_count,
+                learned_count,
+                total_loss
+            ));
+            let log_body = detail_logs.join("\n\n---\n\n");
+            append_learning_detail(&log_body);
+        }
+
         if learned_count > 0 {
-            tracing::info!("📈 Sleep training complete. Avg Loss: {:.4}", total_loss / learned_count as f32);
+            tracing::info!(
+                "📈 Sleep training complete. Avg Loss: {:.4}",
+                total_loss / learned_count as f32
+            );
         }
 
         self.episodic_memory.write().await.clear();
@@ -106,9 +156,9 @@ impl SleepManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pc_hierarchy::PCConfig;
     use crate::pc_decoder::ThoughtDecoder;
-    use crate::types::{CognitiveDictionary, Episode, ThoughtOp};
+    use crate::pc_hierarchy::PCConfig;
+    use crate::types::{CognitiveDictionary, Episode};
     use std::collections::VecDeque;
 
     #[tokio::test]
@@ -116,12 +166,12 @@ mod tests {
         let pc_config = PCConfig::new(2, vec![3, 2]); // Match embedding dimension
         let pc = PredictiveCoding::new(pc_config).unwrap();
         let pc_hierarchy = Arc::new(RwLock::new(pc));
-        
+
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
         let decoder = Arc::new(RwLock::new(
-            ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap() // belief_dim = top level dim (2)
+            ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap(), // belief_dim = top level dim (2)
         ));
-        
+
         let mut episodes = VecDeque::new();
         episodes.push_back(Episode {
             raw_query: "test".into(),
@@ -132,47 +182,47 @@ mod tests {
             thought_sequence: vec![0, 1, 2],
             success: true,
         });
-        
+
         let episodic_memory = Arc::new(RwLock::new(episodes));
-        
-        let sleep_mgr = SleepManager::new(
-            pc_hierarchy,
-            decoder,
-            dict,
-            episodic_memory.clone(),
-        );
-        
+
+        let sleep_mgr = SleepManager::new(pc_hierarchy, decoder, dict, episodic_memory.clone());
+
         // Process sleep cycle
         let result = sleep_mgr.process_sleep_cycle().await;
         assert!(result.is_ok(), "Sleep phase failed: {:?}", result.err());
-        
+
         // Check that memory is cleared
         let memory = episodic_memory.read().await;
-        assert!(memory.is_empty(), "Episodic memory should be cleared after sleep");
+        assert!(
+            memory.is_empty(),
+            "Episodic memory should be cleared after sleep"
+        );
     }
 }
 
 #[cfg(test)]
 mod sleep_phase_integration_tests {
     use super::*;
-    use crate::pc_hierarchy::PCConfig;
     use crate::pc_decoder::ThoughtDecoder;
+    use crate::pc_hierarchy::PCConfig;
     use crate::types::{CognitiveDictionary, Episode};
-    use std::collections::VecDeque;
     use candle_core::Device;
+    use std::collections::VecDeque;
 
     #[tokio::test]
     async fn test_sleep_phase_processes_sequences_and_resizes_vocab() {
         let pc_config = PCConfig::new(2, vec![4, 2]);
         let pc = PredictiveCoding::new(pc_config).unwrap();
         let pc_hierarchy = Arc::new(RwLock::new(pc));
-        
+
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
         // Original dict has 8 elements
-        let decoder = Arc::new(RwLock::new(ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap()));
-        
+        let decoder = Arc::new(RwLock::new(
+            ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap(),
+        ));
+
         let mut episodes = VecDeque::new();
-        
+
         // Insert 4 identical successful episodes.
         // Because there are >3 identical bigrams (0->1), the chunk discoverer will create a new token.
         for _ in 0..4 {
@@ -182,7 +232,7 @@ mod sleep_phase_integration_tests {
                 query_sequence: vec![
                     vec![0.1, 0.2, 0.3, 0.4],
                     vec![0.5, 0.6, 0.7, 0.8],
-                    vec![0.9, 1.0, 1.1, 1.2]
+                    vec![0.9, 1.0, 1.1, 1.2],
                 ],
                 novelty: 3.0,
                 confidence: 0.9,
@@ -191,31 +241,40 @@ mod sleep_phase_integration_tests {
                 success: true,
             });
         }
-        
+
         let episodic_memory = Arc::new(RwLock::new(episodes));
-        
+
         let manager = SleepManager::new(
             pc_hierarchy,
             decoder.clone(),
             dict.clone(),
-            episodic_memory.clone()
+            episodic_memory.clone(),
         );
-        
+
         // Trigger consolidation
         let result = manager.process_sleep_cycle().await;
         assert!(result.is_ok(), "Sleep phase crashed: {:?}", result.err());
-        
+
         // 1. Ensure memory was wiped clean
-        assert!(episodic_memory.read().await.is_empty(), "Memory should be cleared after sleep phase");
-        
+        assert!(
+            episodic_memory.read().await.is_empty(),
+            "Memory should be cleared after sleep phase"
+        );
+
         // 2. Ensure Dictionary Grew
         let new_dict_len = dict.read().await.len();
-        assert!(new_dict_len > 8, "Dictionary should have discovered the 0->1 bigram and grown");
-        
+        assert!(
+            new_dict_len > 8,
+            "Dictionary should have discovered the 0->1 bigram and grown"
+        );
+
         // 3. Ensure Decoder w_vocab Resized to match Dictionary
         let current_vocab_size = decoder.read().await.w_vocab.shape().dims()[0];
-        assert_eq!(current_vocab_size, new_dict_len,
-            "Decoder w_vocab rows ({}) must match Dictionary length ({})!", current_vocab_size, new_dict_len);
+        assert_eq!(
+            current_vocab_size, new_dict_len,
+            "Decoder w_vocab rows ({}) must match Dictionary length ({})!",
+            current_vocab_size, new_dict_len
+        );
     }
 }
 
@@ -223,6 +282,7 @@ mod sleep_phase_integration_tests {
 mod deep_consolidation_tests {
     use super::*;
     use crate::pc_hierarchy::PCConfig;
+    use crate::types::ThoughtOp;
     use candle_core::Device;
 
     #[tokio::test]
@@ -232,12 +292,23 @@ mod deep_consolidation_tests {
         let pc_config = PCConfig::new(2, vec![4, 2]);
         let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config).unwrap()));
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
-        
-        // Base dictionary has 8 items
-        let decoder = Arc::new(RwLock::new(ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap()));
+        // Base dictionary has 12 items (new commands included).
+        let decoder = Arc::new(RwLock::new(
+            ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap(),
+        ));
         let episodic_memory = Arc::new(RwLock::new(std::collections::VecDeque::new()));
 
-        let sleep_mgr = SleepManager::new(pc_hierarchy, decoder.clone(), dict.clone(), episodic_memory.clone());
+        let sleep_mgr = SleepManager::new(
+            pc_hierarchy,
+            decoder.clone(),
+            dict.clone(),
+            episodic_memory.clone(),
+        );
+
+        let base_dict_len = { dict.read().await.len() };
+        let define_id = { dict.read().await.op_to_id[&ThoughtOp::Define] };
+        let iterate_id = { dict.read().await.op_to_id[&ThoughtOp::Iterate] };
+        let eof_id = { dict.read().await.op_to_id[&ThoughtOp::EOF] };
 
         // Push 5 successful identical episodes to force Chunk Discovery of [0, 1]
         for _ in 0..5 {
@@ -247,7 +318,8 @@ mod deep_consolidation_tests {
                 novelty: 5.0,
                 confidence: 0.9,
                 generated_code: "pass".into(),
-                thought_sequence: vec![0, 1, 7], // Will chunk 0 and 1
+                thought_sequence: vec![define_id, iterate_id, eof_id],
+                // Will chunk Define -> Iterate (EOF ensures termination)
                 success: true,
             });
         }
@@ -258,16 +330,27 @@ mod deep_consolidation_tests {
 
         // 1. Verify Dictionary expanded
         let new_dict_size = dict.read().await.len();
-        assert_eq!(new_dict_size, 9, "Dictionary failed to discover new chunk!");
+        assert!(
+            new_dict_size > base_dict_len,
+            "Dictionary failed to discover new chunk!"
+        );
 
         // 2. Verify Neural Network resized WITHOUT losing old data
         let w_vocab_shape = decoder.read().await.w_vocab.shape().clone();
-        assert_eq!(w_vocab_shape.dims()[0], 9, "Decoder matrix did not resize to fit new vocabulary!");
+        assert_eq!(
+            w_vocab_shape.dims()[0],
+            new_dict_size,
+            "Decoder matrix did not resize to fit new vocabulary!"
+        );
 
         // 3. Verify it can STILL run a forward/backward pass with the new dimensions
         let test_belief = Tensor::randn(0f32, 1.0, (2, 1), &Device::Cpu).unwrap();
         // Train it on the newly discovered token ID (8)
-        let train_res = decoder.write().await.train_step(&test_belief, &[8], 0.01);
-        assert!(train_res.is_ok(), "BPTT Panicked after matrix resize! Dimension mismatch likely.");
+        let new_token_id = (new_dict_size - 1) as u32;
+        let train_res = decoder.write().await.train_step(&test_belief, &[new_token_id], 0.01);
+        assert!(
+            train_res.is_ok(),
+            "BPTT Panicked after matrix resize! Dimension mismatch likely."
+        );
     }
 }

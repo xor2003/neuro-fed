@@ -5,8 +5,8 @@
 //! 2. Learning - ensure PC learns from data.
 //! 3. Answering using learned PC - ensure PC can produce answers based on learned knowledge.
 
-use neuro_fed_node::pc_hierarchy::{PredictiveCoding, PCConfig};
 use candle_core::{Device, Tensor};
+use neuro_fed_node::pc_hierarchy::{PCConfig, PredictiveCoding};
 use std::error::Error;
 
 /// Create a deterministic fake embedding tensor for testing.
@@ -27,8 +27,14 @@ fn test_pc_inference() -> Result<(), Box<dyn Error>> {
 
     // 3. Perform inference
     let result = pc.infer(&embedding, 10)?;
-    assert!(result.total_surprise >= 0.0, "Total surprise should be non-negative");
-    println!("Inference succeeded with total surprise: {}", result.total_surprise);
+    assert!(
+        result.total_surprise >= 0.0,
+        "Total surprise should be non-negative"
+    );
+    println!(
+        "Inference succeeded with total surprise: {}",
+        result.total_surprise
+    );
     Ok(())
 }
 
@@ -53,7 +59,11 @@ fn test_pc_learning() -> Result<(), Box<dyn Error>> {
     assert!(!result.free_energy_history.is_empty());
     let last_fe = result.free_energy_history.last().unwrap();
     assert!(!last_fe.is_nan());
-    println!("Learning test passed with free energy history length: {}, last free energy: {}", result.free_energy_history.len(), last_fe);
+    println!(
+        "Learning test passed with free energy history length: {}, last free energy: {}",
+        result.free_energy_history.len(),
+        last_fe
+    );
     Ok(())
 }
 
@@ -80,7 +90,10 @@ fn test_pc_answer_with_learned_knowledge() -> Result<(), Box<dyn Error>> {
     // 3. Infer again on the same pattern - free energy should decrease (or at least not increase drastically)
     let post_inference = pc.infer(&pattern_embedding, 10)?;
     let post_free_energy = *post_inference.free_energy_history.last().unwrap_or(&0.0);
-    println!("Initial free energy: {}, After learning: {}", initial_free_energy, post_free_energy);
+    println!(
+        "Initial free energy: {}, After learning: {}",
+        initial_free_energy, post_free_energy
+    );
     // Note: free energy may not always decrease due to random weights, but we can assert it's not NaN
     assert!(!post_free_energy.is_nan());
 

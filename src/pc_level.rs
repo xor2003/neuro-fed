@@ -1,5 +1,5 @@
 // src/pc_level.rs
-use candle_core::{Device, Tensor, DType, Result as CandleResult};
+use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct PCLevel {
@@ -13,7 +13,7 @@ pub struct PCLevel {
     pub adapter_weights: Tensor,
     pub device: Device,
     pub is_dirty: bool, // For error-driven recomputation
-    
+
     // NEW: Rollback buffers
     pub backup_weights: Option<Tensor>,
     pub backup_temporal: Option<Tensor>,
@@ -31,19 +31,24 @@ impl PCLevel {
     pub fn new(input_dim: usize, output_dim: usize, device: &Device) -> CandleResult<Self> {
         Self::new_with_weights(input_dim, output_dim, None, device)
     }
-    
+
     /// NEW: Create PCLevel with optional pre-trained weights for knowledge-guided initialization
     pub fn new_with_weights(
         input_dim: usize,
         output_dim: usize,
         initial_weights: Option<Tensor>,
-        device: &Device
+        device: &Device,
     ) -> CandleResult<Self> {
         let weights = match initial_weights {
             Some(w) => w,
-            None => Tensor::randn(0f32, (1.0 / input_dim as f32).sqrt(), (input_dim, output_dim), device)?,
+            None => Tensor::randn(
+                0f32,
+                (1.0 / input_dim as f32).sqrt(),
+                (input_dim, output_dim),
+                device,
+            )?,
         };
-        
+
         Ok(PCLevel {
             beliefs: Tensor::zeros((input_dim, 1), DType::F32, device)?,
             predictions: Tensor::zeros((input_dim, 1), DType::F32, device)?,
@@ -52,8 +57,9 @@ impl PCLevel {
             precision: Tensor::ones((input_dim, 1), DType::F32, device)?,
             prev_beliefs: Tensor::zeros((input_dim, 1), DType::F32, device)?,
             // Initialize temporal weights as identity + noise to encourage stability
-            temporal_weights: Tensor::eye(input_dim, DType::F32, device)?
-                .broadcast_add(&Tensor::randn(0f32, 0.001f32, (input_dim, input_dim), device)?)?,
+            temporal_weights: Tensor::eye(input_dim, DType::F32, device)?.broadcast_add(
+                &Tensor::randn(0f32, 0.001f32, (input_dim, input_dim), device)?,
+            )?,
             adapter_weights: Tensor::randn(0f32, 0.01f32, (input_dim, output_dim), device)?,
             device: device.clone(),
             is_dirty: true,
@@ -71,7 +77,9 @@ impl PCLevel {
     /// ИСПОЛЬЗУЕМ ТЕМПОРАЛЬНЫЕ ВЕСА ТОЛЬКО ЕСЛИ ЕСТЬ ИСТОРИЯ
     pub fn predict(&mut self, beliefs_next: &Tensor) -> CandleResult<()> {
         // 🚀 DELTA PROPAGATION: Only multiply the difference if we have cached previous input
-        let spatial_pred = if let (Some(old_input), Some(old_spatial)) = (&self.last_prediction_input, &self.last_spatial_prediction) {
+        let spatial_pred = if let (Some(old_input), Some(old_spatial)) =
+            (&self.last_prediction_input, &self.last_spatial_prediction)
+        {
             let delta_r = (beliefs_next - old_input)?;
             let delta_pred = self.weights.matmul(&delta_r.contiguous()?)?;
             (old_spatial + &delta_pred)?
@@ -79,7 +87,7 @@ impl PCLevel {
             // Initial step: full matmul
             self.weights.matmul(&beliefs_next.contiguous()?)?
         };
-        
+
         // Cache for next delta propagation
         self.last_spatial_prediction = Some(spatial_pred.clone());
         self.last_prediction_input = Some(beliefs_next.clone());
@@ -93,7 +101,7 @@ impl PCLevel {
         } else {
             self.predictions = spatial_pred;
         }
-        
+
         Ok(())
     }
 
@@ -125,27 +133,48 @@ impl PCLevel {
         self.errors = (&raw_error * &self.precision)?;
         Ok(())
     }
-    
-    pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Tensor, precision: Option<&Tensor>, mu_pc_scaling: bool) -> CandleResult<()> {
+
+    pub fn update_weights(
+        &mut self,
+        eta: f32,
+        next_level_beliefs: &Tensor,
+        precision: Option<&Tensor>,
+        mu_pc_scaling: bool,
+    ) -> CandleResult<()> {
         // 🚀 OPTIMIZATION: Force contiguous memory layout after transpose for fast BLAS/Native matmul
-        let next_t = next_level_beliefs.t()?.contiguous()?.to_device(&self.device)?;
+        let next_t = next_level_beliefs
+            .t()?
+            .contiguous()?
+            .to_device(&self.device)?;
         let matmul_result = self.errors.matmul(&next_t)?;
-        
+
         // --- NEW: NUMERICAL GUARDRAIL ---
         // Check if the update is finite. If it's NaN or Inf, skip this update.
-        let is_finite = matmul_result.abs()?.max_all()?.to_scalar::<f32>()?.is_finite();
+        let is_finite = matmul_result
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .is_finite();
         if !is_finite {
-            tracing::error!("⚠️ Skipping weight update: Matmul resulted in non-finite values (Explosion prevented)");
+            tracing::error!(
+                "⚠️ Skipping weight update: Matmul resulted in non-finite values (Explosion prevented)"
+            );
             return Ok(());
         }
         // --------------------------------
-        
+
         let (input_dim, _) = self.weights.shape().dims2()?;
-        let effective_lr = if mu_pc_scaling { eta / (input_dim as f32).sqrt() } else { eta };
-        
+        let effective_lr = if mu_pc_scaling {
+            eta / (input_dim as f32).sqrt()
+        } else {
+            eta
+        };
+
         // Create eta tensor for spatial weights update (cached)
         let eta_tensor_spatial = match &self.cached_spatial_eta {
-            Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => cached_tensor.clone(),
+            Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => {
+                cached_tensor.clone()
+            }
             _ => {
                 let t = Tensor::from_slice(&[effective_lr], (1, 1), &matmul_result.device())?
                     .broadcast_as(matmul_result.shape())?;
@@ -154,44 +183,55 @@ impl PCLevel {
             }
         };
         let mut delta_weights = matmul_result.mul(&eta_tensor_spatial)?;
-        
+
         if let Some(precision_matrix) = precision {
             let broadcasted_precision = precision_matrix.broadcast_as(delta_weights.shape())?;
             delta_weights = (&delta_weights * &broadcasted_precision)?;
         }
-        
+
         // --- GRADIENT CLIPPING ---
         let clip_val = 1.0f64;
         let total_norm = delta_weights.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-        
+
         if total_norm > clip_val {
             let scale = clip_val / total_norm;
             delta_weights = delta_weights.affine(scale, 0.0)?;
         }
-        
+
         // L2 Regularization / Weight Decay to prevent infinite weight explosion
         let weight_decay = 1e-4;
         let decayed_weights = (&self.weights * (1.0 - weight_decay))?;
-        
+
         // 🚀 CACHE LOCALITY: After updating weights, we MUST ensure the new tensor
         // is contiguous. This allows the NEXT token's matmul to use BLAS/SIMD optimally.
         let new_weights = decayed_weights.broadcast_add(&delta_weights)?;
         self.weights = new_weights.contiguous()?;
-        
+        // 🔴 Invalidate stale prediction cache after changing weights
+        self.last_prediction_input = None;
+        self.last_spatial_prediction = None;
+
         // NEW: Also update temporal causal weights using Hebbian learning on prev_beliefs
         // 🚀 OPTIMIZATION: Force contiguous memory layout
         let prev_t = self.prev_beliefs.t()?.contiguous()?;
         let temporal_matmul = self.errors.matmul(&prev_t)?;
-        
+
         // --- NEW: NUMERICAL GUARDRAIL for temporal update ---
-        let is_temporal_finite = temporal_matmul.abs()?.max_all()?.to_scalar::<f32>()?.is_finite();
+        let is_temporal_finite = temporal_matmul
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .is_finite();
         if !is_temporal_finite {
-            tracing::error!("⚠️ Skipping temporal weight update: Matmul resulted in non-finite values");
+            tracing::error!(
+                "⚠️ Skipping temporal weight update: Matmul resulted in non-finite values"
+            );
             // Continue without temporal update, but spatial update already passed guardrail
         } else {
             // Create separate eta tensor for temporal update with correct shape (cached)
             let eta_tensor_temporal = match &self.cached_temporal_eta {
-                Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => cached_tensor.clone(),
+                Some((cached_lr, cached_tensor)) if (cached_lr - effective_lr).abs() < 1e-9 => {
+                    cached_tensor.clone()
+                }
                 _ => {
                     let t = Tensor::from_slice(&[effective_lr], (1, 1), &temporal_matmul.device())?
                         .broadcast_as(temporal_matmul.shape())?;
@@ -200,21 +240,21 @@ impl PCLevel {
                 }
             };
             let mut temporal_update = temporal_matmul.mul(&eta_tensor_temporal)?;
-            
+
             // --- GRADIENT CLIPPING for temporal update ---
             let temporal_norm = temporal_update.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
             if temporal_norm > clip_val {
                 let scale = clip_val / temporal_norm;
                 temporal_update = temporal_update.affine(scale, 0.0)?;
             }
-            
+
             let decayed_temporal = (&self.temporal_weights * (1.0 - weight_decay))?;
-            
+
             // 🚀 CACHE LOCALITY: Ensure temporal weights are also contiguous
             let new_temporal_weights = decayed_temporal.broadcast_add(&temporal_update)?;
             self.temporal_weights = new_temporal_weights.contiguous()?;
         }
-        
+
         Ok(())
     }
 
@@ -222,33 +262,38 @@ impl PCLevel {
     /// This implementation uses normalized beliefs to prevent weight explosion
     /// and adaptive learning rates based on error magnitude.
     /// precision_scale: Optional scaling factor from hyper-network (0.1 to 2.0)
-    pub fn update_weights_exact(&mut self, error: &Tensor, next_beliefs: &Tensor, precision_scale: Option<f32>) -> CandleResult<()> {
+    pub fn update_weights_exact(
+        &mut self,
+        error: &Tensor,
+        next_beliefs: &Tensor,
+        precision_scale: Option<f32>,
+    ) -> CandleResult<()> {
         // Compute surprise magnitude
         let surprise = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        
+
         // ─────────────────────────────────────────────────────
         // Aha! Optimizer: adaptive LR + normalized Hebbian
         // ─────────────────────────────────────────────────────
         let surprise_threshold = 2.0;
         let base_eta = 0.01;
         let aha_boost = 5.0; // во сколько раз увеличиваем шаг при "Ага!"
-        
+
         let mut adaptive_eta = if surprise > surprise_threshold {
             base_eta * aha_boost
         } else {
             base_eta
         };
-        
+
         // Apply precision scaling from hyper-network if provided
         if let Some(scale) = precision_scale {
             adaptive_eta *= scale;
         }
-        
+
         // Нормализация входа (предотвращает взрывы весов)
-        let input_zero_sum = next_beliefs.sum_all()?.to_scalar::<f32>()?;
+        let _input_zero_sum = next_beliefs.sum_all()?.to_scalar::<f32>()?;
         let input_norm = (next_beliefs.sqr()?.sum_all()?.to_scalar::<f32>()? + 1e-6).sqrt();
         let normalized_input = next_beliefs.affine((1.0 / input_norm) as f64, 0.0)?;
-        
+
         // Delta = error * normalized_input^T
         let mut delta = error.matmul(&normalized_input.t()?.contiguous()?)?;
 
@@ -256,13 +301,14 @@ impl PCLevel {
         if let Some(mask) = &self.freeze_mask {
             delta = delta.broadcast_mul(mask)?;
         }
-        
+
         // L2 decay + большой шаг при Aha!
         let l2_decay = 1e-4;
-        let new_weights = self.weights
-            .affine(1.0 - l2_decay, 0.0)?                     // L2 decay
+        let new_weights = self
+            .weights
+            .affine(1.0 - l2_decay, 0.0)? // L2 decay
             .broadcast_add(&delta.affine(adaptive_eta as f64, 0.0)?)?;
-        
+
         self.weights = new_weights.contiguous()?;
         Ok(())
     }
@@ -277,14 +323,17 @@ impl PCLevel {
     pub fn set_weights_from_vec(&mut self, weights_vec: Vec<f32>) -> CandleResult<()> {
         let rows = self.weights.dim(0)?;
         let cols = self.weights.dim(1)?;
-        
+
         if weights_vec.len() != rows * cols {
             return Err(candle_core::Error::Msg(format!(
                 "Weight vector size mismatch: expected {} ({}x{}), got {}",
-                rows * cols, rows, cols, weights_vec.len()
+                rows * cols,
+                rows,
+                cols,
+                weights_vec.len()
             )));
         }
-        
+
         // 🔴 FIX: Bake contiguity into the weights immediately on load
         self.weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?.contiguous()?;
         Ok(())
@@ -294,14 +343,17 @@ impl PCLevel {
     pub fn set_temporal_weights_from_vec(&mut self, weights_vec: Vec<f32>) -> CandleResult<()> {
         let rows = self.temporal_weights.dim(0)?;
         let cols = self.temporal_weights.dim(1)?;
-        
+
         if weights_vec.len() != rows * cols {
             return Err(candle_core::Error::Msg(format!(
                 "Temporal weight vector size mismatch: expected {} ({}x{}), got {}",
-                rows * cols, rows, cols, weights_vec.len()
+                rows * cols,
+                rows,
+                cols,
+                weights_vec.len()
             )));
         }
-        
+
         self.temporal_weights = Tensor::from_vec(weights_vec, (rows, cols), &self.device)?;
         Ok(())
     }
@@ -309,11 +361,11 @@ impl PCLevel {
     pub fn check_if_random(&self) -> CandleResult<bool> {
         let (input_dim, _) = self.weights.shape().dims2()?;
         let expected_var = 1.0 / input_dim as f32;
-        
+
         let sqr_sum = self.weights.sqr()?.sum_all()?.to_scalar::<f32>()?;
         let num_elements = self.weights.elem_count() as f32;
         let actual_var = sqr_sum / num_elements;
-        
+
         let diff_ratio = (actual_var - expected_var).abs() / expected_var;
         // Allow 20% tolerance due to random sampling variance
         Ok(diff_ratio < 0.2)
@@ -322,10 +374,10 @@ impl PCLevel {
     /// 🧠 NEURON PROTECTION: Freezes specific features from ever being overwritten
     pub fn freeze_neurons(&mut self, protected_indices: &[usize]) -> CandleResult<()> {
         let (input_dim, output_dim) = self.weights.shape().dims2()?;
-        
+
         // Create a mask of 1.0s (everything plastic/learnable)
         let mut mask_vec = vec![1.0f32; input_dim * output_dim];
-        
+
         // Set the protected indices to 0.0 (unlearnable/frozen)
         for &idx in protected_indices {
             if idx < output_dim {
@@ -334,9 +386,16 @@ impl PCLevel {
                 }
             }
         }
-        
-        self.freeze_mask = Some(Tensor::from_vec(mask_vec, (input_dim, output_dim), &self.device)?);
-        tracing::info!("🔒 Protected {} neurons from catastrophic forgetting.", protected_indices.len());
+
+        self.freeze_mask = Some(Tensor::from_vec(
+            mask_vec,
+            (input_dim, output_dim),
+            &self.device,
+        )?);
+        tracing::info!(
+            "🔒 Protected {} neurons from catastrophic forgetting.",
+            protected_indices.len()
+        );
         Ok(())
     }
 }
@@ -350,31 +409,37 @@ mod stability_tests {
     fn test_gradient_clipping_enforces_max_norm() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(10, 5, &device)?;
-        
+
         // 1. Create a "Nuclear" error (1 million)
         level.errors = Tensor::full(1_000_000.0f32, (10, 1), &device)?;
         let next_beliefs = Tensor::full(1.0f32, (5, 1), &device)?;
-        
+
         let weights_before = level.weights.to_vec2::<f32>()?;
-        
+
         // 2. Perform update.
         // Without clipping, weights would move by ~1000.0.
         // With clipping (max_norm = 1.0), they should move very little.
         level.update_weights(0.1, &next_beliefs, None, false)?;
-        
+
         let weights_after = level.weights.to_vec2::<f32>()?;
-        
+
         // 3. Measure how far the weights moved
         let mut max_move = 0.0f32;
         for i in 0..10 {
             for j in 0..5 {
                 let diff = (weights_after[i][j] - weights_before[i][j]).abs();
-                if diff > max_move { max_move = diff; }
+                if diff > max_move {
+                    max_move = diff;
+                }
             }
         }
 
         // It must be small because of the clip
-        assert!(max_move < 1.1, "Weights moved too far ({}), clipping failed!", max_move);
+        assert!(
+            max_move < 1.1,
+            "Weights moved too far ({}), clipping failed!",
+            max_move
+        );
         Ok(())
     }
 
@@ -392,7 +457,10 @@ mod stability_tests {
         level.update_weights(0.1, &next_beliefs, None, false)?;
 
         let final_weights = level.weights.to_vec2::<f32>()?;
-        assert_eq!(original_weights, final_weights, "NaN error corrupted the weights!");
+        assert_eq!(
+            original_weights, final_weights,
+            "NaN error corrupted the weights!"
+        );
         Ok(())
     }
 }
@@ -406,11 +474,11 @@ mod temporal_logic_tests {
         let device = Device::Cpu;
         let mut level = PCLevel::new(4, 2, &device)?;
         let next_beliefs = Tensor::randn(0f32, 1.0, (2, 1), &device)?;
-        
+
         // Изначально prev_beliefs = 0. Предсказание должно быть чисто пространственным.
         let spatial_prediction = level.weights.matmul(&next_beliefs)?;
         level.predict(&next_beliefs)?;
-        
+
         // Compute difference manually
         let predictions_vec = level.predictions.to_vec2::<f32>()?;
         let spatial_vec = spatial_prediction.to_vec2::<f32>()?;
@@ -420,8 +488,11 @@ mod temporal_logic_tests {
                 diff += (p - s).abs();
             }
         }
-        assert!(diff < 1e-6, "Temporal prediction was not skipped for zero prev_beliefs");
-        
+        assert!(
+            diff < 1e-6,
+            "Temporal prediction was not skipped for zero prev_beliefs"
+        );
+
         Ok(())
     }
 }
@@ -435,21 +506,24 @@ mod numerical_guardrail_tests {
     fn test_nan_protection_fuse() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(10, 5, &device)?;
-        
+
         let original_weights = level.weights.to_vec2::<f32>()?;
-        
+
         // 1. Срочно создаем ошибку типа NaN (Not a Number)
         // Simulate a mathematical "explosion" in the error tensor
         level.errors = Tensor::full(f32::NAN, (10, 1), &device)?;
         let next_beliefs = Tensor::zeros((5, 1), candle_core::DType::F32, &device)?;
-        
+
         // 2. Пытаемся обновить веса.
         // Logic fix: update_weights should see the NaN and skip the update.
         level.update_weights(0.1, &next_beliefs, None, false)?;
-        
+
         // 3. Проверяем, что веса НЕ изменились и НЕ стали NaN
         let updated_weights = level.weights.to_vec2::<f32>()?;
-        assert_eq!(original_weights, updated_weights, "Weights were corrupted by NaN! Guardrail failed.");
+        assert_eq!(
+            original_weights, updated_weights,
+            "Weights were corrupted by NaN! Guardrail failed."
+        );
         Ok(())
     }
 
@@ -457,30 +531,36 @@ mod numerical_guardrail_tests {
     fn test_gradient_clipping_bounds_updates() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(2, 2, &device)?;
-        
+
         // 1. Создаем гигантскую ошибку в 1 миллион
         // Without clipping, this would teleport weights to infinity
         level.errors = Tensor::full(1_000_000.0f32, (2, 1), &device)?;
         let next_beliefs = Tensor::full(1.0f32, (2, 1), &device)?;
-        
+
         let weights_before = level.weights.to_vec2::<f32>()?;
-        
+
         // 2. Обновляем веса
         level.update_weights(1.0, &next_beliefs, None, false)?;
-        
+
         let weights_after = level.weights.to_vec2::<f32>()?;
-        
+
         // 3. Считаем, как далеко ушли веса.
         // Максимальный сдвиг не должен превышать max_norm (1.0) + погрешность
         let mut max_diff = 0.0f32;
         for i in 0..2 {
             for j in 0..2 {
                 let diff = (weights_after[i][j] - weights_before[i][j]).abs();
-                if diff > max_diff { max_diff = diff; }
+                if diff > max_diff {
+                    max_diff = diff;
+                }
             }
         }
-        
-        assert!(max_diff < 1.5, "Gradient clipping failed! Weights moved too far: {}", max_diff);
+
+        assert!(
+            max_diff < 1.5,
+            "Gradient clipping failed! Weights moved too far: {}",
+            max_diff
+        );
         Ok(())
     }
 }
@@ -494,11 +574,11 @@ mod delta_propagation_tests {
     fn test_spatial_delta_propagation_vs_fresh_matmul() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(4, 4, &device)?;
-        
+
         // Initialize temporal state to guarantee temporal_pred is active
         level.prev_beliefs = Tensor::ones((4, 1), candle_core::DType::F32, &device)?;
         level.temporal_weights = Tensor::eye(4, candle_core::DType::F32, &device)?;
-        
+
         let input1 = Tensor::full(1.0f32, (4, 1), &device)?;
         let input2 = Tensor::full(2.0f32, (4, 1), &device)?;
 
@@ -513,7 +593,7 @@ mod delta_propagation_tests {
         level_fresh.weights = level.weights.clone();
         level_fresh.temporal_weights = level.temporal_weights.clone();
         level_fresh.prev_beliefs = level.prev_beliefs.clone();
-        
+
         // Only predict input2 directly (no cache)
         level_fresh.predict(&input2)?;
         let pred_fresh = level_fresh.predictions.to_vec2::<f32>()?;
@@ -523,12 +603,18 @@ mod delta_propagation_tests {
         for i in 0..4 {
             for j in 0..1 {
                 let diff = (pred_with_delta[i][j] - pred_fresh[i][j]).abs();
-                if diff > max_diff { max_diff = diff; }
+                if diff > max_diff {
+                    max_diff = diff;
+                }
             }
         }
-        
+
         // If the temporal bug was still there, the difference would be massive
-        assert!(max_diff < 1e-4, "Delta propagation diverged from fresh matmul! Max diff: {}", max_diff);
+        assert!(
+            max_diff < 1e-4,
+            "Delta propagation diverged from fresh matmul! Max diff: {}",
+            max_diff
+        );
         Ok(())
     }
 }
@@ -542,24 +628,44 @@ mod aha_optimizer_tests {
     fn test_aha_optimizer_boosts_on_high_surprise() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(8, 4, &device)?;
-        
+
         // Маленькая surprise → маленький шаг
         let small_error = Tensor::full(0.1f32, (8, 1), &device)?;
         let next = Tensor::ones((4, 1), candle_core::DType::F32, &device)?;
-        
+
         let initial_weights = level.weights.clone();
         level.update_weights_exact(&small_error, &next, None)?;
-        let small_change = (level.weights.sub(&initial_weights)?.sqr()?.sum_all()?.to_scalar::<f32>()?).sqrt();
-        
+        let small_change = (level
+            .weights
+            .sub(&initial_weights)?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()?)
+        .sqrt();
+
         // Большая surprise → большой шаг
         let huge_error = Tensor::full(10.0f32, (8, 1), &device)?;
         level.weights = initial_weights.clone(); // сброс
         level.update_weights_exact(&huge_error, &next, None)?;
-        let huge_change = (level.weights.sub(&initial_weights)?.sqr()?.sum_all()?.to_scalar::<f32>()?).sqrt();
-        
-        assert!(huge_change > small_change * 3.0, "Aha! should boost update significantly. small_change={:.4}, huge_change={:.4}", small_change, huge_change);
-        println!("✅ Aha! Optimizer test passed: small_change={:.4}, huge_change={:.4}", small_change, huge_change);
-        
+        let huge_change = (level
+            .weights
+            .sub(&initial_weights)?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()?)
+        .sqrt();
+
+        assert!(
+            huge_change > small_change * 3.0,
+            "Aha! should boost update significantly. small_change={:.4}, huge_change={:.4}",
+            small_change,
+            huge_change
+        );
+        println!(
+            "✅ Aha! Optimizer test passed: small_change={:.4}, huge_change={:.4}",
+            small_change, huge_change
+        );
+
         Ok(())
     }
 
@@ -567,17 +673,24 @@ mod aha_optimizer_tests {
     fn test_normalized_hebbian_prevents_explosion() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(8, 4, &device)?;
-        
+
         // Огромный вход → без нормализации веса взорвались бы
         let huge_next = Tensor::full(1000.0f32, (4, 1), &device)?;
         let error = Tensor::ones((8, 1), candle_core::DType::F32, &device)?;
-        
+
         level.update_weights_exact(&error, &huge_next, None)?;
-        
+
         let weights_norm = level.weights.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-        assert!(weights_norm < 50.0, "Weights exploded! Norm: {}", weights_norm);
-        
-        println!("✅ Normalized Hebbian test passed: final norm={:.2}", weights_norm);
+        assert!(
+            weights_norm < 50.0,
+            "Weights exploded! Norm: {}",
+            weights_norm
+        );
+
+        println!(
+            "✅ Normalized Hebbian test passed: final norm={:.2}",
+            weights_norm
+        );
         Ok(())
     }
 }
@@ -590,12 +703,15 @@ mod neuron_protection_tests {
     fn test_check_if_random_detects_untrained() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let level = PCLevel::new(16, 8, &device)?;
-        
+
         // Freshly initialized level should be detected as random
         let is_random = level.check_if_random()?;
-        assert!(is_random, "Freshly initialized level should be detected as random");
+        assert!(
+            is_random,
+            "Freshly initialized level should be detected as random"
+        );
         println!("✅ Random detection test passed: fresh level correctly identified as random");
-        
+
         Ok(())
     }
 
@@ -603,22 +719,22 @@ mod neuron_protection_tests {
     fn test_freeze_neurons_prevents_updates() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let mut level = PCLevel::new(8, 4, &device)?;
-        
+
         // Freeze neuron 0 and 2
         level.freeze_neurons(&[0, 2])?;
-        
+
         // Store initial weights for protected columns
         let initial_weights = level.weights.clone();
-        
+
         // Apply a weight update
         let error = Tensor::full(1.0f32, (8, 1), &device)?;
         let next = Tensor::full(1.0f32, (4, 1), &device)?;
         level.update_weights_exact(&error, &next, None)?;
-        
+
         // Check that columns 0 and 2 didn't change
         let new_weights = level.weights;
         let diff = new_weights.sub(&initial_weights)?;
-        
+
         // For each protected neuron (column), all rows should have zero change
         for &col in &[0, 2] {
             for row in 0..8 {
@@ -627,11 +743,13 @@ mod neuron_protection_tests {
                 assert!(
                     change.abs() < 1e-4,
                     "Protected neuron (col={}, row={}) changed by {}",
-                    col, row, change
+                    col,
+                    row,
+                    change
                 );
             }
         }
-        
+
         // Unprotected columns (1, 3) should have changed
         let mut any_unprotected_changed = false;
         for &col in &[1, 3] {
@@ -644,9 +762,14 @@ mod neuron_protection_tests {
                 }
             }
         }
-        assert!(any_unprotected_changed, "Unprotected neurons should have changed");
-        
-        println!("✅ Neuron freezing test passed: protected neurons unchanged, unprotected neurons updated");
+        assert!(
+            any_unprotected_changed,
+            "Unprotected neurons should have changed"
+        );
+
+        println!(
+            "✅ Neuron freezing test passed: protected neurons unchanged, unprotected neurons updated"
+        );
         Ok(())
     }
 
@@ -654,11 +777,14 @@ mod neuron_protection_tests {
     fn test_freeze_mask_optional_by_default() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
         let level = PCLevel::new(8, 4, &device)?;
-        
+
         // freeze_mask should be None by default
-        assert!(level.freeze_mask.is_none(), "freeze_mask should be None by default");
+        assert!(
+            level.freeze_mask.is_none(),
+            "freeze_mask should be None by default"
+        );
         println!("✅ Optional freeze_mask test passed: default is None");
-        
+
         Ok(())
     }
 }

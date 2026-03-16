@@ -1,13 +1,13 @@
 // src/blossom_client.rs
 // Blossom client for Nostr's file storage protocol (NIP-94)
 
-use std::path::{Path, PathBuf};
 use std::io;
+use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use anyhow::Result;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -86,7 +86,8 @@ impl BlossomClient {
         info!("Uploading brain from {:?}", brain_path);
 
         // 1. Validate the brain file (safetensors).
-        let file_bytes = tokio::fs::read(brain_path).await
+        let file_bytes = tokio::fs::read(brain_path)
+            .await
             .map_err(|e| BlossomError::Io(e))?;
         let _ = SafeTensors::deserialize(&file_bytes)
             .map_err(|e| BlossomError::Safetensors(e.to_string()))?;
@@ -139,7 +140,8 @@ impl BlossomClient {
         let cached_path = self.cache_dir.join(format!("{}.safetensors", brain_id));
         if cached_path.exists() {
             // Verify hash.
-            let file_bytes = tokio::fs::read(&cached_path).await
+            let file_bytes = tokio::fs::read(&cached_path)
+                .await
                 .map_err(|e| BlossomError::Io(e))?;
             let mut hasher = Sha256::new();
             hasher.update(&file_bytes);
@@ -170,7 +172,8 @@ impl BlossomClient {
         }
 
         // 6. Save to cache.
-        tokio::fs::write(&cached_path, &bytes).await
+        tokio::fs::write(&cached_path, &bytes)
+            .await
             .map_err(|e| BlossomError::Io(e))?;
 
         info!("Brain downloaded successfully to {:?}", cached_path);
@@ -199,7 +202,10 @@ impl BlossomClient {
     async fn resolve_brain_url(&self, metadata: &BrainMetadata) -> Result<String, BlossomError> {
         // TODO: Extract URL from NIP-94 event's "url" tag.
         // For now, we return a dummy URL.
-        Ok(format!("https://example.com/brains/{}.safetensors", metadata.brain_id))
+        Ok(format!(
+            "https://example.com/brains/{}.safetensors",
+            metadata.brain_id
+        ))
     }
 
     /// Download bytes from a URL.
@@ -248,7 +254,7 @@ impl BlossomClient {
     ) -> Result<Vec<u8>, BlossomError> {
         let path = path.as_ref();
         let bytes = tokio::fs::read(path).await.map_err(BlossomError::Io)?;
-        
+
         // Validate hash if expected_brain_id is provided
         if let Some(expected) = expected_brain_id {
             let mut hasher = Sha256::new();
@@ -261,11 +267,11 @@ impl BlossomClient {
                 });
             }
         }
-        
+
         // Validate it's a valid safetensors file
         let _ = SafeTensors::deserialize(&bytes)
             .map_err(|e| BlossomError::Safetensors(e.to_string()))?;
-        
+
         Ok(bytes)
     }
 }

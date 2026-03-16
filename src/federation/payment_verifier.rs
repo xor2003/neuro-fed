@@ -1,13 +1,13 @@
 // src/payment_verifier.rs
 // Payment verification for wallet mode (Nostr zaps)
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, debug};
-use async_trait::async_trait;
+use tracing::{debug, info};
 
-use crate::types::PaymentVerification;
 use crate::federation_manager::PaymentVerifier as PaymentVerifierTrait;
+use crate::types::PaymentVerification;
 
 /// Errors that can occur during payment verification
 #[derive(Error, Debug, Clone)]
@@ -55,7 +55,7 @@ impl PaymentVerifier {
         required_confirmations: u32,
     ) -> Result<PaymentVerification, PaymentVerifierError> {
         info!("Verifying zap payment: {}", payment_proof);
-        
+
         // Parse payment proof (expected format: JSON with event ID, signature, amount, etc.)
         let proof: ZapProof = serde_json::from_str(payment_proof)
             .map_err(|e| PaymentVerifierError::InvalidProof(e.to_string()))?;
@@ -149,11 +149,9 @@ impl PaymentVerifierTrait for PaymentVerifier {
             .await
             .map_err(Into::into)
     }
-    
+
     async fn check_balance(&self, pubkey: &str) -> Result<u64, Box<dyn std::error::Error>> {
-        self.check_balance_impl(pubkey)
-            .await
-            .map_err(Into::into)
+        self.check_balance_impl(pubkey).await.map_err(Into::into)
     }
 }
 
@@ -183,7 +181,7 @@ mod tests {
             "timestamp": 1234567890,
             "metadata": {}
         }"#;
-        
+
         let result = verifier.verify_zap(proof, 1000, 1).await;
         assert!(result.is_ok());
         let verification = result.unwrap();
@@ -203,7 +201,7 @@ mod tests {
             "timestamp": 1234567890,
             "metadata": {}
         }"#;
-        
+
         let result = verifier.verify_zap(proof, 1000, 1).await;
         assert!(result.is_err());
         let err = result.unwrap_err();

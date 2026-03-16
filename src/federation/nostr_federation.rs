@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::federation_manager::FederationStrategy;
 
@@ -51,9 +51,13 @@ impl std::fmt::Display for NostrError {
             NostrError::InvalidEvent(msg) => write!(f, "Invalid event: {}", msg),
             NostrError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             NostrError::BrainShareError(msg) => write!(f, "Brain share error: {}", msg),
-            NostrError::PaymentVerificationError(msg) => write!(f, "Payment verification error: {}", msg),
+            NostrError::PaymentVerificationError(msg) => {
+                write!(f, "Payment verification error: {}", msg)
+            }
             NostrError::PoWVerificationError(msg) => write!(f, "PoW verification error: {}", msg),
-            NostrError::FederationStrategyError(msg) => write!(f, "Federation strategy error: {}", msg),
+            NostrError::FederationStrategyError(msg) => {
+                write!(f, "Federation strategy error: {}", msg)
+            }
         }
     }
 }
@@ -81,7 +85,7 @@ impl NostrFederation {
             federation_strategy: None,
         }
     }
-    
+
     pub fn new_with_strategy(config: NostrConfig, strategy: FederationStrategy) -> Self {
         let relays = config.relay_urls.clone();
         Self {
@@ -92,25 +96,25 @@ impl NostrFederation {
             federation_strategy: Some(strategy),
         }
     }
-    
+
     pub async fn publish_event(&self, event: NostrEvent) -> Result<(), NostrError> {
         info!("Publishing event: {:?}", event.kind);
         // TODO: Implement actual Nostr publishing
         Ok(())
     }
-    
+
     pub async fn subscribe_events(&self) -> Result<(), NostrError> {
         info!("Subscribing to events...");
         // TODO: Implement actual Nostr subscription
         unimplemented!()
     }
-    
+
     pub async fn process_incoming_event(&self, event: NostrEvent) -> Result<(), NostrError> {
         debug!("Processing incoming event: {:?}", event.kind);
         // TODO: Implement event processing
         Ok(())
     }
-    
+
     /// Publish a NIP‑94 brain share event.
     pub async fn publish_brain_event(
         &self,
@@ -123,14 +127,14 @@ impl NostrFederation {
         // For now, return a dummy event ID.
         Ok(format!("nip94_{}", brain_id))
     }
-    
+
     /// Subscribe to NIP‑94 brain share events.
     pub async fn subscribe_to_brain_events(&self) -> Result<(), NostrError> {
         info!("Subscribing to brain share events (NIP-94)");
         // TODO: Implement subscription filter for kind 1064 (NIP-94).
         Ok(())
     }
-    
+
     /// Process an incoming brain share event (NIP-94).
     pub async fn process_brain_event(&self, event: NostrEvent) -> Result<(), NostrError> {
         debug!("Processing brain share event: {}", event.id);
@@ -143,7 +147,7 @@ impl NostrFederation {
         // Then trigger download via BlossomClient.
         Ok(())
     }
-    
+
     pub fn shutdown(&self) {
         self.shutdown_signal.store(true, Ordering::SeqCst);
     }
@@ -152,7 +156,7 @@ impl NostrFederation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_event_publishing() {
         let config = NostrConfig {
@@ -162,7 +166,7 @@ mod tests {
             max_batch_size: 100,
             publish_interval: 60,
         };
-        
+
         let federation = NostrFederation::new(config);
         let event = NostrEvent {
             id: "test-event-1".to_string(),
@@ -170,23 +174,23 @@ mod tests {
             kind: EventKind::SystemMessage,
             timestamp: 1234567890,
         };
-        
+
         let result = federation.publish_event(event).await;
         assert!(result.is_ok());
     }
-    
+
     #[tokio::test]
     async fn test_event_processing() {
         let config = NostrConfig::default();
         let federation = NostrFederation::new(config);
-        
+
         let event = NostrEvent {
             id: "test-event-2".to_string(),
             content: "Test content".to_string(),
             kind: EventKind::DeltaUpdate,
             timestamp: 1234567890,
         };
-        
+
         let result = federation.process_incoming_event(event).await;
         assert!(result.is_ok());
     }
