@@ -212,10 +212,10 @@ pub enum ThoughtOp {
     Validate,   // <-- НОВОЕ
     Iterate,
     Check,
-    Decide,     // <-- НОВОЕ
+    Decide, // <-- НОВОЕ
     Compute,
     Aggregate,
-    HandleError,// <-- НОВОЕ
+    HandleError, // <-- НОВОЕ
     Return,
     Explain,
     EOF,

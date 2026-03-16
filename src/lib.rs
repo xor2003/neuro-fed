@@ -10,6 +10,7 @@ pub mod chat;
 pub mod config;
 pub mod federation; // Moved: federation-related modules
 pub mod knowledge_filter;
+pub mod learning_log;
 pub mod metrics;
 pub mod ml_engine;
 pub mod model_manager;
@@ -25,7 +26,6 @@ pub mod privacy; // Moved: privacy-related modules
 pub mod semantic_cache;
 pub mod sleep_phase;
 pub mod types;
-pub mod learning_log;
 pub mod ui;
 
 // Backward compatibility aliases for moved modules

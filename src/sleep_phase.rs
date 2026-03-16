@@ -1,9 +1,9 @@
 // src/sleep_phase.rs
 // Offline Consolidation: Fast-to-Slow memory transfer and Chunk Discovery
 
-use crate::{learning_log::append_learning_detail, pc_decoder::ThoughtDecoder};
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::types::{CognitiveDictionary, Episode};
+use crate::{learning_log::append_learning_detail, pc_decoder::ThoughtDecoder};
 use candle_core::{Device, Tensor};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -132,9 +132,7 @@ impl SleepManager {
         if !detail_logs.is_empty() {
             detail_logs.push(format!(
                 "Sleep Summary: episodes={}, learned_chunks={}, total_loss={:.4}",
-                learned_count,
-                learned_count,
-                total_loss
+                learned_count, learned_count, total_loss
             ));
             let log_body = detail_logs.join("\n\n---\n\n");
             append_learning_detail(&log_body);
@@ -347,7 +345,10 @@ mod deep_consolidation_tests {
         let test_belief = Tensor::randn(0f32, 1.0, (2, 1), &Device::Cpu).unwrap();
         // Train it on the newly discovered token ID (8)
         let new_token_id = (new_dict_size - 1) as u32;
-        let train_res = decoder.write().await.train_step(&test_belief, &[new_token_id], 0.01);
+        let train_res = decoder
+            .write()
+            .await
+            .train_step(&test_belief, &[new_token_id], 0.01);
         assert!(
             train_res.is_ok(),
             "BPTT Panicked after matrix resize! Dimension mismatch likely."

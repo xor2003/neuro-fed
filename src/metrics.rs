@@ -26,6 +26,7 @@ pub const DOCUMENT_PROCESSING_PERCENT: &str = "document.processing_percent";
 pub const DOCUMENT_PARAGRAPHS_PER_SECOND: &str = "document.paragraphs_per_second";
 pub const DOCUMENT_LEARNING_TIME_SECONDS: &str = "document.learning_time_seconds";
 pub const DOCUMENT_FILES_PROCESSED_TOTAL: &str = "document.files_processed_total";
+pub const THOUGHT_DECODER_LOSS: &str = "thought_decoder.loss.current";
 
 /// Тип значения метрики
 #[derive(Debug, Clone)]

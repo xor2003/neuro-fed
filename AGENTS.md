@@ -186,6 +186,23 @@ cargo outdated
 cargo doc --open
 ```
 
+### Investigate learning
+
+Execute the following command to troubleshoot learning:
+ rm -f neurofed.db detail.log && cargo build && timeout 180 target/debug/neuro-fed-node 2>&1 | tee output.log ; cat detail.log
+
+### Guided replay benchmark
+
+Use the dedicated learning benchmark binary and helper script to rerun specific HumanEval/GSM8K slices and collect plan vs canonical comparisons. Example workflow:
+```bash
+# Rerun only the targeted dataset, then export enriched CSV data
+rm -f neurofed.db detail.log && \
+  cargo build && \
+  cargo run --bin learning_benchmark -- --study-paths study/human-eval/data/HumanEval.jsonl --output learning_feedback.csv --skip-run=false && \
+  python scripts/collect_learning_feedback.py --log detail.log --output learning_feedback.csv
+```
+Adjust `--study-paths` (comma-separated) to focus on other subsets; guided replay will automatically trigger for HumanEval/48 and /72 when loss exceeds 150.
+
 ### Testing
 ```bash
 # Run all tests

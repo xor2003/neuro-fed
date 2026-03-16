@@ -1,28 +1,31 @@
+use crate::learning_log::append_learning_detail;
+use crate::ml_engine::MLEngine;
+use crate::pc_decoder::ThoughtDecoder;
+use crate::pc_hierarchy::PredictiveCoding;
+use crate::persistence::PCPersistence;
+use crate::types::{CognitiveDictionary, LastStudyTask, StudyState, ThoughtOp};
+use candle_core::Tensor;
+use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use candle_core::Tensor;
-use sha2::{Digest, Sha256};
-use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use walkdir::WalkDir;
-use crate::ml_engine::MLEngine;
-use crate::pc_decoder::ThoughtDecoder;
-use crate::pc_hierarchy::PredictiveCoding;
-use crate::persistence::PCPersistence;
-use crate::types::{CognitiveDictionary, ThoughtOp, StudyState, LastStudyTask};
-use crate::learning_log::append_learning_detail;
-use serde_json::Value;
+
+struct GuidedReplayInfo {
+    plan: String,
+    loss: f32,
+}
 
 // NEW: For Parquet support
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-
-
 
 pub struct BootstrapManager {
     ml_engine: Arc<RwLock<MLEngine>>,
@@ -69,7 +72,7 @@ impl BootstrapManager {
         let mut all_files = Vec::new();
         for path_str in &self.config.document_paths {
             let path = Path::new(path_str);
-            
+
             // --- 🔴 MODIFIED BLOCK START ---
             if path.is_dir() {
                 // Use WalkDir to find all files recursively
@@ -86,10 +89,14 @@ impl BootstrapManager {
         }
 
         let bar = ProgressBar::new(all_files.len() as u64);
-        bar.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("#>-"));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
 
         let engine = self.ml_engine.read().await;
         let mut pc = self.pc_hierarchy.write().await;
@@ -100,22 +107,22 @@ impl BootstrapManager {
             tracing::debug!("📖 Processing file: {}", file_name);
 
             let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            
+
             // Handle different file types
             let text_chunks: Vec<String> = match ext {
                 "parquet" => extract_rows_from_parquet(&file_path),
-                "pdf" => {
-                    match std::fs::read(&file_path) {
-                        Ok(bytes) => extract_text_from_pdf(&bytes).map(|s| vec![s]).unwrap_or_default(),
-                        Err(_) => vec![],
-                    }
-                }
-                "epub" => extract_text_from_epub(&file_path).map(|s| vec![s]).unwrap_or_default(),
-                "txt" | "md" => {
-                    std::fs::read_to_string(&file_path)
+                "pdf" => match std::fs::read(&file_path) {
+                    Ok(bytes) => extract_text_from_pdf(&bytes)
                         .map(|s| vec![s])
-                        .unwrap_or_default()
-                }
+                        .unwrap_or_default(),
+                    Err(_) => vec![],
+                },
+                "epub" => extract_text_from_epub(&file_path)
+                    .map(|s| vec![s])
+                    .unwrap_or_default(),
+                "txt" | "md" => std::fs::read_to_string(&file_path)
+                    .map(|s| vec![s])
+                    .unwrap_or_default(),
                 "jsonl" => extract_lines_from_jsonl(&file_path),
                 _ => {
                     warn!("Unsupported file type: {}. Skipping.", ext);
@@ -123,8 +130,12 @@ impl BootstrapManager {
                 }
             };
 
-            tracing::debug!("📖 Extracted {} text chunks from {}", text_chunks.len(), file_name);
-            
+            tracing::debug!(
+                "📖 Extracted {} text chunks from {}",
+                text_chunks.len(),
+                file_name
+            );
+
             for (idx, raw_text) in text_chunks.iter().enumerate() {
                 // Log position information based on file type
                 match ext {
@@ -144,20 +155,47 @@ impl BootstrapManager {
                         tracing::info!("📄 Studying text chunk {}", idx + 1);
                     }
                 }
-                
-                let paragraphs = chunk_text(&raw_text);
+
+                let mut paragraphs = chunk_text(&raw_text);
+                if ext == "jsonl" && !paragraphs.is_empty() {
+                    let mut expanded = Vec::new();
+                    for paragraph in paragraphs.drain(..) {
+                        if paragraph.len() > 1024 {
+                            tracing::warn!(
+                                "JSONL line {} chunk {} chars; applying sliding window",
+                                idx + 1,
+                                paragraph.len()
+                            );
+                            for window in paragraph.as_bytes().chunks(512) {
+                                let chunk = String::from_utf8_lossy(window).trim().to_string();
+                                if chunk.len() > 20 {
+                                    expanded.push(chunk);
+                                }
+                            }
+                        } else {
+                            expanded.push(paragraph);
+                        }
+                    }
+                    paragraphs = expanded;
+                }
                 if ext == "jsonl" {
-                    let discovery_msg = format!(
-                        "JSONL discovery: line {} -> {}",
-                        idx + 1,
-                        raw_text
-                    );
+                    let discovery_msg =
+                        format!("JSONL discovery: line {} -> {}", idx + 1, raw_text);
                     tracing::info!("{}", discovery_msg);
                     append_learning_detail(&discovery_msg);
                 }
                 tracing::debug!("📖 Chunk {} has {} paragraphs", idx, paragraphs.len());
-                
+
                 for (paragraph_idx, chunk) in paragraphs.iter().enumerate() {
+                    if ext == "jsonl" {
+                        tracing::debug!(
+                            "JSONL chunk {} length {} (line {}/{})",
+                            paragraph_idx + 1,
+                            chunk.len(),
+                            idx + 1,
+                            text_chunks.len()
+                        );
+                    }
                     if chunk.len() > 50 || ext == "jsonl" {
                         let preview = if chunk.len() > 100 {
                             let end = 100.min(chunk.len());
@@ -165,25 +203,38 @@ impl BootstrapManager {
                         } else {
                             chunk.clone()
                         };
-                        tracing::debug!("📖 Learning paragraph {} ({} chars): {}",
-                            paragraph_idx, chunk.len(), preview);
-                        
+                        tracing::debug!(
+                            "📖 Learning paragraph {} ({} chars): {}",
+                            paragraph_idx,
+                            chunk.len(),
+                            preview
+                        );
+
                         let sequence_tensor = engine.process_text_sequence(&chunk).await?;
-                        
+
                         // Clear temporal state between chunks to prevent "thought bleeding"
                         pc.reset_state()?;
-                        
+
                         let learn_result = pc.learn_sequence(&sequence_tensor, None);
                         if let Ok(stats) = &learn_result {
                             let n_levels = stats.level_surprises.len();
                             if n_levels >= 2 {
                                 let top_l = n_levels.saturating_sub(2);
-                                let abstraction_ratio = 1.0 - (stats.level_surprises[top_l] / stats.level_surprises[0].max(1.0));
+                                let abstraction_ratio = 1.0
+                                    - (stats.level_surprises[top_l]
+                                        / stats.level_surprises[0].max(1.0));
 
                                 if abstraction_ratio < 0.2 {
-                                    warn!("📉 Low Study Efficiency ({:.1}%). Ideas are too complex for {} layers.", abstraction_ratio * 100.0, n_levels);
+                                    warn!(
+                                        "📉 Low Study Efficiency ({:.1}%). Ideas are too complex for {} layers.",
+                                        abstraction_ratio * 100.0,
+                                        n_levels
+                                    );
                                 } else {
-                                    tracing::debug!("📊 Study Efficiency: {:.1}% (abstraction ratio)", abstraction_ratio * 100.0);
+                                    tracing::debug!(
+                                        "📊 Study Efficiency: {:.1}% (abstraction ratio)",
+                                        abstraction_ratio * 100.0
+                                    );
                                 }
                             }
                             if ext == "jsonl" {
@@ -197,10 +248,7 @@ impl BootstrapManager {
                             }
                         }
                         if ext == "jsonl" && learn_result.is_err() {
-                            let fail_msg = format!(
-                                "JSONL line {} learning failed",
-                                idx + 1
-                            );
+                            let fail_msg = format!("JSONL line {} learning failed", idx + 1);
                             tracing::warn!("{}", fail_msg);
                             append_learning_detail(&fail_msg);
                         }
@@ -217,18 +265,22 @@ impl BootstrapManager {
     pub async fn run_synthetic_training(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("🚀 Training Thought Decoder...");
         let synthetic_data = self.generate_synthetic_decoder_dataset().await?;
+        info!(
+            "Synthetic decoder dataset contains {} scenarios.",
+            synthetic_data.len()
+        );
         let mut decoder = self.thought_decoder.write().await;
 
         let max_epochs = self.config.max_epochs.max(100);
         let mut lr = self.config.learning_rate.max(0.01) as f64;
-        
+
         // 🚀 FIX #11: Adaptive Learning Rate
         let mut best_loss = f32::INFINITY;
         let mut patience = 0;
         const PATIENCE_LIMIT: usize = 10;
         const LR_DECAY_FACTOR: f64 = 0.5;
         const MIN_LR: f64 = 1e-5;
-        
+
         for epoch in 0..max_epochs {
             let mut total_loss = 0.0;
             for (belief, seq) in &synthetic_data {
@@ -236,7 +288,8 @@ impl BootstrapManager {
                 total_loss += loss;
             }
             let avg_loss = total_loss / synthetic_data.len() as f32;
-            
+            crate::gauge!(crate::metrics::THOUGHT_DECODER_LOSS, avg_loss as f64);
+
             // Adaptive learning rate logic
             if avg_loss < best_loss - 1e-4 {
                 // Improvement
@@ -247,19 +300,39 @@ impl BootstrapManager {
                 if patience >= PATIENCE_LIMIT && lr > MIN_LR {
                     // Reduce learning rate
                     lr = (lr * LR_DECAY_FACTOR).max(MIN_LR);
-                    info!("📉 Loss plateaued at epoch {}, reducing learning rate to {:.6}", epoch, lr);
+                    info!(
+                        "📉 Loss plateaued at epoch {}, reducing learning rate to {:.6}",
+                        epoch, lr
+                    );
                     patience = 0; // reset patience after LR reduction
                 }
             }
-            
+            if avg_loss.is_finite() {
+                info!(
+                    "Epoch {}: Loss = {:.4}, LR = {:.6}, best_loss = {:.4}, plateau_count = {}",
+                    epoch, avg_loss, lr, best_loss, patience
+                );
+            } else {
+                warn!(
+                    "Epoch {} produced non-finite loss, aborting synthetic training.",
+                    epoch
+                );
+                break;
+            }
+
             if epoch % 20 == 0 {
-                 info!("Epoch {}: Loss = {:.4}, LR = {:.6}", epoch, avg_loss, lr);
+                info!(
+                    "Epoch {} checkpointed: Loss = {:.4}, LR = {:.6}",
+                    epoch, avg_loss, lr
+                );
             }
         }
         Ok(())
     }
 
-    async fn generate_synthetic_decoder_dataset(&self) -> Result<Vec<(Tensor, Vec<u32>)>, Box<dyn std::error::Error>> {
+    async fn generate_synthetic_decoder_dataset(
+        &self,
+    ) -> Result<Vec<(Tensor, Vec<u32>)>, Box<dyn std::error::Error>> {
         let engine = self.ml_engine.read().await;
         let dict = self.dict.read().await;
         let mut pc = self.pc_hierarchy.write().await;
@@ -269,16 +342,87 @@ impl BootstrapManager {
         // If it only knows 1 example, it hallucinates for everything else.
         // 🔴 FIX: Give the PC Brain a much broader foundational education.
         // If it only knows 1 example, it hallucinates for everything else.
-        let scenarios = vec![
-            ("Solve 2x = 10", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Compute], dict.op_to_id[&ThoughtOp::EOF]]),
-            ("Write a Python script to reverse a string", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Iterate], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
-            ("Explain the theory of relativity", vec![dict.op_to_id[&ThoughtOp::Explain], dict.op_to_id[&ThoughtOp::EOF]]),
-            ("Check if a number is prime", vec![dict.op_to_id[&ThoughtOp::Define], dict.op_to_id[&ThoughtOp::Check], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
-            ("Summarize this document", vec![dict.op_to_id[&ThoughtOp::Aggregate], dict.op_to_id[&ThoughtOp::Explain], dict.op_to_id[&ThoughtOp::EOF]]),
-            ("Calculate the square root of 144", vec![dict.op_to_id[&ThoughtOp::Compute], dict.op_to_id[&ThoughtOp::Return], dict.op_to_id[&ThoughtOp::EOF]]),
+        let mut scenarios: Vec<(&'static str, Vec<u32>)> = vec![
+            (
+                "Solve 2x = 10",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Define],
+                    dict.op_to_id[&ThoughtOp::Compute],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Write a Python script to reverse a string",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Define],
+                    dict.op_to_id[&ThoughtOp::Iterate],
+                    dict.op_to_id[&ThoughtOp::Return],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Explain the theory of relativity",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Explain],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Check if a number is prime",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Define],
+                    dict.op_to_id[&ThoughtOp::Check],
+                    dict.op_to_id[&ThoughtOp::Return],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Summarize this document",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Aggregate],
+                    dict.op_to_id[&ThoughtOp::Explain],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Calculate the square root of 144",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Compute],
+                    dict.op_to_id[&ThoughtOp::Return],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
         ];
+        // Reinforce these scenarios by repeating them in both orders and adding variants
+        let additional: Vec<(&'static str, Vec<u32>)> = vec![
+            (
+                "Check if a number is prime quickly",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Define],
+                    dict.op_to_id[&ThoughtOp::Compute],
+                    dict.op_to_id[&ThoughtOp::Return],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+            (
+                "Describe how to write a Python script",
+                vec![
+                    dict.op_to_id[&ThoughtOp::Explain],
+                    dict.op_to_id[&ThoughtOp::Aggregate],
+                    dict.op_to_id[&ThoughtOp::EOF],
+                ],
+            ),
+        ];
+        scenarios.extend(additional);
+        scenarios.extend(scenarios.clone());
 
-        for (query, seq) in scenarios {
+        for (query, seq) in scenarios.iter().enumerate().flat_map(|(i, (q, seq))| {
+            let mut copies = vec![(*q, seq.clone())];
+            if i % 2 == 0 {
+                copies.push((*q, seq.clone()));
+            }
+            copies
+        }) {
             let emb = engine.process_text(query).await?;
             pc.learn(&emb, None)?;
             let belief = pc.levels.last().unwrap().beliefs.flatten_all()?;
@@ -286,78 +430,105 @@ impl BootstrapManager {
         }
         Ok(dataset)
     }
-    
+
     /// Parses a single file, computes its hash, and returns its text chunks if it needs studying.
-    pub async fn process_and_check_file(&self, file_path: &Path, persistence: &PCPersistence) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn process_and_check_file(
+        &self,
+        file_path: &Path,
+        persistence: &PCPersistence,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let content_bytes = std::fs::read(file_path)?;
-        
+
         let mut hasher = Sha256::new();
         hasher.update(&content_bytes);
         let content_hash = format!("{:x}", hasher.finalize());
-        
+
         // 🔴 FIX: UNCOMMENT THIS BLOCK
-        if persistence.is_document_studied(&file_path.to_string_lossy(), &content_hash).await? {
+        if persistence
+            .is_document_studied(&file_path.to_string_lossy(), &content_hash)
+            .await?
+        {
             tracing::info!("✅ Skipping already studied file: {:?}", file_path);
             return Ok(None);
         }
         // -----------------------------
-        
+
         let text_chunks: Vec<String> = match ext {
             "parquet" => {
                 let rows = extract_rows_from_parquet(file_path);
-                info!("📊 Parquet file {} contains {} rows", file_path.display(), rows.len());
+                info!(
+                    "📊 Parquet file {} contains {} rows",
+                    file_path.display(),
+                    rows.len()
+                );
                 rows
             }
             "jsonl" => {
                 let lines = extract_lines_from_jsonl(file_path);
-                info!("📄 JSONL file {} contains {} lines", file_path.display(), lines.len());
+                info!(
+                    "📄 JSONL file {} contains {} lines",
+                    file_path.display(),
+                    lines.len()
+                );
                 lines
             }
-            "pdf" => {
-                match extract_text_from_pdf(&content_bytes) {
-                    Ok(text) => {
-                        info!("📚 PDF file {} extracted {} characters", file_path.display(), text.len());
-                        vec![text]
-                    }
-                    Err(e) => {
-                        error!("Failed to extract text from PDF: {}", e);
-                        vec![]
-                    }
+            "pdf" => match extract_text_from_pdf(&content_bytes) {
+                Ok(text) => {
+                    info!(
+                        "📚 PDF file {} extracted {} characters",
+                        file_path.display(),
+                        text.len()
+                    );
+                    vec![text]
                 }
-            }
-            "epub" => {
-                match extract_text_from_epub(file_path) {
-                    Ok(text) => {
-                        info!("📖 EPUB file {} extracted {} characters", file_path.display(), text.len());
-                        vec![text]
-                    }
-                    Err(e) => {
-                        error!("Failed to extract text from EPUB: {}", e);
-                        vec![]
-                    }
+                Err(e) => {
+                    error!("Failed to extract text from PDF: {}", e);
+                    vec![]
                 }
-            }
-            "txt" | "md" => {
-                match String::from_utf8(content_bytes) {
-                    Ok(text) => {
-                        info!("📝 Text file {} contains {} characters", file_path.display(), text.len());
-                        vec![text]
-                    }
-                    Err(e) => {
-                        error!("Failed to decode text file as UTF-8: {}", e);
-                        vec![]
-                    }
+            },
+            "epub" => match extract_text_from_epub(file_path) {
+                Ok(text) => {
+                    info!(
+                        "📖 EPUB file {} extracted {} characters",
+                        file_path.display(),
+                        text.len()
+                    );
+                    vec![text]
                 }
-            }
+                Err(e) => {
+                    error!("Failed to extract text from EPUB: {}", e);
+                    vec![]
+                }
+            },
+            "txt" | "md" => match String::from_utf8(content_bytes) {
+                Ok(text) => {
+                    info!(
+                        "📝 Text file {} contains {} characters",
+                        file_path.display(),
+                        text.len()
+                    );
+                    vec![text]
+                }
+                Err(e) => {
+                    error!("Failed to decode text file as UTF-8: {}", e);
+                    vec![]
+                }
+            },
             _ => vec![],
         };
-        
-        persistence.mark_document_as_studied(&file_path.to_string_lossy(), &content_hash).await?;
+
+        persistence
+            .mark_document_as_studied(&file_path.to_string_lossy(), &content_hash)
+            .await?;
         Ok(Some(text_chunks))
     }
 
-    pub async fn study_file_chunks(&self, file_path: &Path, text_chunks: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn study_file_chunks(
+        &self,
+        file_path: &Path,
+        text_chunks: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let start_time = Instant::now();
         let file_name = file_path.to_string_lossy().to_string();
 
@@ -402,17 +573,24 @@ impl BootstrapManager {
 
         // 2. Determine how many pieces to split the book into (based on actual Rayon threads)
         let num_threads = rayon::current_num_threads().max(1);
-        
+
         // Calculate the chunk size to evenly distribute paragraphs across all available threads
         let chunk_size = (all_paragraphs.len() as f64 / num_threads as f64).ceil() as usize;
         let chunk_size = chunk_size.max(1);
-        
-        let segments: Vec<Vec<String>> = all_paragraphs.chunks(chunk_size).map(|c| c.to_vec()).collect();
-        
+
+        let segments: Vec<Vec<String>> = all_paragraphs
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect();
+
         let total_paragraphs = all_paragraphs.len();
-        tracing::info!("📚 Distributing {} paragraphs into {} parallel segments across {} CPU cores...",
-            total_paragraphs, segments.len(), num_threads);
-        
+        tracing::info!(
+            "📚 Distributing {} paragraphs into {} parallel segments across {} CPU cores...",
+            total_paragraphs,
+            segments.len(),
+            num_threads
+        );
+
         // Record initial metrics
         crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, 0.0);
         crate::increment_counter!(crate::metrics::DOCUMENT_FILES_PROCESSED_TOTAL, 1);
@@ -427,7 +605,7 @@ impl BootstrapManager {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicUsize, Ordering};
             use std::sync::Arc;
-            
+
             // Progress tracking: atomic counter for processed paragraphs
             let processed_counter = Arc::new(AtomicUsize::new(0));
 
@@ -436,11 +614,11 @@ impl BootstrapManager {
 
                 // Create a strictly thread-local clone of the engine
                 let local_engine = engine_owned.clone();
-                
+
                 // We need a tiny local async runtime to call process_text_sequence
                 // because we are currently inside a synchronous Rayon thread.
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-                
+
                 // Create an isolated clone of the PC Brain for this specific CPU core
                 let mut local_pc = PredictiveCoding::new_with_device(pc_config.clone(), device.clone()).ok()?;
                 local_pc.load_level_weights(base_weights.clone()).ok()?;
@@ -455,36 +633,29 @@ impl BootstrapManager {
                     local_pc.reset_state().ok()?;
 
                     let learn_result = local_pc.learn_sequence(&sequence_tensor, None);
-                    if let Ok(stats) = &learn_result {
-                        let full_input = p.clone();
-                        let answer_text = serde_json::from_str::<Value>(&full_input)
-                            .ok()
-                            .and_then(|v| v.get("canonical_solution").and_then(Value::as_str).map(str::to_string))
-                            .map(|s| {
-                                    s
-                            })
-                            .unwrap_or_else(|| "<no canonical solution>".to_string());
-                        let belief = local_pc.levels.last().unwrap().beliefs.clone();
+        if let Ok(stats) = &learn_result {
+            let full_input = p.clone();
+            let parsed_question = serde_json::from_str::<Value>(&full_input).ok();
+            let canonical_solution_value = parsed_question
+                .as_ref()
+                .and_then(|v| v.get("canonical_solution"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let answer_text = canonical_solution_value
+                .clone()
+                .unwrap_or_else(|| "<no canonical solution>".to_string());
+            let task_id = parsed_question
+                .as_ref()
+                .and_then(|v| v.get("task_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let belief = local_pc.levels.last().unwrap().beliefs.clone();
 
-                        let decoded_output = {
-                            let decoder_guard = decoder_arc_for_blocking.blocking_read();
-                            let dict_guard = dict_arc_for_blocking.blocking_read();
-                            match decoder_guard.decode_sequence(&belief, 8, 4) {
-                                Ok(seq) if !seq.is_empty() => {
-                                    let thoughts: Vec<String> = seq
-                                        .iter()
-                                        .map(|id| dict_guard.get_op(*id).to_string())
-                                        .collect();
-                                    if thoughts.is_empty() {
-                                        "<decoder_empty>".to_string()
-                                    } else {
-                                        thoughts.join(" -> ")
-                                    }
-                                }
-                                Ok(_) => "<decoder_empty>".to_string(),
-                                Err(e) => format!("<decoder_error: {}>", e),
-                            }
-                        };
+                        let decoded_output = decode_plan_from_belief(
+                            &belief,
+                            &decoder_arc_for_blocking,
+                            &dict_arc_for_blocking,
+                        );
 
                         let mut trajectory_parts = Vec::new();
                         if !stats.free_energy_history.is_empty() {
@@ -518,14 +689,54 @@ impl BootstrapManager {
                                 .join(", ")
                         );
 
+                        let mut guided_replay_info = None;
+                        if should_trigger_guided_replay(
+                            task_id.as_deref(),
+                            canonical_solution_value.as_deref(),
+                            stats.total_surprise,
+                        ) {
+                            if let Some(canonical) = canonical_solution_value.as_deref() {
+                                if let Ok(canonical_tensor) =
+                                    rt.block_on(local_engine.process_text_sequence(canonical))
+                                {
+                                    local_pc.reset_state().ok();
+                                    if let Ok(guided_stats) =
+                                        local_pc.learn_sequence(&canonical_tensor, None)
+                                    {
+                                        let guided_belief =
+                                            local_pc.levels.last().unwrap().beliefs.clone();
+                                        let guided_plan = decode_plan_from_belief(
+                                            &guided_belief,
+                                            &decoder_arc_for_blocking,
+                                            &dict_arc_for_blocking,
+                                        );
+                                        guided_replay_info = Some(GuidedReplayInfo {
+                                            plan: guided_plan,
+                                            loss: guided_stats.total_surprise,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        let guided_replay_log = if let Some(info) = &guided_replay_info {
+                            format!(
+                                "\nGuided Replay: yes\nGuided Replay Loss: {:.4}\nGuided Replay Plan: {}",
+                                info.loss, info.plan
+                            )
+                        } else {
+                            "\nGuided Replay: no".to_string()
+                        };
+
                         let learning_msg = format!(
-                            "Bootstrap learning\nQuestion: {}\nAnswer: {}\nDecoded Output: {}\nTrajectory: {}\nLoss: {:.4}\nResults: {}",
+                            "Bootstrap learning\nQuestion: {}\nAnswer: {}\nDecoded Output: {}\nTrajectory: {}\nLoss: {:.4}\nResults: {}{}",
                             full_input,
                             answer_text,
                             decoded_output,
                             trajectory,
                             stats.total_surprise,
-                            results
+                            results,
+                            guided_replay_log
                         );
                         append_learning_detail(&learning_msg);
                         tracing::info!("🧠 Learned paragraph (loss {:.4})", stats.total_surprise);
@@ -537,25 +748,25 @@ impl BootstrapManager {
                         append_learning_detail(&fail_msg);
                         tracing::warn!("{}", fail_msg);
                     }
-                    
+
                     // Update progress counter
                     let processed = processed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let percent = (processed as f64 * 100.0) / (total_paragraphs as f64);
-                    
+
                     // Log frequently to the console (every 5 paragraphs or start/end)
                     if processed % 5 == 0 || processed == 1 || processed == total_paragraphs {
                         tracing::info!("📊 Processing: {}/{} paragraphs ({:.1}%)", processed, total_paragraphs, percent);
                     }
-                    
+
                     // Record internal metrics
                     crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, percent);
                     crate::increment_counter!(crate::metrics::DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL, 1);
-                    
+
                     // 🔴 FIX: Update shared study state IMMEDIATELY for UI responsiveness.
                     // We use blocking_write() which safely locks the state synchronously from the Rayon OS thread.
                     study_state_clone_for_blocking.blocking_write().progress_percent = percent;
                 }
-                
+
                 // Return the brain weights that THIS specific core learned
                 local_pc.get_level_weights().ok()
             }).collect::<Vec<_>>()
@@ -568,9 +779,12 @@ impl BootstrapManager {
 
         // 4. 🔴 KNOWLEDGE MERGE: Federated Averaging
         // We take the brains from all CPU cores and mathematically average them.
-        tracing::info!("🧠 Merging learned knowledge from {} parallel cores...", all_learned_weights.len());
+        tracing::info!(
+            "🧠 Merging learned knowledge from {} parallel cores...",
+            all_learned_weights.len()
+        );
         let mut main_pc = main_pc_lock.write().await;
-        
+
         if !all_learned_weights.is_empty() {
             let num_models = all_learned_weights.len() as f32;
             let n_levels = main_pc.levels.len();
@@ -579,11 +793,13 @@ impl BootstrapManager {
                 // Get the total number of elements in this level's weight matrix
                 let elem_count = main_pc.levels[l].weights.flatten_all()?.elem_count();
                 let mut avg_weights_l: Vec<f32> = vec![0.0; elem_count];
-                
+
                 // Sum all weights from all parallel threads
                 for model_weights in &all_learned_weights {
                     if let Some(level_weights) = model_weights.get(l) {
-                        for (avg_w, new_w) in avg_weights_l.iter_mut().zip(level_weights.weights.iter()) {
+                        for (avg_w, new_w) in
+                            avg_weights_l.iter_mut().zip(level_weights.weights.iter())
+                        {
                             *avg_w += *new_w;
                         }
                     }
@@ -599,12 +815,18 @@ impl BootstrapManager {
             }
             tracing::info!("✅ Parallel knowledge merged successfully.");
         }
-        
+
         // Record completion metrics
         crate::gauge!(crate::metrics::DOCUMENT_PROCESSING_PERCENT, 100.0);
-        crate::increment_counter!(crate::metrics::DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL, total_paragraphs as u64);
-        tracing::info!("📈 Document processing complete: {} paragraphs learned", total_paragraphs);
-        
+        crate::increment_counter!(
+            crate::metrics::DOCUMENT_PARAGRAPHS_PROCESSED_TOTAL,
+            total_paragraphs as u64
+        );
+        tracing::info!(
+            "📈 Document processing complete: {} paragraphs learned",
+            total_paragraphs
+        );
+
         // 🔴 3. Update final study state
         {
             let duration_seconds = start_time.elapsed().as_secs_f64();
@@ -616,9 +838,11 @@ impl BootstrapManager {
                 paragraphs_processed: total_paragraphs as u64,
                 duration_seconds,
             });
-            tracing::debug!("✅ Study state updated: is_studying=false, progress=100%, last_task recorded");
+            tracing::debug!(
+                "✅ Study state updated: is_studying=false, progress=100%, last_task recorded"
+            );
         }
-        
+
         Ok(())
     }
 }
@@ -629,18 +853,28 @@ impl BootstrapManager {
 fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) => { error!("Failed to open parquet: {}", e); return vec![]; }
+        Err(e) => {
+            error!("Failed to open parquet: {}", e);
+            return vec![];
+        }
     };
 
     let reader = match SerializedFileReader::new(file) {
         Ok(r) => r,
-        Err(e) => { error!("Failed to read parquet metadata: {}", e); return vec![]; }
+        Err(e) => {
+            error!("Failed to read parquet metadata: {}", e);
+            return vec![];
+        }
     };
 
     // Get total row count from metadata
     let metadata = reader.metadata();
     let total_rows = metadata.file_metadata().num_rows();
-    tracing::info!("📊 Parquet file {} has {} total rows", path.display(), total_rows);
+    tracing::info!(
+        "📊 Parquet file {} has {} total rows",
+        path.display(),
+        total_rows
+    );
 
     let mut results = Vec::new();
     let iter = reader.get_row_iter(None).unwrap();
@@ -650,10 +884,10 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
             // GSM8K Standard: Question is col 0, Answer is col 1
             let question = r.get_string(0).map(|s| s.as_str()).unwrap_or("");
             let answer = r.get_string(1).map(|s| s.as_str()).unwrap_or("");
-            
+
             if !question.is_empty() {
                 results.push(format!("Question: {}\nAnswer: {}", question, answer));
-                
+
                 // Log progress every 100 rows
                 if row_idx % 100 == 0 {
                     tracing::debug!("📊 Processing parquet row {} / {}", row_idx + 1, total_rows);
@@ -662,20 +896,27 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
             }
         }
     }
-    
-    tracing::info!("📊 Finished processing {} rows from {}", results.len(), path.display());
+
+    tracing::info!(
+        "📊 Finished processing {} rows from {}",
+        results.len(),
+        path.display()
+    );
     results
 }
 
 fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) => { error!("Failed to open JSONL: {}", e); return vec![]; }
+        Err(e) => {
+            error!("Failed to open JSONL: {}", e);
+            return vec![];
+        }
     };
-    
+
     let mut lines = Vec::new();
     let reader = std::io::BufReader::new(file);
-    
+
     // Count total lines first
     let mut line_count = 0;
     for line in reader.lines() {
@@ -683,7 +924,7 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
             Ok(l) => {
                 lines.push(l);
                 line_count += 1;
-                
+
                 // Log progress every 100 lines
                 if line_count % 100 == 0 {
                     tracing::debug!("📝 Processing JSONL line {}", line_count);
@@ -695,24 +936,28 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
             }
         }
     }
-    
-    tracing::info!("📝 JSONL file {} has {} total lines", path.display(), line_count);
+
+    tracing::info!(
+        "📝 JSONL file {} has {} total lines",
+        path.display(),
+        line_count
+    );
     lines
 }
 
 fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
     let doc = lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     let mut full_text = String::new();
-    
+
     let pages = doc.get_pages();
     let total_pages = pages.len();
     tracing::info!("📄 PDF has {} total pages", total_pages);
-    
+
     for (page_num, _) in pages.into_iter() {
         if let Ok(text) = doc.extract_text(&[page_num]) {
             full_text.push_str(&text);
             full_text.push('\n');
-            
+
             // Log progress every 10 pages
             if page_num % 10 == 0 {
                 tracing::debug!("📄 Processing PDF page {} / {}", page_num + 1, total_pages);
@@ -720,7 +965,7 @@ fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
             }
         }
     }
-    
+
     if full_text.trim().is_empty() {
         return Err("No text found in PDF".to_string());
     }
@@ -754,7 +999,7 @@ fn extract_text_from_epub(path: &Path) -> Result<String, String> {
         if let Some((curr_content, _)) = doc.get_current_str() {
             content.push_str(&strip_html_tags(&curr_content));
             content.push('\n');
-            
+
             // Log progress every 10 pages
             if page_num % 10 == 0 {
                 tracing::debug!("📖 Processing EPUB page {}/{}", page_num + 1, total_pages);
@@ -763,12 +1008,16 @@ fn extract_text_from_epub(path: &Path) -> Result<String, String> {
         }
         doc.go_next();
     }
-    
+
     if content.trim().is_empty() {
         return Err("No text content found in EPUB".to_string());
     }
-    
-    tracing::info!("📖 EPUB file {} processed ({} pages)", path.display(), total_pages);
+
+    tracing::info!(
+        "📖 EPUB file {} processed ({} pages)",
+        path.display(),
+        total_pages
+    );
     Ok(content)
 }
 
@@ -779,65 +1028,116 @@ fn chunk_text(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn decode_plan_from_belief(
+    belief: &Tensor,
+    decoder: &Arc<RwLock<ThoughtDecoder>>,
+    dict: &Arc<RwLock<CognitiveDictionary>>,
+) -> String {
+    let decoder_guard = decoder.blocking_read();
+    let dict_guard = dict.blocking_read();
+    match decoder_guard.decode_sequence(belief, 8, 4) {
+        Ok(seq) if !seq.is_empty() => {
+            let thoughts: Vec<String> = seq
+                .iter()
+                .map(|id| dict_guard.get_op(*id).to_string())
+                .collect();
+            if thoughts.is_empty() {
+                "<decoder_empty>".to_string()
+            } else {
+                thoughts.join(" -> ")
+            }
+        }
+        Ok(_) => "<decoder_empty>".to_string(),
+        Err(e) => format!("<decoder_error: {}>", e),
+    }
+}
+
+fn should_trigger_guided_replay(
+    task_id: Option<&str>,
+    canonical_solution: Option<&str>,
+    loss: f32,
+) -> bool {
+    matches!(task_id, Some("HumanEval/48") | Some("HumanEval/72"))
+        && canonical_solution.is_some()
+        && loss > 150.0
+}
+
 #[cfg(test)]
 mod cpu_core_utilization_tests {
     use super::*;
     use std::sync::Arc;
-    
+
     /// Test that demonstrates paragraph distribution across CPU cores
     #[test]
     fn test_paragraph_distribution_across_cores() {
         // Create a mock text with many paragraphs
         let mut mock_text = String::new();
         for i in 0..100 {
-            mock_text.push_str(&format!("Paragraph {}: This is paragraph number {} with some content.\n\n", i, i));
+            mock_text.push_str(&format!(
+                "Paragraph {}: This is paragraph number {} with some content.\n\n",
+                i, i
+            ));
         }
-        
+
         // Simulate what study_file_chunks does
         let paragraphs = chunk_text(&mock_text);
-        let filtered_paragraphs: Vec<String> = paragraphs.into_iter()
-            .filter(|p| p.len() > 50)
-            .collect();
-        
+        let filtered_paragraphs: Vec<String> =
+            paragraphs.into_iter().filter(|p| p.len() > 50).collect();
+
         // Verify we have many paragraphs
-        assert!(filtered_paragraphs.len() > 50, "Should have many paragraphs after filtering");
-        
+        assert!(
+            filtered_paragraphs.len() > 50,
+            "Should have many paragraphs after filtering"
+        );
+
         // Simulate Rayon thread distribution
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (filtered_paragraphs.len() as f64 / num_threads as f64).ceil() as usize;
         let chunk_size = chunk_size.max(1);
-        
+
         // Count how many threads would be used
         let mut thread_count = 0;
         for chunk in filtered_paragraphs.chunks(chunk_size) {
             thread_count += 1;
             assert!(!chunk.is_empty(), "Each chunk should have paragraphs");
         }
-        
+
         // Should use multiple threads (at least 2 on multi-core systems)
         assert!(thread_count >= 1, "Should distribute across threads");
-        println!("✅ Paragraph distribution test: {} paragraphs distributed across {} threads (chunk size: {})",
-                 filtered_paragraphs.len(), thread_count, chunk_size);
+        println!(
+            "✅ Paragraph distribution test: {} paragraphs distributed across {} threads (chunk size: {})",
+            filtered_paragraphs.len(),
+            thread_count,
+            chunk_size
+        );
     }
-    
+
     /// Test that JSONL files are processed line-by-line
     #[test]
     fn test_jsonl_line_extraction() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
-        
+        use tempfile::NamedTempFile;
+
         // Create a temporary JSONL file
         let mut temp_file = NamedTempFile::new().unwrap();
         for i in 0..20 {
-            writeln!(temp_file, "{{\"text\": \"Line {} content\", \"id\": {}}}", i, i).unwrap();
+            writeln!(
+                temp_file,
+                "{{\"text\": \"Line {} content\", \"id\": {}}}",
+                i, i
+            )
+            .unwrap();
         }
-        
+
         let lines = extract_lines_from_jsonl(temp_file.path());
         assert_eq!(lines.len(), 20, "Should extract 20 lines from JSONL");
-        assert!(lines[0].contains("Line 0 content"), "Should contain line content");
+        assert!(
+            lines[0].contains("Line 0 content"),
+            "Should contain line content"
+        );
         println!("✅ JSONL extraction test: {} lines extracted", lines.len());
     }
-    
+
     /// Test that parquet files are processed row-by-row
     #[test]
     fn test_parquet_row_extraction() {
@@ -845,7 +1145,7 @@ mod cpu_core_utilization_tests {
         // For demonstration, we'll just verify the function exists
         println!("✅ Parquet extraction function exists (would need actual parquet file to test)");
     }
-    
+
     /// Test CPU core utilization simulation
     #[test]
     fn test_cpu_core_utilization_simulation() {
@@ -861,7 +1161,7 @@ mod cpu_core_utilization_tests {
             vec!["Paragraph 13".to_string(), "Paragraph 14".to_string()],
             vec!["Paragraph 15".to_string(), "Paragraph 16".to_string()],
         ];
-        
+
         // Simulate work distribution
         let results: Vec<usize> = paragraphs_per_core
             .into_iter()
@@ -870,10 +1170,15 @@ mod cpu_core_utilization_tests {
                 paragraphs.len()
             })
             .collect();
-        
+
         let total_processed: usize = results.iter().sum();
-        assert_eq!(total_processed, 16, "Should process all paragraphs across cores");
-        println!("✅ CPU core utilization simulation: {} paragraphs processed across {} simulated cores",
-                 total_processed, num_cores);
+        assert_eq!(
+            total_processed, 16,
+            "Should process all paragraphs across cores"
+        );
+        println!(
+            "✅ CPU core utilization simulation: {} paragraphs processed across {} simulated cores",
+            total_processed, num_cores
+        );
     }
 }

@@ -497,7 +497,7 @@ impl MLEngine {
         // Log tensor shapes for debugging
         let belief_shape = belief.shape();
         let lm_head_shape = self.lm_head.shape();
-        
+
         // Check vocabulary size compatibility
         let tokenizer_vocab_size = self.tokenizer.get_vocab_size(true);
         let lm_head_vocab_size = lm_head_shape.dims()[0];
