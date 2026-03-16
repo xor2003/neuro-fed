@@ -16,6 +16,7 @@ use crate::pc_hierarchy::PredictiveCoding;
 use crate::persistence::PCPersistence;
 use crate::types::{CognitiveDictionary, ThoughtOp, StudyState, LastStudyTask};
 use crate::learning_log::append_learning_detail;
+use serde_json::Value;
 
 // NEW: For Parquet support
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -456,7 +457,14 @@ impl BootstrapManager {
                     let learn_result = local_pc.learn_sequence(&sequence_tensor, None);
                     if let Ok(stats) = &learn_result {
                         let full_input = p.clone();
-                        let belief = local_pc.levels.first().unwrap().beliefs.clone();
+                        let answer_text = serde_json::from_str::<Value>(&full_input)
+                            .ok()
+                            .and_then(|v| v.get("canonical_solution").and_then(Value::as_str).map(str::to_string))
+                            .map(|s| {
+                                    s
+                            })
+                            .unwrap_or_else(|| "<no canonical solution>".to_string());
+                        let belief = local_pc.levels.last().unwrap().beliefs.clone();
 
                         let decoded_output = {
                             let decoder_guard = decoder_arc_for_blocking.blocking_read();
@@ -511,8 +519,9 @@ impl BootstrapManager {
                         );
 
                         let learning_msg = format!(
-                            "Bootstrap learning\nInput: {}\nOutput: {}\nTrajectory: {}\nLoss: {:.4}\nResults: {}",
+                            "Bootstrap learning\nQuestion: {}\nAnswer: {}\nDecoded Output: {}\nTrajectory: {}\nLoss: {:.4}\nResults: {}",
                             full_input,
+                            answer_text,
                             decoded_output,
                             trajectory,
                             stats.total_surprise,
