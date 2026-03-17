@@ -1,7 +1,7 @@
 //! Quick performance test for contiguous tensor optimizations
 //! Directly tests the optimized matmul operations
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,7 +58,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 3: Real PC hierarchy scenario
     println!("\n5. Testing PC hierarchy scenario (sequence processing)...");
     let sequence_len = 10;
-    let batch_size = 8;
 
     // Create sequence tensor
     let sequence_tensor = Tensor::randn(0f32, 1.0, (sequence_len, dim, 1), &device)?;

@@ -23,7 +23,7 @@ use crate::openai_proxy::metrics::ProxyMetrics;
 use crate::openai_proxy::types::{
     Choice, Message, OpenAiRequest, OpenAiResponse, ProxyError, Usage,
 };
-use crate::pc_decoder::ThoughtDecoder;
+use crate::pc_decoder::{ThoughtConstraints, ThoughtDecoder};
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::semantic_cache::SemanticCache;
 use crate::sleep_phase::SleepManager;
@@ -32,6 +32,15 @@ use candle_core::Tensor;
 
 const REMOTE_PRICE_PER_1K_TOKENS_USD: f64 = 0.002;
 const EPISODIC_MEMORY_CAPACITY: usize = 50;
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UiState {
+    pub status: String,
+    pub steps: Vec<String>,
+    pub last_updated: i64,
+    pub last_source: String,
+    pub saved_total_usd: f64,
+}
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
 pub struct OpenAiProxy {
@@ -48,6 +57,7 @@ pub struct OpenAiProxy {
     episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
     pub study_state: Arc<RwLock<StudyState>>,
+    pub ui_state: Arc<RwLock<UiState>>,
 }
 
 impl OpenAiProxy {
@@ -65,6 +75,7 @@ impl OpenAiProxy {
         cache: Option<Arc<RwLock<SemanticCache>>>,
     ) -> Self {
         let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
+        let ui_state = Arc::new(RwLock::new(UiState::default()));
         OpenAiProxy {
             config,
             proxy_config,
@@ -78,7 +89,52 @@ impl OpenAiProxy {
             episodic_memory,
             calibration,
             study_state,
+            ui_state,
         }
+    }
+
+    async fn ui_reset(&self, status: &str) {
+        let mut ui = self.ui_state.write().await;
+        ui.status = status.to_string();
+        ui.steps.clear();
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_set_status(&self, status: &str) {
+        let mut ui = self.ui_state.write().await;
+        ui.status = status.to_string();
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_push_step(&self, step: impl Into<String>) {
+        let mut ui = self.ui_state.write().await;
+        ui.steps.push(step.into());
+        if ui.steps.len() > 20 {
+            ui.steps.remove(0);
+        }
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_set_source(&self, source: &str) {
+        let mut ui = self.ui_state.write().await;
+        ui.last_source = source.to_string();
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_add_saved(&self, saved: f64) {
+        let mut ui = self.ui_state.write().await;
+        ui.saved_total_usd += saved;
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn metrics_inc_pc_inference(&self) {
+        let mut metrics = self.metrics.write().await;
+        metrics.pc_inference_calls += 1;
+    }
+
+    async fn metrics_inc_thought_decoder(&self) {
+        let mut metrics = self.metrics.write().await;
+        metrics.thought_decoder_calls += 1;
     }
 
     /// Main handler with iterative reasoning, calibration, and verification
@@ -105,6 +161,8 @@ impl OpenAiProxy {
             metrics.total_requests += 1;
             metrics.status_message = "Answering...".to_string();
         }
+        self.ui_reset("Answering...").await;
+        self.ui_push_step("PC reasoning: embed + infer").await;
         let start_time = Instant::now();
 
         let state = self.extract_structured_state(&req).await;
@@ -141,6 +199,7 @@ impl OpenAiProxy {
                     }
                 }
 
+                self.metrics_inc_pc_inference().await;
                 let pc_result = {
                     let mut pc = self.pc_hierarchy.write().await;
                     match pc.infer_sequence(&query_seq, 5) {
@@ -167,28 +226,56 @@ impl OpenAiProxy {
                     let dict = self.cognitive_dict.read().await;
                     pc_belief = Some(belief.clone());
 
-                    if let Ok(seq) = decoder.decode_sequence(&belief, 10, 3) {
-                        thought_trajectory = seq.clone();
-                        let thoughts: Vec<String> =
-                            seq.iter().map(|id| dict.get_op(*id).to_string()).collect();
-                        pc_thoughts_string = thoughts.join(" -> ");
+                    self.metrics_inc_thought_decoder().await;
+                    let decode_result = if self.proxy_config.require_thought_ops {
+                        let mut constraints = ThoughtConstraints::new(dict.eof_id());
+                        constraints.min_non_eof = self.proxy_config.min_thought_ops;
+                        decoder.decode_sequence_with_constraints(&belief, 10, 3, &constraints)
+                    } else {
+                        decoder.decode_sequence(&belief, 10, 3)
+                    };
 
-                        tracing::info!("🧠 PC Thought Trajectory: {}", pc_thoughts_string);
-                        tracing::info!("🧠 PC confidence: {:.4} (Threshold: 0.6)", raw_confidence);
+                    match decode_result {
+                        Ok(seq) => {
+                            thought_trajectory = seq.clone();
+                            let thoughts: Vec<String> =
+                                seq.iter().map(|id| dict.get_op(*id).to_string()).collect();
+                            pc_thoughts_string = thoughts.join(" -> ");
 
-                        if raw_confidence > 0.6 {
-                            tracing::info!("✅ PC is confident. Using thoughts to guide LLM.");
-                        } else {
-                            let msg = format!(
-                                "⚠️ PC output low confidence ({:.4}) — falling back to LLMs",
+                            tracing::info!("🧠 PC Thought Trajectory: {}", pc_thoughts_string);
+                            if !pc_thoughts_string.is_empty() {
+                                self.ui_push_step(format!("ThoughtOps: {}", pc_thoughts_string))
+                                    .await;
+                            }
+                            tracing::info!(
+                                "🧠 PC confidence: {:.4} (Threshold: 0.6)",
                                 raw_confidence
                             );
-                            tracing::info!("{}", msg);
-                            pc_error = Some(msg.clone());
+
+                            if raw_confidence > 0.6 {
+                                tracing::info!("✅ PC is confident. Using thoughts to guide LLM.");
+                            } else {
+                                let msg = format!(
+                                    "⚠️ PC output low confidence ({:.4}) — falling back to LLMs",
+                                    raw_confidence
+                                );
+                                tracing::info!("{}", msg);
+                                pc_error = Some(msg.clone());
+                            }
                         }
-                    } else {
-                        pc_error = Some("Thought Decoder failed".to_string());
-                        tracing::error!("❌ Thought Decoder error");
+                        Err(e) => {
+                            let msg = format!("Thought Decoder failed: {}", e);
+                            pc_error = Some(msg.clone());
+                            tracing::error!("❌ {}", msg);
+                            self.ui_push_step("Thought decoder failed".to_string()).await;
+                            if self.proxy_config.require_thought_ops {
+                                self.ui_set_status("error").await;
+                                return Err(ProxyError::PCError(format!(
+                                    "Reasoning required but unavailable: {}",
+                                    e
+                                )));
+                            }
+                        }
                     }
                 } else if pc_error.is_none() {
                     tracing::warn!("⚠️ PC Inference failed to return a belief.");
@@ -219,8 +306,16 @@ impl OpenAiProxy {
             tracing::info!("📝 Injected PC guidance into LLM prompt for caching");
         }
 
+        if self.proxy_config.require_thought_ops && thought_trajectory.is_empty() {
+            self.ui_set_status("error").await;
+            return Err(ProxyError::PCError(
+                "Reasoning required but no ThoughtOp sequence produced".to_string(),
+            ));
+        }
+
         // Step 2: Remote LLM attempt
         if final_text.trim().is_empty() {
+            self.ui_push_step("Remote LLM request".to_string()).await;
             match self.forward_to_remote(&req).await {
                 Ok(resp) => {
                     if let Some(choice) = resp.choices.first() {
@@ -243,6 +338,7 @@ impl OpenAiProxy {
 
         // Step 3: Local LLM attempt
         if final_text.trim().is_empty() {
+            self.ui_push_step("Local LLM request".to_string()).await;
             match self
                 .forward_to_local(&state, &pc_thoughts_string, pc_belief.as_ref())
                 .await
@@ -321,6 +417,8 @@ impl OpenAiProxy {
             generated_code: final_text.clone(),
             thought_sequence: thought_trajectory,
             success,
+            reasoning_task: None,
+            expected_output: None,
         });
 
         // 🔴 FIX: PREVENT OOM AND ENFORCE SLEEP CYCLE WHEN MEMORY IS FULL
@@ -365,6 +463,8 @@ impl OpenAiProxy {
         let _saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
             - actual_cost)
             .max(0.0);
+        self.ui_set_source(last_source).await;
+        self.ui_add_saved(_saved).await;
 
         // 🔴 FIX 3: Reset UI Status
         {
@@ -401,6 +501,7 @@ impl OpenAiProxy {
                 metrics.status_message = "Idle".to_string();
             }
         }
+        self.ui_set_status("Idle").await;
         Ok(response)
     }
 
@@ -639,8 +740,10 @@ mod reasoning_consistency_tests {
         let pc_hierarchy = Arc::new(RwLock::new(
             PredictiveCoding::new(config.pc_config.clone()).unwrap(),
         ));
+        let dict_len = dict.read().await.len();
+        let vocab_capacity = config.pc_config.thought_vocab_capacity.max(dict_len);
         let thought_decoder = Arc::new(RwLock::new(
-            ThoughtDecoder::new(512, dict.read().await.len(), &device).unwrap(),
+            ThoughtDecoder::new(512, vocab_capacity, &device).unwrap(),
         ));
         {
             let decoder = thought_decoder.write().await;

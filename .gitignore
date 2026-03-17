@@ -23,3 +23,5 @@ Cargo.lock
 .vscode/
 
 config.toml
+.env
+.env.local

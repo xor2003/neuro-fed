@@ -509,137 +509,6 @@ impl MLEngine {
             );
         }
 
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-            use anyhow::Result;
-            use candle_core::{DType, Device, Tensor};
-
-            #[test]
-            fn test_safe_l2_normalization_avoids_broadcast_panic()
-            -> Result<(), Box<dyn std::error::Error>> {
-                let device = Device::Cpu;
-                let dim = 2048;
-
-                // 1. Simulate the 1D tensor resulting from stacked.mean(0)
-                // We use a high standard deviation (5.0) to simulate unnormalized LLM outputs
-                let mean_emb = Tensor::randn(0f32, 5.0, vec![dim], &device)?;
-
-                // Check initial norm (will be much larger than 1.0)
-                let initial_norm = mean_emb.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-                assert!(
-                    initial_norm > 10.0,
-                    "Initial norm should be large, got {}",
-                    initial_norm
-                );
-
-                // 2. The exact safe normalization logic from process_text()
-                let norm_sq = mean_emb.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                let norm = norm_sq.sqrt() as f64;
-                let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
-
-                // 3. THIS is the operation that previously panicked with a broadcast error.
-                // It must succeed using the f64 scalar implementation.
-                let normalized = (mean_emb * scale_factor)?;
-
-                // 4. Reshape to PC shape as done in process_text
-                let final_tensor = normalized.reshape((1, dim))?;
-
-                // 5. Verify the L2 norm is now exactly 1.0
-                let new_norm = final_tensor.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-
-                assert!(
-                    (new_norm - 1.0).abs() < 1e-4,
-                    "Normalized tensor L2 norm must be 1.0, got {}",
-                    new_norm
-                );
-
-                Ok(())
-            }
-
-            #[test]
-            fn test_input_l2_normalization_accuracy() -> Result<(), Box<dyn std::error::Error>> {
-                let device = Device::Cpu;
-
-                // 1. Создаем случайный вектор с ОГРОМНЫМИ значениями (как было в баге)
-                let huge_values = vec![100.0f32; 2048];
-                let tensor = Tensor::from_vec(huge_values, (1, 2048), &device)?;
-
-                // 2. Применяем логику нормализации из process_text
-                let norm_sq = tensor.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                let norm = norm_sq.sqrt();
-                let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
-
-                // Масштабируем
-                let normalized = (tensor * (scale_factor as f64))?;
-
-                // 3. Проверяем длину (норму) итогового вектора
-                let final_norm_sq = normalized.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                let final_norm = final_norm_sq.sqrt();
-
-                // Норма должна быть идеально равна 1.0 (с учетом погрешности float)
-                assert!(
-                    (final_norm - 1.0).abs() < 1e-5,
-                    "L2 нормализация не работает! Норма: {}",
-                    final_norm
-                );
-
-                Ok(())
-            }
-
-            #[test]
-            fn test_decode_belief_with_rms_scaling() -> Result<()> {
-                // This test requires a real model to load the lm_head
-                let config = crate::config::NodeConfig::default();
-                // Ensure you have a model at the default path or update this path
-                if !std::path::Path::new(&config.model_path).exists() {
-                    println!(
-                        "Skipping test_decode_belief_with_rms_scaling: model file not found at {}",
-                        config.model_path
-                    );
-                    return Ok(());
-                }
-
-                let device_type = crate::types::DeviceType {
-                    name: "cpu".to_string(),
-                    description: "".to_string(),
-                    supported: true,
-                };
-                let engine = MLEngine::new(&config.model_path, device_type).unwrap();
-                let belief_dim = engine.embedding_dim();
-
-                // Create a normalized belief tensor (length 1.0), which caused the original issue
-                let belief_l2 = Tensor::ones((1, belief_dim), DType::F32, &engine.device)?;
-                // Manual L2 normalization
-                let norm_sq = belief_l2.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                let norm = norm_sq.sqrt();
-                let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
-                let belief_l2 = (belief_l2 * (scale_factor as f64))?;
-
-                let (_word, avg_mag, max_mag) = engine.decode_belief_with_confidence(&belief_l2)?;
-
-                // The original buggy code produced max_mag ~0.03.
-                // With the sqrt(dim) scaling, it should be >> 1.0.
-                // A value > 10 for a simple vector of ones is a very safe bet.
-                assert!(
-                    max_mag > 10.0,
-                    "Max logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
-                    max_mag
-                );
-                assert!(
-                    avg_mag > 0.5,
-                    "Average logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
-                    avg_mag
-                );
-
-                println!(
-                    "Logit scaling test passed: max_mag={}, avg_mag={}",
-                    max_mag, avg_mag
-                );
-                Ok(())
-            }
-        }
-
         // 1. Project belief through LM Head to get Vocab Logits
         // belief shape should be (1, embedding_dim) or (embedding_dim, 1)
         // lm_head shape is (vocab_size, embedding_dim)
@@ -1156,5 +1025,136 @@ impl MLEngine {
             .map_err(|e| MLError::InvalidResponse(format!("Mul error: {}", e)))?;
 
         Ok(stacked)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn test_safe_l2_normalization_avoids_broadcast_panic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+        let dim = 2048;
+
+        // 1. Simulate the 1D tensor resulting from stacked.mean(0)
+        // We use a high standard deviation (5.0) to simulate unnormalized LLM outputs
+        let mean_emb = Tensor::randn(0f32, 5.0, vec![dim], &device)?;
+
+        // Check initial norm (will be much larger than 1.0)
+        let initial_norm = mean_emb.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        assert!(
+            initial_norm > 10.0,
+            "Initial norm should be large, got {}",
+            initial_norm
+        );
+
+        // 2. The exact safe normalization logic from process_text()
+        let norm_sq = mean_emb.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let norm = norm_sq.sqrt() as f64;
+        let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
+
+        // 3. THIS is the operation that previously panicked with a broadcast error.
+        // It must succeed using the f64 scalar implementation.
+        let normalized = (mean_emb * scale_factor)?;
+
+        // 4. Reshape to PC shape as done in process_text
+        let final_tensor = normalized.reshape((1, dim))?;
+
+        // 5. Verify the L2 norm is now exactly 1.0
+        let new_norm = final_tensor.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+
+        assert!(
+            (new_norm - 1.0).abs() < 1e-4,
+            "Normalized tensor L2 norm must be 1.0, got {}",
+            new_norm
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_input_l2_normalization_accuracy() -> Result<(), Box<dyn std::error::Error>> {
+        let device = Device::Cpu;
+
+        // 1. Создаем случайный вектор с ОГРОМНЫМИ значениями (как было в баге)
+        let huge_values = vec![100.0f32; 2048];
+        let tensor = Tensor::from_vec(huge_values, (1, 2048), &device)?;
+
+        // 2. Применяем логику нормализации из process_text
+        let norm_sq = tensor.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let norm = norm_sq.sqrt();
+        let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
+
+        // Масштабируем
+        let normalized = (tensor * (scale_factor as f64))?;
+
+        // 3. Проверяем длину (норму) итогового вектора
+        let final_norm_sq = normalized.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let final_norm = final_norm_sq.sqrt();
+
+        // Норма должна быть идеально равна 1.0 (с учетом погрешности float)
+        assert!(
+            (final_norm - 1.0).abs() < 1e-5,
+            "L2 нормализация не работает! Норма: {}",
+            final_norm
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_belief_with_rms_scaling() -> Result<()> {
+        // This test requires a real model to load the lm_head
+        let config = crate::config::NodeConfig::default();
+        // Ensure you have a model at the default path or update this path
+        if !std::path::Path::new(&config.model_path).exists() {
+            println!(
+                "Skipping test_decode_belief_with_rms_scaling: model file not found at {}",
+                config.model_path
+            );
+            return Ok(());
+        }
+
+        let device_type = crate::types::DeviceType {
+            name: "cpu".to_string(),
+            description: "".to_string(),
+            supported: true,
+        };
+        let engine = MLEngine::new(&config.model_path, device_type).unwrap();
+        let belief_dim = engine.embedding_dim();
+
+        // Create a normalized belief tensor (length 1.0), which caused the original issue
+        let belief_l2 = Tensor::ones((1, belief_dim), DType::F32, &engine.device)?;
+        // Manual L2 normalization
+        let norm_sq = belief_l2.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let norm = norm_sq.sqrt();
+        let scale_factor = if norm > 1e-6 { 1.0 / norm } else { 1.0 };
+        let belief_l2 = (belief_l2 * (scale_factor as f64))?;
+
+        let (_word, avg_mag, max_mag) = engine.decode_belief_with_confidence(&belief_l2)?;
+
+        // The original buggy code produced max_mag ~0.03.
+        // With the sqrt(dim) scaling, it should be >> 1.0.
+        // A value > 10 for a simple vector of ones is a very safe bet.
+        assert!(
+            max_mag > 10.0,
+            "Max logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
+            max_mag
+        );
+        assert!(
+            avg_mag > 0.5,
+            "Average logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
+            avg_mag
+        );
+
+        println!(
+            "Logit scaling test passed: max_mag={}, avg_mag={}",
+            max_mag, avg_mag
+        );
+        Ok(())
     }
 }

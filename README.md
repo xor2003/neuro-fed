@@ -104,6 +104,26 @@ curl -L https://neuro-fed.ai/install | sh
 neuro-fed-node start
 ```
 
+**2.5. Quick GUI (Local)**
+```bash
+rm -f neurofed.db detail.log
+cargo run --features web-ui --bin neuro-fed-node -- --config config.toml
+```
+Open: `http://localhost:8080/ui`
+- **Send** = normal chat history
+- **Ask Once** = single-shot query (does not persist in local storage)
+
+If you want visible reasoning steps:
+```toml
+[proxy_config]
+require_thought_ops = true
+min_thought_ops = 2
+
+[pc_config]
+inference_steps = 8
+thought_vocab_capacity = 256
+```
+
 **3. Point your tools to the Proxy**
 Open your favorite AI application (e.g., Cursor IDE, Open WebUI, Obsidian) and change the API settings:
 *   **Base URL:** `http://localhost:8080/v1`
@@ -111,6 +131,14 @@ Open your favorite AI application (e.g., Cursor IDE, Open WebUI, Obsidian) and c
 
 **4. Start Typing!**
 NeuroFed will immediately begin intercepting requests. If it knows the answer, it responds instantly for free. If it's a complex coding task, it bypasses the request to the Base LLM, observes the correct answer, and *learns the association permanently*.
+
+### ThoughtOps in the UI
+The UI “Current Steps” panel now includes the **ThoughtOps** trajectory (e.g., `PLAN -> COMPUTE_MATH -> RETURN_VALUE`) when available.
+
+### Seeded Demo Stories
+To bootstrap reasoning quickly, use:
+- `study/user_stories_seed.txt`
+- `study/user_stories_thoughtops.jsonl` (explicit ThoughtOps traces)
 
 ---
 

@@ -21,6 +21,7 @@ pub fn create_router(proxy: Arc<OpenAiProxy>) -> Router {
         .route("/ui", get(ui_index))
         .route("/ui/app.js", get(ui_app_js))
         .route("/ui/styles.css", get(ui_styles))
+        .route("/ui/state", get(ui_state))
         .route("/ui/metrics", get(ui_metrics))
         .route("/ui/stats", get(ui_stats))
         .route("/ui/introspection", get(get_brain_introspection))
@@ -40,23 +41,56 @@ async fn ui_styles() -> Response {
     static_response(STYLES_CSS, "text/css; charset=utf-8")
 }
 
+#[derive(serde::Serialize)]
+struct UiStatePayload {
+    status: String,
+    steps: Vec<String>,
+    last_updated: i64,
+    progress_percent: f64,
+    progress_current: u64,
+    progress_total: u64,
+    saved_total_usd: f64,
+    last_source: String,
+}
+
+async fn ui_state(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStatePayload> {
+    let ui = match proxy.ui_state.try_read() {
+        Ok(s) => s.clone(),
+        Err(_) => crate::openai_proxy::UiState::default(),
+    };
+    let study = match proxy.study_state.try_read() {
+        Ok(s) => s.clone(),
+        Err(_) => crate::types::StudyState::default(),
+    };
+    let (progress_current, progress_total) = if let Some(task) = &study.last_task {
+        (task.paragraphs_processed, task.paragraphs_processed)
+    } else {
+        (0, 0)
+    };
+
+    Json(UiStatePayload {
+        status: if ui.status.is_empty() { "idle".to_string() } else { ui.status },
+        steps: ui.steps,
+        last_updated: ui.last_updated,
+        progress_percent: study.progress_percent,
+        progress_current,
+        progress_total,
+        saved_total_usd: ui.saved_total_usd,
+        last_source: ui.last_source,
+    })
+}
+
 async fn ui_metrics(
     State(proxy): State<Arc<OpenAiProxy>>,
 ) -> Json<crate::openai_proxy::metrics::ProxyMetrics> {
     // 1. Get lock-free metrics from the global METRICS store
     let _telemetry = crate::metrics::METRICS.get_snapshot();
 
-    // 2. Get StudyState with a TRY lock to prevent UI freezing
-    let study = match proxy.study_state.try_read() {
-        Ok(s) => s.clone(),
-        Err(_) => crate::types::StudyState::default(), // Fallback if busy
-    };
+    // 2. Read StudyState (awaitable to avoid stale zeroed telemetry)
+    let study = proxy.study_state.read().await.clone();
 
-    // 3. Try to get proxy metrics with a TRY lock
-    let proxy_metrics = match proxy.metrics.try_read() {
-        Ok(m) => m.clone(),
-        Err(_) => crate::openai_proxy::metrics::ProxyMetrics::default(), // Fallback if busy
-    };
+    // 3. Read proxy metrics (awaitable to avoid default reset on lock contention)
+    let proxy_metrics = proxy.metrics.read().await.clone();
 
     // Create the summary string for the last completed task
     let summary = if let Some(last_task) = &study.last_task {
@@ -114,23 +148,25 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
         .unwrap_or_else(|| "./neurofed.db".to_string());
     let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
-    // Get memory usage using `free` command (simplified approach)
-    let memory_bytes = match Command::new("free").arg("-b").output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Parse the "used" memory from the first line after "Mem:"
-            stdout
-                .lines()
-                .find(|line| line.starts_with("Mem:"))
-                .and_then(|line| {
-                    line.split_whitespace()
-                        .nth(2) // used memory is the 3rd field
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(0)
+    // Prefer process RSS from /proc when available (more relevant to telemetry).
+    let memory_bytes = read_proc_rss_bytes().unwrap_or_else(|| {
+        // Fallback: system memory via `free` (may be unavailable on non-Linux).
+        match Command::new("free").arg("-b").output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .find(|line| line.starts_with("Mem:"))
+                    .and_then(|line| {
+                        line.split_whitespace()
+                            .nth(2)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0)
+            }
+            Err(_) => 0,
         }
-        Err(_) => 0,
-    };
+    });
 
     // CPU usage is complex to get without sysinfo; return 0.0 as placeholder
     let cpu_usage = 0.0;
@@ -140,6 +176,19 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
         memory_bytes,
         cpu_usage,
     })
+}
+
+fn read_proc_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut parts = statm.split_whitespace();
+    let _total_pages = parts.next()?;
+    let rss_pages = parts.next()?;
+    let rss_pages: u64 = rss_pages.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(rss_pages.saturating_mul(page_size as u64))
 }
 
 async fn get_brain_introspection(State(proxy): State<Arc<OpenAiProxy>>) -> Json<serde_json::Value> {

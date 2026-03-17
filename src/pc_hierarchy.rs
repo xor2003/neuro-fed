@@ -92,19 +92,52 @@ impl PrecisionHyperNet {
         &mut self,
         surprise_scalar: f32,
         target_scales: &[f32],
-        _learning_rate: f32,
+        learning_rate: f32,
         device: &Device,
     ) -> CandleResult<()> {
-        // Simple gradient descent update for demonstration
-        // In a full implementation, this would use backpropagation through the hyper-network
-        let current_scales = self.compute_precision_scales(surprise_scalar, device)?;
-
-        // Compute error and update weights (simplified)
-        for i in 0..self.max_levels.min(target_scales.len()) {
-            let _error = target_scales[i] - current_scales[i];
-            // Simplified update - in reality would need proper backprop
-            // This is a placeholder for the actual learning rule
+        let levels = self.max_levels.min(target_scales.len());
+        if levels == 0 {
+            return Ok(());
         }
+
+        // Forward pass (recomputed to keep gradients aligned)
+        let surprise_tensor = Tensor::from_slice(&[surprise_scalar], (1, 1), device)?;
+        let hidden = surprise_tensor.matmul(&self.weights1)?;
+        let hidden_relu = hidden.relu()?;
+        let output = hidden_relu.matmul(&self.weights2)?;
+
+        let neg_output = output.affine(-1.0, 0.0)?;
+        let exp_neg = neg_output.exp()?;
+        let one = Tensor::ones_like(&exp_neg)?;
+        let denom = one.broadcast_add(&exp_neg)?;
+        let sigmoid = one.broadcast_div(&denom)?; // (1, max_levels)
+        let scaled = sigmoid.affine(1.9, 0.1)?; // [0.1, 2.0]
+
+        let target = Tensor::from_slice(target_scales, (1, levels), device)?
+            .broadcast_as(scaled.shape())?;
+        let error = (&scaled - &target)?;
+
+        // Backprop (manual, small MLP)
+        let d_scaled = error; // MSE gradient without averaging constant
+        let d_sigmoid = d_scaled.affine(1.9, 0.0)?;
+        let sigmoid_grad = (&sigmoid * (&one - &sigmoid)?)?;
+        let d_output = d_sigmoid.broadcast_mul(&sigmoid_grad)?;
+
+        // grad_w2 = hidden_relu^T * d_output
+        let grad_w2 = hidden_relu.t()?.matmul(&d_output)?;
+
+        // grad_w1 = surprise^T * (d_output * w2^T) * relu'
+        let d_hidden = d_output.matmul(&self.weights2.t()?)?;
+        let relu_mask = hidden.gt(0.0)?;
+        let d_hidden_relu = d_hidden.broadcast_mul(&relu_mask.to_dtype(candle_core::DType::F32)?)?;
+        let grad_w1 = surprise_tensor.t()?.matmul(&d_hidden_relu)?;
+
+        let lr = Tensor::from_slice(&[learning_rate], (1, 1), device)?;
+        let lr_w1 = lr.broadcast_as(self.weights1.shape())?;
+        let lr_w2 = lr.broadcast_as(self.weights2.shape())?;
+
+        self.weights1 = (&self.weights1 - grad_w1.mul(&lr_w1)?)?.contiguous()?;
+        self.weights2 = (&self.weights2 - grad_w2.mul(&lr_w2)?)?.contiguous()?;
 
         Ok(())
     }
@@ -249,9 +282,14 @@ impl PredictiveCoding {
 
         tracing::trace!("PC infer: input shape {:?}, steps {}", input.shape(), steps);
 
-        // === FAST-PATH: один быстрый прыжок к финальному состоянию ===
-        let fast_guess = self.amortized.fast_forward(&input)?;
-        self.levels[0].beliefs = fast_guess;
+        // === INIT: optional amortized init (no shortcut) ===
+        if self.config.use_amortized_init {
+            let fast_guess = self.amortized.fast_forward(&input)?;
+            self.levels[0].beliefs = fast_guess;
+        } else {
+            // Sensory clamping: start from the actual input
+            self.levels[0].beliefs = input.clone();
+        }
 
         for level in self.levels.iter_mut() {
             level.is_dirty = true;
@@ -260,71 +298,95 @@ impl PredictiveCoding {
         let mut stats = SurpriseStats::default();
         stats.level_surprises = vec![0.0; self.levels.len()];
 
-        // 🚀 OPTIMIZATION: Pre-calculate contiguous transposed weights for the downward pass.
-        // Weights DO NOT change during the inference loop, so we only need to do this once!
-        let mut weights_t = Vec::with_capacity(self.levels.len());
-        for level in &self.levels {
-            weights_t.push(level.weights.t()?.contiguous()?);
-        }
+        if self.config.minimal_pc_mode {
+            for step in 0..steps {
+                for l in 0..self.levels.len() - 1 {
+                    let (left, right) = self.levels.split_at_mut(l + 1);
+                    left[l].predict(&right[0].beliefs)?;
+                    left[l].compute_errors()?;
 
-        let mut prev_fe = f32::MAX; // Track for early exit
+                    let update = left[l].errors.mul(&self.cached_lr_errors[l])?;
+                    // Simple belief update: x_l = x_l - alpha * error
+                    left[l].beliefs = (&left[l].beliefs - &update)?;
 
-        // Делаем всего 2–4 реальных шага тонкой настройки вместо 20
-        let real_steps = (steps.min(4)).max(2);
-
-        for step in 0..real_steps {
-            // Upward pass: compute predictions and errors
-            for l in 0..self.levels.len() - 1 {
-                // Use pre-computed weights_t for downward pass, but for upward
-                // we use the level's weights directly.
-                let (left, right) = self.levels.split_at_mut(l + 1);
-                left[l].predict(&right[0].beliefs)?;
-                left[l].compute_errors()?;
-
-                let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
-                stats.level_surprises[l] += err_sq;
-            }
-
-            // Downward pass: update beliefs
-            for l in (0..self.levels.len() - 1).rev() {
-                if l > 0 {
-                    let update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
-                    self.levels[l].beliefs = (&self.levels[l].beliefs
-                        - &update.clamp(-0.1f32, 0.1f32)?)?
-                        .clamp(-10.0f32, 10.0f32)?;
+                    let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                    stats.level_surprises[l] += err_sq;
                 }
 
-                // Propagate error upward
-                if l + 1 < self.levels.len() {
-                    // 🚀 CACHE LOCALITY: use the pre-transposed contiguous matrix
-                    let matmul_result = weights_t[l].matmul(&self.levels[l].errors)?;
-                    let belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
-                    self.levels[l + 1].beliefs = (&self.levels[l + 1].beliefs
-                        + &belief_update.clamp(-0.1f32, 0.1f32)?)?
-                        .clamp(-10.0f32, 10.0f32)?;
+                let fe = self.compute_free_energy()?;
+                stats.free_energy_history.push(fe);
+                tracing::debug!("PC energy step {}: {:.6}", step, fe);
+                if fe > self.config.surprise_threshold {
+                    stats.high_surprise_indices.push(step);
                 }
             }
-
-            let fe = self.compute_free_energy()?;
-            stats.free_energy_history.push(fe);
-
-            // 🔴 ADD THIS: Push live telemetry to the Lock-Free metrics store
-            crate::gauge!(crate::metrics::PC_FREE_ENERGY, fe as f64);
-
-            if fe > self.config.surprise_threshold {
-                stats.high_surprise_indices.push(step);
+        } else {
+            // 🚀 OPTIMIZATION: Pre-calculate contiguous transposed weights for the downward pass.
+            // Weights DO NOT change during the inference loop, so we only need to do this once!
+            let mut weights_t = Vec::with_capacity(self.levels.len());
+            for level in &self.levels {
+                weights_t.push(level.weights.t()?.contiguous()?);
             }
 
-            // 🚀 OPTIMIZATION: Early Exit (Algorithmic Speedup)
-            // If Free Energy change is less than threshold (e.g., 0.01%), the belief is stable.
-            if step > 2 {
-                let fe_delta = (prev_fe - fe).abs() / fe.max(1e-6);
-                if fe_delta < self.config.convergence_threshold {
-                    tracing::trace!("PC converged at step {}", step);
-                    break;
+            let mut prev_fe = f32::MAX; // Track for early exit
+
+            // Full-mode inference: run the configured number of steps (with early exit).
+            let real_steps = steps.max(1);
+
+            for step in 0..real_steps {
+                // Upward pass: compute predictions and errors
+                for l in 0..self.levels.len() - 1 {
+                    // Use pre-computed weights_t for downward pass, but for upward
+                    // we use the level's weights directly.
+                    let (left, right) = self.levels.split_at_mut(l + 1);
+                    left[l].predict(&right[0].beliefs)?;
+                    left[l].compute_errors()?;
+
+                    let err_sq = left[l].errors.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                    stats.level_surprises[l] += err_sq;
                 }
+
+                // Downward pass: update beliefs
+                for l in (0..self.levels.len() - 1).rev() {
+                    if l > 0 {
+                        let update = self.levels[l].errors.mul(&self.cached_lr_errors[l])?;
+                        self.levels[l].beliefs = (&self.levels[l].beliefs
+                            - &update.clamp(-0.1f32, 0.1f32)?)?
+                            .clamp(-10.0f32, 10.0f32)?;
+                    }
+
+                    // Propagate error upward
+                    if l + 1 < self.levels.len() {
+                        // 🚀 CACHE LOCALITY: use the pre-transposed contiguous matrix
+                        let matmul_result = weights_t[l].matmul(&self.levels[l].errors)?;
+                        let belief_update = matmul_result.mul(&self.cached_lr_up[l])?;
+                        self.levels[l + 1].beliefs = (&self.levels[l + 1].beliefs
+                            + &belief_update.clamp(-0.1f32, 0.1f32)?)?
+                            .clamp(-10.0f32, 10.0f32)?;
+                    }
+                }
+
+                let fe = self.compute_free_energy()?;
+                stats.free_energy_history.push(fe);
+
+                // 🔴 ADD THIS: Push live telemetry to the Lock-Free metrics store
+                crate::gauge!(crate::metrics::PC_FREE_ENERGY, fe as f64);
+
+                if fe > self.config.surprise_threshold {
+                    stats.high_surprise_indices.push(step);
+                }
+
+                // 🚀 OPTIMIZATION: Early Exit (Algorithmic Speedup)
+                // If Free Energy change is less than threshold (e.g., 0.01%), the belief is stable.
+                if step > 2 {
+                    let fe_delta = (prev_fe - fe).abs() / fe.max(1e-6);
+                    if fe_delta < self.config.convergence_threshold {
+                        tracing::trace!("PC converged at step {}", step);
+                        break;
+                    }
+                }
+                prev_fe = fe;
             }
-            prev_fe = fe;
         }
 
         stats.total_surprise = stats.free_energy_history.iter().sum::<f32>();
@@ -377,7 +439,7 @@ impl PredictiveCoding {
     pub fn learn(
         &mut self,
         input: &Tensor,
-        _context: Option<PrecisionContext>,
+        context: Option<PrecisionContext>,
     ) -> Result<SurpriseStats, PCError> {
         // Perform inference to compute errors
         let stats = self.infer(input, self.config.inference_steps)?;
@@ -420,23 +482,57 @@ impl PredictiveCoding {
             .collect();
 
         // 🚀 DYNAMIC PRECISION: Compute precision scaling factors from hyper-network
-        let precision_scales = match self
-            .precision_hyper
-            .compute_precision_scales(stats.total_surprise, &self.device)
-        {
-            Ok(scales) => scales,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to compute precision scales from hyper-network: {}. Using default scaling.",
-                    e
-                );
-                // Default scaling: 1.0 for all levels
-                vec![1.0; self.levels.len()]
+        let precision_scales = if self.config.minimal_pc_mode {
+            vec![1.0; self.levels.len()]
+        } else {
+            match self
+                .precision_hyper
+                .compute_precision_scales(stats.total_surprise, &self.device)
+            {
+                Ok(scales) => scales,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to compute precision scales from hyper-network: {}. Using default scaling.",
+                        e
+                    );
+                    // Default scaling: 1.0 for all levels
+                    vec![1.0; self.levels.len()]
+                }
             }
         };
 
-        // Update weights only for high-surprise components
-        if self.config.selective_update {
+        // Train precision hyper-network toward a target precision signal (if available).
+        if !self.config.minimal_pc_mode {
+            if let Some(ctx) = context {
+                if let Some(ref calculator) = self.precision_calculator {
+                    let result = calculator.calculate_precision(&ctx);
+                    let target_scales = vec![result.precision; self.levels.len()];
+                    if let Err(e) = self.precision_hyper.update(
+                        stats.total_surprise,
+                        &target_scales,
+                        self.config.precision_hyper_lr,
+                        &self.device,
+                    ) {
+                        tracing::warn!("Failed to update precision hyper-network: {}", e);
+                    }
+                }
+            }
+        }
+
+        if self.config.minimal_pc_mode {
+            // Simple outer-product rule for minimal PC
+            for l in 0..self.levels.len() - 1 {
+                let error = self.levels[l].errors.clone();
+                self.levels[l].update_weights(
+                    self.config.learning_rate,
+                    &next_level_beliefs[l + 1],
+                    None,
+                    self.config.mu_pc_scaling,
+                )?;
+                let _ = error; // keeps symmetry with non-minimal path
+            }
+        } else if self.config.selective_update {
+            // Update weights only for high-surprise components
             for l in 0..self.levels.len() - 1 {
                 // 🔴 BUG FIX: Only update weights if there IS high surprise (not is_empty)
                 if !stats.high_surprise_indices.is_empty() {

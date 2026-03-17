@@ -118,9 +118,130 @@ export GPU_MEMORY_FRACTION=0.8
 - **src/node_loop.rs**: Async processing loop skeleton
 - **src/ml_engine.rs**: ML Engine using candle framework for pure Rust CPU/GPU operations
 - **src/pc_hierarchy.rs**: Pure Predictive Coding implementation
+
+### Learning/Generation Quality Gate (Required)
+For every code update, enforce the following before considering the step complete:
+1. **Parse learning log**: run `cargo run --bin learning_benchmark -- --skip-run` and review the updated `learning_feedback.csv`.
+2. **Investigate anomalies**: if losses, trajectories, or counts look worse than the previous step, inspect `detail.log` and explain the regression.
+3. **Apply fixes**: do not proceed to the next change until learning/generation is at least stable or improved.
+4. **Smoke coverage**: keep learning/generation unbroken by running lightweight tests when feasible (e.g., `cargo test --lib` and `cargo test --test integration_tests`).
+
+### Improvement Workflow (No Confirmations)
+Proceed through the current plan step-by-step without asking for confirmation:
+1. Stabilize flaky learning-related tests (deterministic inputs and tolerances).
+2. Expand learning log parsing to include replay/sleep-phase entries.
+3. Add a JSONL reasoning dataset loader for replay.
+After each step, run the Learning/Generation Quality Gate and only advance if metrics are stable or improved.
+
+### Reasoning Replay JSONL Format
+To exercise reasoning → state → output paths via `learning_benchmark --reasoning-replay`, provide JSONL with fields:
+- `task`: one of `multiply`, `reverse_string`, `sum_even`, `max`, `sort_list`
+- Task fields:
+  - `multiply`: `a`, `b`
+  - `reverse_string`: `input`
+  - `sum_even`/`max`/`sort_list`: `values` (array of integers)
+- Optional:
+  - `ops`: array of ThoughtOps (e.g., `PLAN`, `DECOMPOSE`, `INITIALIZE_VARIABLE`, `COMPUTE_MATH`, `RETURN_VALUE`, `EOF`)
+  - `expected_output`: string used for text-loss check
+
+Example line:
+```json
+{"task":"multiply","a":17,"b":23,"ops":["PLAN","DECOMPOSE","INITIALIZE_VARIABLE","COMPUTE_MATH","REFINE","RETURN_VALUE","EOF"],"expected_output":"391"}
+```
+
+### Learning Data Pipeline
+Use `scripts/generate_learning_dataset.py` to normalize multi-type JSONL into a single structured stream:
+```bash
+python scripts/generate_learning_dataset.py --input assistant.jsonl,reasoning.jsonl,code.jsonl,agent.jsonl --output merged_learning.jsonl
+```
+Expected input record types (`type` field):
+- `assistant`: `user`, `assistant`
+- `reasoning`: `problem`, `thoughts` (array), `solution`
+- `code`: `instruction`, `code`, `tests`, optional `final`
+- `agent`: `goal`, `tool_call`, `observation`, `next_action`
+
+Additional reasoning task types for replay JSONL:
+- `sympy_eval`: `expression`, `operation`, optional `expected`
+- `z3_solve`: `var`, `constraints` (array of strings), optional `expected`
+
+### Dataset Query/Adjust
+Use `scripts/query_learning_dataset.py` to inspect and filter the merged JSONL:
+```bash
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --stats
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --type reasoning --max-chars 3000 --output data/reasoning_filtered.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --contains "toxicity|abuse" --output data/cleaned.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --preset alpaca --output data/alpaca_filtered.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --preset openassistant --min-score 0.6 --output data/oa_filtered.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --max-chars 2500 --output data/merged_filtered.jsonl --stats
+```
+
+### Dataset Fetch (Required Sources)
+Use `scripts/fetch_datasets.py` to download and convert the required datasets into raw JSONL:
+```bash
+.venv/bin/python scripts/fetch_datasets.py --datasets alpaca,dolly,openassistant,gsm8k,strategyqa,hotpotqa,codesearchnet,humaneval --limit 5000 --streaming
+```
+Notes:
+- Requires a local venv with `datasets` + `huggingface_hub`:
+  ```bash
+  python3 -m venv .venv
+  .venv/bin/pip install datasets huggingface_hub
+  ```
+- Set `HF_TOKEN` in `.env` for higher rate limits.
+- For CodeSearchNet or The Stack, pass `--language python` (or `rust`, `go`, `java`, `javascript`).
+- For The Stack subset, add `the_stack` to `--datasets` and set a small `--limit`.
+- Agent datasets:
+  - ToolBench: add `toolbench`
+  - WebArena: add `webarena`
+
+### End-to-End Conversion
+```bash
+.venv/bin/python scripts/fetch_datasets.py --datasets alpaca,dolly,openassistant,gsm8k,strategyqa,hotpotqa,codesearchnet,humaneval --limit 5000 --streaming
+.venv/bin/python scripts/fetch_datasets.py --datasets toolbench,webarena --limit 200 --streaming
+.venv/bin/python scripts/generate_learning_dataset.py --input data/raw/alpaca.jsonl,data/raw/dolly.jsonl,data/raw/openassistant.jsonl,data/raw/gsm8k.jsonl,data/raw/strategyqa.jsonl,data/raw/hotpotqa.jsonl,data/raw/codesearchnet.jsonl,data/raw/humaneval.jsonl,data/raw/toolbench.jsonl,data/raw/webarena.jsonl --output data/merged_learning.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --max-chars 2500 --output data/merged_filtered.jsonl --stats
+.venv/bin/python scripts/augment_reasoning_dataset.py --input data/merged_filtered.jsonl --output data/merged_augmented.jsonl
+```
+
+### Reasoning Augmentation (Cycle)
+To automatically add simple reasoning traces to assistant rows:
+```bash
+.venv/bin/python scripts/augment_reasoning_dataset.py --input data/merged_learning.jsonl --output data/merged_learning_augmented.jsonl
+.venv/bin/python scripts/augment_reasoning_dataset.py --input data/merged_filtered.jsonl --output data/merged_augmented.jsonl
+```
+This only augments simple arithmetic (`a + b`, `a - b`, `a * b`) when `thought` is missing.
+
+### Reasoning Tooling
+- Z3 integration lives in `src/reasoning_tools.rs` and is gated by feature flag `z3-tools`.
+- SymPy checks use a Python subprocess (`python3 -c ...`); set `PYTHON` env var to override.
 - **src/model_manager.rs**: Model detection, recommendation, and downloading
 - **src/bootstrap.rs**: Bootstrap and synthetic training utilities
 - **src/brain_manager.rs**: Brain sharing and import/export workflow
+
+### Minimal PC Mode (Working Baseline)
+Enable the minimal, stable predictive-coding loop (simple inference + learning rule):
+```bash
+# config.toml
+[pc_config]
+minimal_pc_mode = true
+```
+Use the small reasoning dataset:
+```bash
+study/minimal_pc/data/minimal_pc_sum.jsonl
+```
+Run a quick learning benchmark on the minimal set:
+```bash
+rm -f neurofed.db detail.log && \
+  cargo run --bin learning_benchmark -- \
+  --study-paths study/minimal_pc/data/minimal_pc_sum.jsonl
+```
+Or use the helper script:
+```bash
+scripts/run_minimal_pc.sh
+```
+Optional smoke test (disabled by default in CI/sandbox):
+```bash
+RUN_MINIMAL_PC_SCRIPT_SMOKE=1 cargo test --test minimal_pc_script_smoke
+```
 
 ### Architectural Risks To Watch
 - **Type drift across modules**: `config.rs`, `types.rs`, and `pc_types.rs` define overlapping concepts. New work should consolidate around one canonical type per concept instead of adding more adapters.
@@ -167,6 +288,27 @@ cargo test
 # Run with specific test
 cargo test ml_engine::tests::test_embedding_creation
 ```
+
+### Quick GUI Run (Thoughtful Answers)
+```bash
+# Ensure config.toml has: web_ui_enabled=true, bootstrap_on_start=true,
+# require_thought_ops=true, min_thought_ops=2, inference_steps=8
+cargo run --features web-ui --bin neuro-fed-node -- --config config.toml
+```
+Then open:
+- `http://localhost:8080/ui`
+Ask a question and verify the response includes ThoughtOps and a coherent answer.
+Use **Ask Once** for a single-shot query without storing chat history in local storage.
+
+Seeded demo content (user stories):
+- `study/user_stories_seed.txt`
+- `study/user_stories_thoughtops.jsonl`
+
+### Full-Mode Reasoning Knobs
+Tune these for better “thinking” in full mode:
+- `pc_config.inference_steps` (e.g., 8–16). Higher = more iterative reasoning.
+- `proxy_config.require_thought_ops = true` and `min_thought_ops = 2`.
+- If you see DB lock errors: `rm -f neurofed.db detail.log` before a fresh run.
 
 ### Code Quality
 ```bash
@@ -469,3 +611,51 @@ This guide provides a comprehensive overview of the development process for Neur
 - Review security implications
 - Check for performance issues
 - Verify documentation is up-to-date
+
+## Predictive Coding Reasoning Roadmap (Phased)
+High-level but engineer-actionable plan to make Predictive Coding the primary reasoning source (ThoughtOps become mandatory, not optional).
+
+### Phase 1: Force Reasoning (Critical)
+- Gate text output until at least one ThoughtOp has been emitted.
+- Add two decoder modes: `MODE_REASONING` then `MODE_OUTPUT`.
+- Test: `17 * 23` must emit `COMPUTE_MATH` before final answer.
+
+### Phase 2: Make ThoughtOps Affect State (Very High)
+- Introduce a State Engine that applies ThoughtOps to a real mutable state.
+- Update loss: include `state_error` in addition to text error.
+- Test: variable init/update yields correct state after the sequence.
+
+### Phase 3: No-Shortcut Tasks (Very High)
+- Train on tasks where direct output is impossible without ThoughtOps.
+- Include arithmetic, symbolic transforms, and mini-programs.
+- Dataset format must include `INPUT`, `THOUGHT`, `STATE`, `OUTPUT`.
+
+### Phase 4: Split Reasoning vs Text (High)
+- Separate reasoning tokens from text tokens (distinct channels).
+- Enforce: ThoughtOps are not just decoded text.
+
+### Phase 5: Reasoning-Weighted Loss (High)
+- Total loss = `state_error + reasoning_error + text_error`.
+- Penalize correct text with incorrect ThoughtOps/state.
+
+### Phase 6: Multi-Step Reasoning (High)
+- Allow variable-length ThoughtOp chains (N steps).
+- Test with max/argmax-style tasks.
+
+### Phase 7: Planning Layer (Medium)
+- Add `PLAN / DECOMPOSE / REFINE` operations before execution ops.
+
+### Phase 8: Anti-Cheat Metrics (High)
+- Track `reasoning_usage_rate`, `state_accuracy`, `steps_per_task`.
+- Penalize trivial or missing chains.
+
+### Phase 9: Tool-Integrated Reasoning (Medium)
+- Add external tool ops: `SYMPY_EVAL`, `Z3_SOLVE`.
+- Loop: `THINK → ACT → OBSERVE → UPDATE`.
+- Always compare tool result vs predicted state and backprop error.
+
+### Required Tests
+- ThoughtOp gating test (no output before reasoning).
+- State Engine update test.
+- Multi-step reasoning test.
+- Tool-integrated validation test (SymPy/Z3).

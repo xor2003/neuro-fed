@@ -28,10 +28,19 @@
           <h2>Chat</h2>
           <div class="panel-meta">/v1/chat/completions</div>
         </div>
+        <div class="panel-subhead">
+          <label class="toggle">
+            <input type="checkbox" id="show-thoughtops" checked />
+            <span>Show ThoughtOps</span>
+          </label>
+        </div>
         <div class="messages" id="messages"></div>
         <div class="composer">
           <textarea id="prompt" placeholder="Ask the node…"></textarea>
-          <button id="send">Send</button>
+          <div class="composer-actions">
+            <button id="send">Send</button>
+            <button id="ask-once" class="ghost">Ask Once</button>
+          </div>
         </div>
       </div>
 

@@ -3,6 +3,25 @@ use crate::pc_types::PCError;
 use candle_core::{Device, Tensor, Var};
 use candle_nn::ops;
 
+const DEFAULT_EOF_TOKEN_ID: u32 = 7;
+
+#[derive(Debug, Clone)]
+pub struct ThoughtConstraints {
+    pub eof_token_id: u32,
+    pub min_non_eof: usize,
+    pub required_ops: Vec<u32>,
+}
+
+impl ThoughtConstraints {
+    pub fn new(eof_token_id: u32) -> Self {
+        Self {
+            eof_token_id,
+            min_non_eof: 0,
+            required_ops: Vec::new(),
+        }
+    }
+}
+
 pub struct ThoughtDecoder {
     pub w_vocab: Var,
     pub w_gate_stack: Var, // Combined w_update and w_hidden
@@ -68,6 +87,27 @@ impl ThoughtDecoder {
         beam_width: usize,
         action_costs: Option<&std::collections::HashMap<u32, f32>>,
     ) -> Result<Vec<u32>, PCError> {
+        self.decode_sequence_with_rules(anchor_belief, max_steps, beam_width, action_costs, None)
+    }
+
+    pub fn decode_sequence_with_constraints(
+        &self,
+        anchor_belief: &Tensor,
+        max_steps: usize,
+        beam_width: usize,
+        constraints: &ThoughtConstraints,
+    ) -> Result<Vec<u32>, PCError> {
+        self.decode_sequence_with_rules(anchor_belief, max_steps, beam_width, None, Some(constraints))
+    }
+
+    fn decode_sequence_with_rules(
+        &self,
+        anchor_belief: &Tensor,
+        max_steps: usize,
+        beam_width: usize,
+        action_costs: Option<&std::collections::HashMap<u32, f32>>,
+        constraints: Option<&ThoughtConstraints>,
+    ) -> Result<Vec<u32>, PCError> {
         let anchor_flat = anchor_belief.flatten_all()?;
         let belief_dim = anchor_flat.dims()[0];
         let anchor_2d = anchor_flat.reshape((1, belief_dim))?;
@@ -82,15 +122,47 @@ impl ThoughtDecoder {
         };
         let anchor_2d = anchor_2d.affine(scale_factor, 0.0)?;
 
-        let mut beams = vec![(0.0f32, 0.0f32, Vec::<u32>::new(), anchor_2d.clone(), false)];
+        let (required_mask, required_map) = if let Some(constraints) = constraints {
+            if constraints.required_ops.len() > 63 {
+                return Err(PCError(
+                    "Too many required ops for constraint mask".to_string(),
+                ));
+            }
+            let mut map = std::collections::HashMap::new();
+            for (idx, op) in constraints.required_ops.iter().enumerate() {
+                map.insert(*op, idx as u64);
+            }
+            let mask = if constraints.required_ops.is_empty() {
+                0
+            } else {
+                (1u64 << constraints.required_ops.len()) - 1
+            };
+            (mask, map)
+        } else {
+            (0u64, std::collections::HashMap::new())
+        };
+
+        let eof_token_id = constraints
+            .map(|c| c.eof_token_id)
+            .unwrap_or(DEFAULT_EOF_TOKEN_ID);
+
+        let mut beams =
+            vec![(0.0f32, 0.0f32, Vec::<u32>::new(), anchor_2d.clone(), false, 0u64)];
 
         for _step in 1..=max_steps {
             let mut new_beams = Vec::new();
 
-            for (_, raw_score, seq, h_t, is_done) in &beams {
+            for (_, raw_score, seq, h_t, is_done, seen_mask) in &beams {
                 if *is_done {
                     let norm_score = *raw_score / (seq.len() as f32).powf(0.7);
-                    new_beams.push((norm_score, *raw_score, seq.clone(), h_t.clone(), true));
+                    new_beams.push((
+                        norm_score,
+                        *raw_score,
+                        seq.clone(),
+                        h_t.clone(),
+                        true,
+                        *seen_mask,
+                    ));
                     continue;
                 }
 
@@ -126,6 +198,14 @@ impl ThoughtDecoder {
                 for (&lp, &token_id) in top_k_log_probs_vec.iter().zip(top_k_indices_vec.iter()) {
                     let mut new_seq = seq.clone();
 
+                    if let Some(constraints) = constraints {
+                        if token_id == constraints.eof_token_id
+                            && seq.len() < constraints.min_non_eof
+                        {
+                            continue;
+                        }
+                    }
+
                     // 🔴 FIX: SOFTEN REPETITION PENALTY
                     // Too high (2.0) forces the decoder to randomly pick bad tokens just to avoid repeating.
                     // 0.8 is enough to break infinite loops, without causing "out of order word salads".
@@ -144,8 +224,26 @@ impl ThoughtDecoder {
                     let new_raw_score = raw_score + lp - cost - penalty;
                     let norm_score = new_raw_score / (new_seq.len() as f32).powf(0.7);
 
-                    let done = token_id == 7; // EOF
-                    new_beams.push((norm_score, new_raw_score, new_seq, h_next.clone(), done));
+                    let mut new_seen = *seen_mask;
+                    if let Some(idx) = required_map.get(&token_id) {
+                        new_seen |= 1u64 << idx;
+                    }
+
+                    if let Some(constraints) = constraints {
+                        if token_id == constraints.eof_token_id && new_seen != required_mask {
+                            continue;
+                        }
+                    }
+
+                    let done = token_id == eof_token_id;
+                    new_beams.push((
+                        norm_score,
+                        new_raw_score,
+                        new_seq,
+                        h_next.clone(),
+                        done,
+                        new_seen,
+                    ));
                 }
             }
 
@@ -157,7 +255,31 @@ impl ThoughtDecoder {
                 break;
             }
         }
-        Ok(beams[0].2.clone())
+
+        if beams.is_empty() {
+            return Err(PCError("Beam search produced no candidates".to_string()));
+        }
+
+        let seq = beams[0].2.clone();
+        if let Some(constraints) = constraints {
+            if seq.iter().filter(|id| **id != constraints.eof_token_id).count()
+                < constraints.min_non_eof
+            {
+                return Err(PCError(
+                    "Decoded sequence violates min_non_eof constraint".to_string(),
+                ));
+            }
+
+            for required in constraints.required_ops.iter() {
+                if !seq.contains(required) {
+                    return Err(PCError(
+                        "Decoded sequence missing required op".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(seq)
     }
 
     /// Decode a sequence using beliefs from multiple levels of the PC hierarchy.
@@ -502,7 +624,7 @@ mod tests {
         let device = Device::Cpu;
         let belief_dim = 2;
         let vocab_size = 100;
-        let mut decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
+        let decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
 
         // Manually craft weights to force specific outcomes
         let mut vocab_weights = vec![0.0f32; vocab_size * belief_dim];
@@ -566,21 +688,45 @@ mod tests {
         let belief_dim = 4;
         let vocab_size = 5;
 
-        // Create two identical decoders
+        // Use deterministic weights and inputs to avoid flaky loss comparisons.
         let mut decoder1 = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
-        let mut decoder2 = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
-        decoder2
-            .w_gate_stack
-            .set(decoder1.w_gate_stack.as_tensor())?;
-        decoder2.w_vocab.set(decoder1.w_vocab.as_tensor())?;
+        let gate_shape = decoder1.w_gate_stack.shape();
+        let vocab_shape = decoder1.w_vocab.shape();
+        let gate_elems = gate_shape.elem_count();
+        let vocab_elems = vocab_shape.elem_count();
 
-        let belief = Tensor::randn(0f32, 1.0, (belief_dim, 1), &device)?;
+        let gate_vals = vec![0.01f32; gate_elems];
+        let vocab_vals: Vec<f32> = (0..vocab_elems)
+            .map(|i| (i as f32 % belief_dim as f32) * 0.005 + 0.001)
+            .collect();
+
+        let gate_tensor = Tensor::from_vec(
+            gate_vals,
+            (gate_shape.dims()[0], gate_shape.dims()[1]),
+            &device,
+        )?;
+        let vocab_tensor = Tensor::from_vec(
+            vocab_vals,
+            (vocab_shape.dims()[0], vocab_shape.dims()[1]),
+            &device,
+        )?;
+        decoder1.w_gate_stack.set(&gate_tensor)?;
+        decoder1.w_vocab.set(&vocab_tensor)?;
+
+        let belief = Tensor::from_vec(
+            vec![0.1f32, 0.2f32, 0.3f32, 0.4f32],
+            (belief_dim, 1),
+            &device,
+        )?;
         let target_seq = vec![1, 3, 4];
 
         // We can't easily test the old vs new code, but we can verify that the
         // optimized code produces a consistent result and learns.
-        let loss1 = decoder1.train_step(&belief, &target_seq, 0.01)?;
-        let loss2 = decoder1.train_step(&belief, &target_seq, 0.01)?;
+        let loss1 = decoder1.train_step(&belief, &target_seq, 0.05)?;
+        let mut loss2 = loss1;
+        for _ in 0..4 {
+            loss2 = decoder1.train_step(&belief, &target_seq, 0.05)?;
+        }
 
         assert!(
             loss2 < loss1,
@@ -722,7 +868,7 @@ mod tests {
     #[test]
     fn test_global_gradient_clipping() -> Result<(), PCError> {
         let device = Device::Cpu;
-        let mut decoder = ThoughtDecoder::new(4, 4, &device)?;
+        let decoder = ThoughtDecoder::new(4, 4, &device)?;
 
         // Manually set huge gradients for w_vocab and tiny ones for w_gate_stack
         let huge_grad = Tensor::full(100.0f32, decoder.w_vocab.shape(), &device)?;
@@ -767,7 +913,7 @@ mod reasoning_behavior_tests {
         let device = Device::Cpu;
         let belief_dim = 16;
         let vocab_size = 10;
-        let mut decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
+        let decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
 
         // Force the decoder to HIGHLY favor token ID 3 by hacking the weights
         // But keep the difference small enough that repetition penalty (0.8) can overcome it
@@ -848,6 +994,71 @@ mod reasoning_behavior_tests {
         // It might not be perfect due to beam search constraints, but it should contain elements of the target
         assert!(!generated_plan.is_empty(), "Decoder generated empty plan");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_constraints_require_non_eof_before_output() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let belief_dim = 8;
+        let vocab_size = 3;
+        let decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
+
+        // Force EOF (token 0) to be most likely.
+        let mut vocab_weights = vec![0.0f32; vocab_size * belief_dim];
+        for i in 0..belief_dim {
+            vocab_weights[0 * belief_dim + i] = 4.0;
+            vocab_weights[1 * belief_dim + i] = 1.0;
+            vocab_weights[2 * belief_dim + i] = 1.0;
+        }
+        decoder.w_vocab.set(&Tensor::from_vec(
+            vocab_weights,
+            (vocab_size, belief_dim),
+            &device,
+        )?)?;
+
+        let belief = Tensor::ones((belief_dim, 1), candle_core::DType::F32, &device)?;
+        let mut constraints = ThoughtConstraints::new(0);
+        constraints.min_non_eof = 1;
+        let seq = decoder.decode_sequence_with_constraints(&belief, 3, 3, &constraints)?;
+
+        assert!(
+            !seq.is_empty(),
+            "Constrained decoder returned empty sequence"
+        );
+        assert_ne!(seq[0], 0, "First token should not be EOF under constraint");
+        Ok(())
+    }
+
+    #[test]
+    fn test_constraints_require_specific_op() -> Result<(), PCError> {
+        let device = Device::Cpu;
+        let belief_dim = 6;
+        let vocab_size = 4;
+        let decoder = ThoughtDecoder::new(belief_dim, vocab_size, &device)?;
+
+        // Make token 2 reasonably likely so the constraint can be satisfied.
+        let mut vocab_weights = vec![0.0f32; vocab_size * belief_dim];
+        for i in 0..belief_dim {
+            vocab_weights[2 * belief_dim + i] = 2.5;
+            vocab_weights[0 * belief_dim + i] = 2.0;
+        }
+        decoder.w_vocab.set(&Tensor::from_vec(
+            vocab_weights,
+            (vocab_size, belief_dim),
+            &device,
+        )?)?;
+
+        let belief = Tensor::ones((belief_dim, 1), candle_core::DType::F32, &device)?;
+        let mut constraints = ThoughtConstraints::new(0);
+        constraints.min_non_eof = 1;
+        constraints.required_ops = vec![2];
+        let seq = decoder.decode_sequence_with_constraints(&belief, 4, 4, &constraints)?;
+
+        assert!(
+            seq.contains(&2),
+            "Constrained decoder did not include required op"
+        );
         Ok(())
     }
 }

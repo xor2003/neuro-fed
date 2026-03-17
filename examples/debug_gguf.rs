@@ -1,5 +1,5 @@
 //! Debug GGUF file structure
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use std::fs::File;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

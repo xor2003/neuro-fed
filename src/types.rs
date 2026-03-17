@@ -218,6 +218,11 @@ pub enum ThoughtOp {
     HandleError, // <-- НОВОЕ
     Return,
     Explain,
+    Plan,
+    Decompose,
+    Refine,
+    SympyEval,
+    Z3Solve,
     EOF,
     Dynamic(String), // ALLOWS INFINITE NEW CHUNKS (e.g., "Iterate_Check")
 }
@@ -236,10 +241,34 @@ impl std::fmt::Display for ThoughtOp {
             ThoughtOp::HandleError => write!(f, "HANDLE_ERROR"),
             ThoughtOp::Return => write!(f, "RETURN_VALUE"),
             ThoughtOp::Explain => write!(f, "EXPLAIN"),
+            ThoughtOp::Plan => write!(f, "PLAN"),
+            ThoughtOp::Decompose => write!(f, "DECOMPOSE"),
+            ThoughtOp::Refine => write!(f, "REFINE"),
+            ThoughtOp::SympyEval => write!(f, "SYMPY_EVAL"),
+            ThoughtOp::Z3Solve => write!(f, "Z3_SOLVE"),
             ThoughtOp::EOF => write!(f, "EOF"),
             ThoughtOp::Dynamic(s) => write!(f, "{}", s),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReasoningTask {
+    Multiply { a: i64, b: i64 },
+    ReverseString { input: String },
+    SumEven { values: Vec<i64> },
+    Max { values: Vec<i64> },
+    SortList { values: Vec<i64> },
+    SympyEval {
+        expression: String,
+        operation: String,
+        expected: Option<String>,
+    },
+    Z3Solve {
+        var: String,
+        constraints: Vec<String>,
+        expected: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -286,6 +315,8 @@ pub struct Episode {
     pub generated_code: String,
     pub thought_sequence: Vec<u32>,
     pub success: bool,
+    pub reasoning_task: Option<ReasoningTask>,
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +344,11 @@ impl Default for CognitiveDictionary {
         dict.add_op(ThoughtOp::HandleError);
         dict.add_op(ThoughtOp::Return);
         dict.add_op(ThoughtOp::Explain);
+        dict.add_op(ThoughtOp::Plan);
+        dict.add_op(ThoughtOp::Decompose);
+        dict.add_op(ThoughtOp::Refine);
+        dict.add_op(ThoughtOp::SympyEval);
+        dict.add_op(ThoughtOp::Z3Solve);
         dict.add_op(ThoughtOp::EOF);
         dict
     }
@@ -336,6 +372,21 @@ impl CognitiveDictionary {
 
     pub fn len(&self) -> usize {
         self.id_to_op.len()
+    }
+
+    pub fn op_id(&self, op: &ThoughtOp) -> Option<u32> {
+        self.op_to_id.get(op).copied()
+    }
+
+    pub fn eof_id(&self) -> u32 {
+        self.op_to_id
+            .get(&ThoughtOp::EOF)
+            .copied()
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn is_eof(&self, id: u32) -> bool {
+        matches!(self.get_op(id), ThoughtOp::EOF)
     }
 
     /// CHUNK DISCOVERY: Finds frequent pairs of thoughts and combines them
@@ -401,7 +452,7 @@ mod tests {
     #[test]
     fn test_cognitive_dictionary_initialization() {
         let dict = CognitiveDictionary::default();
-        assert_eq!(dict.len(), 12, "Dictionary should have 12 core ops");
+        assert_eq!(dict.len(), 17, "Dictionary should have 17 core ops");
         assert!(dict.op_to_id.contains_key(&ThoughtOp::Define));
     }
 }
@@ -427,6 +478,8 @@ mod cognitive_dictionary_tests {
                 generated_code: "".into(),
                 thought_sequence: vec![define_id, check_id, dict.op_to_id[&ThoughtOp::EOF]],
                 success: true,
+                reasoning_task: None,
+                expected_output: None,
             });
         }
 

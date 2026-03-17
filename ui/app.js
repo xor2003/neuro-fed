@@ -1,6 +1,8 @@
 const messages = document.getElementById("messages");
 const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
+const askOnceBtn = document.getElementById("ask-once");
+const showThoughtOps = document.getElementById("show-thoughtops");
 const stepsEl = document.getElementById("step-list");
 const statusPill = document.getElementById("status-pill");
 const lastUpdatedEl = document.getElementById("last-updated");
@@ -69,6 +71,14 @@ function appendMessage(role, content, persist = true) {
   return div;
 }
 
+function appendThoughtOps(container, thoughtOps) {
+  if (!thoughtOps) return;
+  const div = document.createElement("div");
+  div.className = "thoughtops";
+  div.textContent = thoughtOps;
+  container.appendChild(div);
+}
+
 function appendProcessing() {
   const div = document.createElement("div");
   div.className = "msg assistant processing";
@@ -105,6 +115,14 @@ async function sendMessage() {
     if (processingNode === node) processingNode = null;
     chatHistory.push({ role: "assistant", content: reply });
     saveHistory();
+    if (showThoughtOps?.checked) {
+      const res = await fetch("/ui/state");
+      const uiState = await res.json();
+      const thoughtLine = (uiState.steps || []).find((s) => s.startsWith("ThoughtOps:"));
+      if (thoughtLine) {
+        appendThoughtOps(node, thoughtLine.trim());
+      }
+    }
   } catch (err) {
     node.textContent = `error: ${err}`;
     node.classList.remove("processing");
@@ -114,7 +132,47 @@ async function sendMessage() {
   }
 }
 
+async function sendMessageOnce() {
+  const text = promptEl.value.trim();
+  if (!text) return;
+  appendMessage("user", text, false);
+  promptEl.value = "";
+  const node = appendProcessing();
+
+  const payload = {
+    model: "neurofed",
+    messages: [{ role: "user", content: text }],
+  };
+
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await res.json();
+    const reply = data?.choices?.[0]?.message?.content ?? "(no response)";
+    node.textContent = reply;
+    node.classList.remove("processing");
+    if (processingNode === node) processingNode = null;
+    if (showThoughtOps?.checked) {
+      const res = await fetch("/ui/state");
+      const uiState = await res.json();
+      const thoughtLine = (uiState.steps || []).find((s) => s.startsWith("ThoughtOps:"));
+      if (thoughtLine) {
+        appendThoughtOps(node, thoughtLine.trim());
+      }
+    }
+  } catch (err) {
+    node.textContent = `error: ${err}`;
+    node.classList.remove("processing");
+    if (processingNode === node) processingNode = null;
+  }
+}
+
 sendBtn.addEventListener("click", sendMessage);
+askOnceBtn.addEventListener("click", sendMessageOnce);
 promptEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -145,6 +203,8 @@ async function refreshState() {
         li.classList.add("step-local");
       } else if (step.includes("PC reasoning") || step.includes("PC learning")) {
         li.classList.add("step-pc");
+      } else if (step.includes("ThoughtOps")) {
+        li.classList.add("step-thought");
       }
       stepsEl.appendChild(li);
     });

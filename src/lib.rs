@@ -25,6 +25,8 @@ pub mod pow_verifier;
 pub mod privacy; // Moved: privacy-related modules
 pub mod semantic_cache;
 pub mod sleep_phase;
+pub mod reasoning_state;
+pub mod reasoning_tools;
 pub mod types;
 pub mod ui;
 

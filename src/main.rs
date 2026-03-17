@@ -26,6 +26,7 @@ use neuro_fed_node::{
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::VecDeque;
+use std::env;
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +65,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
     tracing::info!("🧠 NeuroFed Node - Final Production Build - Starting...");
+
+    let disable_http = env::var("NEUROFED_DISABLE_HTTP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    tracing::info!("HTTP disabled via env: {}", disable_http);
 
     // --- 🔴 NEW: Smart N-1 CPU Allocation and Priority ---
     let total_cpus = std::thread::available_parallelism()?.get();
@@ -208,8 +214,8 @@ async fn main() -> Result<()> {
 
     let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config.clone())?));
 
-    // 🧬 KNOWLEDGE INJECTION: If starting fresh, steal intelligence from the LLM
-    if db_missing || !has_weights {
+    // 🧬 KNOWLEDGE INJECTION: Opt-in only (unsafe shortcut otherwise)
+    if (db_missing || !has_weights) && pc_config.enable_llm_weight_injection {
         tracing::info!("🧬 Attempting to inject pre-trained LLM genetics into PC Level 0...");
         let engine = ml_engine.read().await;
 
@@ -256,6 +262,8 @@ async fn main() -> Result<()> {
         } else {
             tracing::info!("⚠️ Could not inject LLM weights, starting Tabula Rasa.");
         }
+    } else if db_missing || !has_weights {
+        tracing::info!("🧪 Skipping LLM weight injection (disabled by config).");
     }
 
     // Load CognitiveDictionary from persistence if available
@@ -292,9 +300,11 @@ async fn main() -> Result<()> {
         .dim_per_level
         .last()
         .unwrap_or(&embedding_dim);
+    let dict_len = cognitive_dict.read().await.len();
+    let vocab_capacity = pc_config.thought_vocab_capacity.max(dict_len);
     let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
         top_belief_dim,
-        cognitive_dict.read().await.len(),
+        vocab_capacity,
         &device,
     )?));
 
@@ -343,6 +353,8 @@ async fn main() -> Result<()> {
         enable_cache: config.proxy_config.semantic_cache_enabled,
         cache_size: config.proxy_config.max_cache_size,
         timeout_seconds: 30,
+        require_thought_ops: config.proxy_config.require_thought_ops,
+        min_thought_ops: config.proxy_config.min_thought_ops,
     };
 
     // Create semantic cache if enabled
@@ -452,8 +464,30 @@ async fn main() -> Result<()> {
         None
     };
     let app = create_router(proxy.clone()).merge(ui::create_router(proxy));
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080");
+    let listener = if disable_http {
+        None
+    } else {
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:8080").await {
+            Ok(listener) => {
+                tracing::info!(
+                    "🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080"
+                );
+                listener
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(
+                    "Permission denied binding 0.0.0.0:8080; falling back to 127.0.0.1:8080"
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+                tracing::info!(
+                    "🚀 NeuroFed API (OpenAI Compatible) listening on 127.0.0.1:8080"
+                );
+                listener
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Some(listener)
+    };
     let db_path = config
         .pc_config
         .persistence_db_path
@@ -673,6 +707,18 @@ async fn main() -> Result<()> {
             has_weights,
         );
 
+        if disable_http {
+            if training_needed || !config.bootstrap_config.document_paths.is_empty() {
+                tracing::info!("🚀 HTTP disabled: running full bootstrap training...");
+                if let Err(e) = bootstrap.run_full_bootstrap().await {
+                    tracing::warn!("Bootstrap full training failed: {}", e);
+                }
+            } else {
+                tracing::info!("HTTP disabled: bootstrap skipped (already trained).");
+            }
+            return Ok(());
+        }
+
         tokio::spawn(async move {
             if training_needed {
                 tracing::info!("🚀 Running synthetic bootstrap training...");
@@ -697,6 +743,11 @@ async fn main() -> Result<()> {
                 db_path
             );
         }
+    }
+
+    if disable_http {
+        tracing::info!("HTTP disabled: skipping server + file watcher startup.");
+        return Ok(());
     }
 
     // Start persistent event-driven study system with notify watcher
@@ -735,9 +786,11 @@ async fn main() -> Result<()> {
         tracing::info!("📁 No document paths configured for persistent study system");
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    if let Some(listener) = listener {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+    }
 
     Ok(())
 }

@@ -9,8 +9,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -906,6 +907,20 @@ fn extract_rows_from_parquet(path: &Path) -> Vec<String> {
 }
 
 fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
+    let cache_dir = Path::new(".cache/bootstrap/jsonl");
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if let Some(cache_path) = jsonl_cache_path(cache_dir, path, &metadata) {
+            if let Ok(cached) = load_cached_lines(&cache_path) {
+                tracing::info!(
+                    "🗂️ Using cached JSONL lines: {} ({} lines)",
+                    cache_path.display(),
+                    cached.len()
+                );
+                return cached;
+            }
+        }
+    }
+
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -917,15 +932,29 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
     let mut lines = Vec::new();
     let reader = std::io::BufReader::new(file);
 
-    // Count total lines first
     let mut line_count = 0;
     for line in reader.lines() {
         match line {
             Ok(l) => {
-                lines.push(l);
+                let trimmed = l.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parsed_text = if trimmed.contains("\"text\"") {
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                } else {
+                    None
+                };
+                lines.push(parsed_text.unwrap_or_else(|| trimmed.to_string()));
                 line_count += 1;
 
-                // Log progress every 100 lines
                 if line_count % 100 == 0 {
                     tracing::debug!("📝 Processing JSONL line {}", line_count);
                     tracing::info!("📝 Studying JSONL line {}", line_count);
@@ -942,7 +971,48 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
         path.display(),
         line_count
     );
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if let Some(cache_path) = jsonl_cache_path(cache_dir, path, &metadata) {
+            if let Err(e) = write_cached_lines(&cache_path, &lines) {
+                tracing::debug!("Failed to write JSONL cache {}: {}", cache_path.display(), e);
+            }
+        }
+    }
+
     lines
+}
+
+fn jsonl_cache_path(cache_dir: &Path, path: &Path, metadata: &std::fs::Metadata) -> Option<PathBuf> {
+    let modified = metadata.modified().ok()?;
+    let modified = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let size = metadata.len();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    let path_hash = hasher.finish();
+    let file_name = format!("jsonl_{:x}_{}_{}.txt", path_hash, size, modified);
+    Some(cache_dir.join(file_name))
+}
+
+fn load_cached_lines(path: &Path) -> Result<Vec<String>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn write_cached_lines(path: &Path, lines: &[String]) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut buf = String::new();
+    for line in lines {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    std::fs::write(path, buf)
 }
 
 fn extract_text_from_pdf(bytes: &[u8]) -> Result<String, String> {
@@ -1065,7 +1135,6 @@ fn should_trigger_guided_replay(
 #[cfg(test)]
 mod cpu_core_utilization_tests {
     use super::*;
-    use std::sync::Arc;
 
     /// Test that demonstrates paragraph distribution across CPU cores
     #[test]

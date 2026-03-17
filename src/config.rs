@@ -55,6 +55,8 @@ pub struct BackendConfig {
     pub pc_inference_enabled: bool,
     pub pc_learning_enabled: bool,
     pub max_cache_size: usize,
+    pub require_thought_ops: bool,
+    pub min_thought_ops: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -209,6 +211,16 @@ pub struct PCConfig {
     pub hidden_dim_factor: f32,
     /// Threshold for surprise detection based on statistical distribution
     pub surprise_threshold: f32,
+    /// Use amortized predictor only as an initialization hint (not a shortcut).
+    pub use_amortized_init: bool,
+    /// Allow direct LLM weight injection into PC levels (unsafe by default).
+    pub enable_llm_weight_injection: bool,
+    /// Learning rate for the precision hyper-network (if enabled).
+    pub precision_hyper_lr: f32,
+    /// Minimal PC mode: simple inference + simple learning (for stability).
+    pub minimal_pc_mode: bool,
+    /// Initial ThoughtDecoder vocabulary capacity (can grow dynamically).
+    pub thought_vocab_capacity: usize,
 }
 
 impl PCConfig {
@@ -235,6 +247,11 @@ impl PCConfig {
             convergence_threshold: 0.01,
             hidden_dim_factor: 0.5,
             surprise_threshold: 2.0,
+            use_amortized_init: false,
+            enable_llm_weight_injection: false,
+            precision_hyper_lr: 0.001,
+            minimal_pc_mode: false,
+            thought_vocab_capacity: 256,
         }
     }
 }
@@ -459,6 +476,11 @@ impl Default for PCConfig {
             convergence_threshold: 0.01,
             hidden_dim_factor: 0.5,
             surprise_threshold: 2.0,
+            use_amortized_init: false,
+            enable_llm_weight_injection: false,
+            precision_hyper_lr: 0.001,
+            minimal_pc_mode: false,
+            thought_vocab_capacity: 256,
         }
     }
 }
@@ -478,6 +500,8 @@ impl Default for BackendConfig {
             pc_inference_enabled: true,
             pc_learning_enabled: true,
             max_cache_size: 100,
+            require_thought_ops: true,
+            min_thought_ops: 1,
         }
     }
 }

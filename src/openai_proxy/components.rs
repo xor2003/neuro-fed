@@ -30,6 +30,8 @@ pub struct ProxyConfig {
     pub enable_cache: bool,
     pub cache_size: usize,
     pub timeout_seconds: u64,
+    pub require_thought_ops: bool,
+    pub min_thought_ops: usize,
 }
 
 impl Default for ProxyConfig {
@@ -42,6 +44,8 @@ impl Default for ProxyConfig {
             enable_cache: true,
             cache_size: 1000,
             timeout_seconds: 30,
+            require_thought_ops: true,
+            min_thought_ops: 1,
         }
     }
 }

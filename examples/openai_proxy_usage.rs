@@ -5,7 +5,7 @@ use neuro_fed_node::openai_proxy::components::ProxyConfig;
 use neuro_fed_node::openai_proxy::{OpenAiProxy, create_router};
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::pc_hierarchy::{PCConfig, PredictiveCoding};
-use neuro_fed_node::types::{CognitiveDictionary, DeviceType, Episode, StudyState};
+use neuro_fed_node::types::{CognitiveDictionary, DeviceType, StudyState};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;

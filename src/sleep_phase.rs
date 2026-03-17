@@ -3,6 +3,7 @@
 
 use crate::pc_hierarchy::PredictiveCoding;
 use crate::types::{CognitiveDictionary, Episode};
+use crate::reasoning_state::{state_error, text_error};
 use crate::{learning_log::append_learning_detail, pc_decoder::ThoughtDecoder};
 use candle_core::{Device, Tensor};
 use std::sync::Arc;
@@ -101,8 +102,36 @@ impl SleepManager {
 
             let belief = pc.levels.last().unwrap().beliefs.flatten_all()?;
 
-            if let Ok(loss) = decoder.train_step(&belief, &ep.thought_sequence, 0.05) {
-                total_loss += loss;
+            let mut state_loss = 0.0f32;
+            let mut text_loss = 0.0f32;
+            let mut state_debug: Option<String> = None;
+
+            if let Some(task) = &ep.reasoning_task {
+                let dict_guard = self.dict.read().await;
+                let ops: Vec<_> = ep
+                    .thought_sequence
+                    .iter()
+                    .map(|id| dict_guard.get_op(*id))
+                    .collect();
+                let (err, outcome) = state_error(task, &ops);
+                state_loss = err;
+                if !outcome.errors.is_empty() {
+                    state_debug = Some(outcome.errors.join(" | "));
+                }
+            }
+
+            if let Some(expected) = &ep.expected_output {
+                text_loss = text_error(expected, &ep.generated_code);
+            }
+
+            let loss_scale = (1.0 + state_loss + text_loss).clamp(0.5, 3.0);
+            let adjusted_lr = 0.05 * loss_scale as f64;
+
+            if let Ok(reasoning_loss) =
+                decoder.train_step(&belief, &ep.thought_sequence, adjusted_lr)
+            {
+                let combined_loss = reasoning_loss + state_loss + text_loss;
+                total_loss += combined_loss;
                 learned_count += 1;
                 let trajectory = {
                     let dict = self.dict.read().await;
@@ -113,14 +142,22 @@ impl SleepManager {
                         .join(" -> ")
                 };
                 detail_logs.push(format!(
-                    "Input Question: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nLoss: {:.4}",
+                    "Input Question: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
                     ep.raw_query,
                     ep.generated_code,
                     trajectory,
                     ep.thought_sequence,
                     ep.confidence,
                     ep.novelty,
-                    loss
+                    reasoning_loss,
+                    state_loss,
+                    text_loss,
+                    combined_loss,
+                    state_debug
+                        .as_ref()
+                        .map(|s| format!("\nState errors: {}", s))
+                        .unwrap_or_default(),
+                    adjusted_lr
                 ));
             }
 
@@ -179,6 +216,8 @@ mod tests {
             generated_code: "".into(),
             thought_sequence: vec![0, 1, 2],
             success: true,
+            reasoning_task: None,
+            expected_output: None,
         });
 
         let episodic_memory = Arc::new(RwLock::new(episodes));
@@ -203,7 +242,7 @@ mod sleep_phase_integration_tests {
     use super::*;
     use crate::pc_decoder::ThoughtDecoder;
     use crate::pc_hierarchy::PCConfig;
-    use crate::types::{CognitiveDictionary, Episode};
+    use crate::types::{CognitiveDictionary, Episode, ThoughtOp};
     use candle_core::Device;
     use std::collections::VecDeque;
 
@@ -214,12 +253,13 @@ mod sleep_phase_integration_tests {
         let pc_hierarchy = Arc::new(RwLock::new(pc));
 
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
-        // Original dict has 8 elements
+        // Decoder vocab can be smaller for tests; it will resize on new chunks.
         let decoder = Arc::new(RwLock::new(
             ThoughtDecoder::new(2, 8, &Device::Cpu).unwrap(),
         ));
 
         let mut episodes = VecDeque::new();
+        let eof_id = { dict.read().await.op_to_id[&ThoughtOp::EOF] };
 
         // Insert 4 identical successful episodes.
         // Because there are >3 identical bigrams (0->1), the chunk discoverer will create a new token.
@@ -235,8 +275,10 @@ mod sleep_phase_integration_tests {
                 novelty: 3.0,
                 confidence: 0.9,
                 generated_code: "print('X')".into(),
-                thought_sequence: vec![0, 1, 7], // Define -> Iterate -> EOF
+                thought_sequence: vec![0, 1, eof_id], // Define -> Iterate -> EOF
                 success: true,
+                reasoning_task: None,
+                expected_output: None,
             });
         }
 
@@ -319,6 +361,8 @@ mod deep_consolidation_tests {
                 thought_sequence: vec![define_id, iterate_id, eof_id],
                 // Will chunk Define -> Iterate (EOF ensures termination)
                 success: true,
+                reasoning_task: None,
+                expected_output: None,
             });
         }
 

@@ -105,6 +105,7 @@ async fn test_story_sleep_phase_dreaming() -> anyhow::Result<()> {
     // We get the IDs for Define and Return
     let define_id = { dict.read().await.op_to_id[&ThoughtOp::Define] };
     let compute_id = { dict.read().await.op_to_id[&ThoughtOp::Compute] };
+    let eof_id = { dict.read().await.op_to_id[&ThoughtOp::EOF] };
 
     // The proxy handled 4 requests successfully.
     // It noticed the LLM always used the "Define -> Compute" thought sequence.
@@ -115,8 +116,10 @@ async fn test_story_sleep_phase_dreaming() -> anyhow::Result<()> {
             novelty: 5.0,
             confidence: 0.2, // Was low, so proxy answered
             generated_code: "def calc(): return 1+1".into(),
-            thought_sequence: vec![define_id, compute_id, 7], // 7 is EOF
+            thought_sequence: vec![define_id, compute_id, eof_id],
             success: true,
+            reasoning_task: None,
+            expected_output: None,
         });
     }
 

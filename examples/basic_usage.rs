@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create brain manager
     match BrainManager::new(brain_sharing_config, nostr_federation_arc.clone()) {
-        Ok(mut brain_manager) => {
+        Ok(_brain_manager) => {
             println!("   Brain manager created successfully");
 
             // Note: The new brain manager API requires a PredictiveCoding instance for export
@@ -292,12 +292,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 >)
         }
         FederationStrategy::NoWalletMode {
-            difficulty,
-            timeout_seconds,
+            difficulty: _difficulty,
+            timeout_seconds: _timeout_seconds,
         } => {
             println!(
                 "   No-Wallet Mode selected (difficulty: {}, timeout: {}s)",
-                difficulty, timeout_seconds
+                _difficulty, _timeout_seconds
             );
             None
         }
@@ -305,8 +305,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pow_verifier = match &federation_manager_config.strategy {
         FederationStrategy::NoWalletMode {
-            difficulty,
-            timeout_seconds,
+            difficulty: _difficulty,
+            timeout_seconds: _timeout_seconds,
         } => {
             println!("   Creating PoWVerifier for No-Wallet Mode...");
             Some(Arc::new(PoWVerifier::new(
@@ -332,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_brain_size: 1024 * 1024 * 1024, // 1GB
     };
 
-    let brain_manager = match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone())
+    let _brain_manager = match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone())
     {
         Ok(bm) => Arc::new(bm),
         Err(e) => {
