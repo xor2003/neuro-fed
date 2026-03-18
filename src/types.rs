@@ -294,6 +294,8 @@ pub struct StructuredState {
     pub intent: AssistantIntent,
     pub goal: String,
     pub plan_steps: Vec<String>,
+    pub deliverables: Vec<String>,
+    pub verification_checks: Vec<String>,
     pub entities: HashMap<String, String>,
     pub constraints: Vec<String>,
     pub assumptions: Vec<String>,
@@ -309,6 +311,10 @@ impl StructuredState {
         if !self.plan_steps.is_empty() {
             ctx.push_str("\nPlan: ");
             ctx.push_str(&self.plan_steps.join(" -> "));
+        }
+        if !self.verification_checks.is_empty() {
+            ctx.push_str("\nVerification: ");
+            ctx.push_str(&self.verification_checks.join("; "));
         }
         if !self.assumptions.is_empty() {
             ctx.push_str("\nCorrected Assumptions: ");
@@ -336,6 +342,8 @@ pub struct Episode {
     pub assistant_intent: Option<AssistantIntent>,
     pub goal: Option<String>,
     pub plan_steps: Vec<String>,
+    pub deliverables: Vec<String>,
+    pub verification_checks: Vec<String>,
     pub constraints: Vec<String>,
     pub assumptions: Vec<String>,
     pub tests: Option<String>,
@@ -520,6 +528,8 @@ mod cognitive_dictionary_tests {
                 assistant_intent: None,
                 goal: None,
                 plan_steps: Vec::new(),
+                deliverables: Vec::new(),
+                verification_checks: Vec::new(),
                 constraints: Vec::new(),
                 assumptions: Vec::new(),
                 tests: None,
@@ -561,6 +571,11 @@ mod types_architecture_tests {
                 "design the data structure".to_string(),
                 "verify behavior with a test".to_string(),
             ],
+            deliverables: vec![
+                "implementation sketch".to_string(),
+                "verification note".to_string(),
+            ],
+            verification_checks: vec!["assert bst([1,2,3], 2) == 1".to_string()],
             entities: HashMap::new(),
             constraints: vec!["O(log n)".to_string()],
             assumptions: vec![
@@ -580,6 +595,7 @@ mod types_architecture_tests {
         assert!(context.contains("Intent: CodeTask"));
         assert!(context.contains("Goal: Write a binary search tree"));
         assert!(context.contains("Plan: inspect existing constraints -> design the data structure -> verify behavior with a test"));
+        assert!(context.contains("Verification: assert bst([1,2,3], 2) == 1"));
         assert!(context.contains(
             "Corrected Assumptions: The array is already sorted; Failed previously on empty array"
         ));

@@ -121,6 +121,8 @@ async fn test_story_sleep_phase_dreaming() -> anyhow::Result<()> {
             assistant_intent: None,
             goal: None,
             plan_steps: Vec::new(),
+            deliverables: Vec::new(),
+            verification_checks: Vec::new(),
             constraints: Vec::new(),
             assumptions: Vec::new(),
             tests: None,

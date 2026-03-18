@@ -142,7 +142,7 @@ impl SleepManager {
                         .join(" -> ")
                 };
                 detail_logs.push(format!(
-                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
+                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nDeliverables: {}\nVerification checks: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
                     ep.raw_query,
                     ep.assistant_intent
                         .as_ref()
@@ -153,6 +153,16 @@ impl SleepManager {
                         "none".to_string()
                     } else {
                         ep.plan_steps.join(" -> ")
+                    },
+                    if ep.deliverables.is_empty() {
+                        "none".to_string()
+                    } else {
+                        ep.deliverables.join("; ")
+                    },
+                    if ep.verification_checks.is_empty() {
+                        "none".to_string()
+                    } else {
+                        ep.verification_checks.join("; ")
                     },
                     if ep.constraints.is_empty() {
                         "none".to_string()
@@ -240,6 +250,8 @@ mod tests {
             assistant_intent: None,
             goal: None,
             plan_steps: Vec::new(),
+            deliverables: Vec::new(),
+            verification_checks: Vec::new(),
             constraints: Vec::new(),
             assumptions: Vec::new(),
             tests: None,
@@ -307,6 +319,8 @@ mod sleep_phase_integration_tests {
                 assistant_intent: None,
                 goal: None,
                 plan_steps: Vec::new(),
+                deliverables: Vec::new(),
+                verification_checks: Vec::new(),
                 constraints: Vec::new(),
                 assumptions: Vec::new(),
                 tests: None,
@@ -397,6 +411,8 @@ mod deep_consolidation_tests {
                 assistant_intent: None,
                 goal: None,
                 plan_steps: Vec::new(),
+                deliverables: Vec::new(),
+                verification_checks: Vec::new(),
                 constraints: Vec::new(),
                 assumptions: Vec::new(),
                 tests: None,

@@ -567,6 +567,8 @@ impl OpenAiProxy {
             assistant_intent: Some(state.intent.clone()),
             goal: Some(state.goal.clone()),
             plan_steps: state.plan_steps.clone(),
+            deliverables: state.deliverables.clone(),
+            verification_checks: state.verification_checks.clone(),
             constraints: state.constraints.clone(),
             assumptions: state.assumptions.clone(),
             tests: if state.tests.trim().is_empty() {
@@ -671,11 +673,14 @@ impl OpenAiProxy {
         let (reasoning_task, expected_output) = detect_reasoning_task(&raw_query);
         let intent = detect_intent(&raw_query, reasoning_task.is_some());
         let plan_steps = build_plan_steps(&intent, &raw_query);
+        let (deliverables, verification_checks) = workflow_contract_for_intent(&intent, &raw_query);
         let (constraints, assumptions, tests) = scaffold_state_for_intent(&intent, &raw_query);
         StructuredState {
             intent,
             goal: raw_query.clone(),
             plan_steps,
+            deliverables,
+            verification_checks,
             entities: HashMap::new(),
             constraints,
             assumptions,
@@ -959,20 +964,67 @@ fn build_intent_guidance(state: &StructuredState) -> Option<String> {
     match state.intent {
         AssistantIntent::Chat | AssistantIntent::Reasoning => None,
         AssistantIntent::Investigation => Some(format!(
-            "Investigation mode:\n- restate the question precisely\n- gather evidence before conclusions\n- separate findings from assumptions\n- end with open questions or uncertainties if any remain\nPlanned steps:\n- {}\nTask: {}",
+            "Investigation mode:\n- restate the question precisely\n- gather evidence before conclusions\n- separate findings from assumptions\n- end with open questions or uncertainties if any remain\nPlanned steps:\n- {}\nDeliverables:\n- {}\nVerification:\n- {}\nTask: {}",
             state.plan_steps.join("\n- "),
+            state.deliverables.join("\n- "),
+            state.verification_checks.join("\n- "),
             state.raw_query
         )),
         AssistantIntent::CodeTask => Some(format!(
-            "Code-task mode:\n- inspect the relevant code path first\n- propose or follow a concrete change plan\n- preserve behavior unless intentionally changed\n- verify with tests or build commands when possible\nPlanned steps:\n- {}\nTask: {}",
+            "Code-task mode:\n- inspect the relevant code path first\n- propose or follow a concrete change plan\n- preserve behavior unless intentionally changed\n- verify with tests or build commands when possible\nPlanned steps:\n- {}\nDeliverables:\n- {}\nVerification:\n- {}\nTask: {}",
             state.plan_steps.join("\n- "),
+            state.deliverables.join("\n- "),
+            state.verification_checks.join("\n- "),
             state.raw_query
         )),
         AssistantIntent::TextTask => Some(format!(
-            "Text-task mode:\n- identify audience, goal, and tone\n- preserve key facts and constraints\n- optimize for clarity and structure\nPlanned steps:\n- {}\nTask: {}",
+            "Text-task mode:\n- identify audience, goal, and tone\n- preserve key facts and constraints\n- optimize for clarity and structure\nPlanned steps:\n- {}\nDeliverables:\n- {}\nVerification:\n- {}\nTask: {}",
             state.plan_steps.join("\n- "),
+            state.deliverables.join("\n- "),
+            state.verification_checks.join("\n- "),
             state.raw_query
         )),
+    }
+}
+
+fn workflow_contract_for_intent(
+    intent: &AssistantIntent,
+    raw_query: &str,
+) -> (Vec<String>, Vec<String>) {
+    match intent {
+        AssistantIntent::Chat | AssistantIntent::Reasoning => (Vec::new(), Vec::new()),
+        AssistantIntent::Investigation => (
+            vec![
+                "concise findings summary".to_string(),
+                "evidence summary".to_string(),
+                "open questions".to_string(),
+            ],
+            vec![
+                format!("answer must stay anchored to the investigation target: {}", raw_query),
+                "findings and assumptions must be separated".to_string(),
+            ],
+        ),
+        AssistantIntent::CodeTask => (
+            vec![
+                "change plan".to_string(),
+                "implementation summary".to_string(),
+                "verification summary".to_string(),
+            ],
+            vec![
+                "state the concrete verification command or reason it could not run".to_string(),
+                "call out behavior changes or residual risks".to_string(),
+            ],
+        ),
+        AssistantIntent::TextTask => (
+            vec![
+                "rewritten text".to_string(),
+                "applied style/tone summary".to_string(),
+            ],
+            vec![
+                "preserve core meaning and factual content".to_string(),
+                "match requested tone, brevity, or audience constraints".to_string(),
+            ],
+        ),
     }
 }
 
@@ -1088,11 +1140,13 @@ fn render_local_intent_response(
 
     match state.intent {
         AssistantIntent::Investigation => format!(
-            "Investigation Plan:\n- Goal: {}\n- Steps: {}\n- Evidence needed: {}\n- Assumptions: {}\n- Open questions: {}\n- Working local clue: {}\n{}\n{}",
+            "Investigation Plan:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Evidence needed: {}\n- Assumptions: {}\n- Verification: {}\n- Open questions: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
             join_or_default(&state.plan_steps, "restate the question; collect evidence; synthesize findings"),
+            join_or_default(&state.deliverables, "findings summary; evidence summary; open questions"),
             join_or_default(&state.constraints, "collect evidence before concluding"),
             join_or_default(&state.assumptions, "the available local context is incomplete"),
+            join_or_default(&state.verification_checks, "separate findings from assumptions"),
             if state.tests.trim().is_empty() {
                 "document uncertainty and list missing evidence".to_string()
             } else {
@@ -1103,9 +1157,10 @@ fn render_local_intent_response(
             signal_line
         ),
         AssistantIntent::CodeTask => format!(
-            "Code Task Plan:\n- Goal: {}\n- Steps: {}\n- Constraints: {}\n- Assumptions: {}\n- Verification: {}\n- Working local clue: {}\n{}\n{}",
+            "Code Task Workflow:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Constraints: {}\n- Assumptions: {}\n- Verification target: {}\n- Verification checks: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
             join_or_default(&state.plan_steps, "inspect code path; implement smallest coherent change; verify behavior"),
+            join_or_default(&state.deliverables, "change plan; implementation summary; verification summary"),
             join_or_default(&state.constraints, "preserve existing behavior until validated"),
             join_or_default(&state.assumptions, "the repository needs inspection before editing"),
             if state.tests.trim().is_empty() {
@@ -1113,14 +1168,16 @@ fn render_local_intent_response(
             } else {
                 state.tests.clone()
             },
+            join_or_default(&state.verification_checks, "state concrete verification or explain why it could not run"),
             decoded_hint,
             guidance_line,
             signal_line
         ),
         AssistantIntent::TextTask => format!(
-            "Text Task Plan:\n- Goal: {}\n- Steps: {}\n- Constraints: {}\n- Assumptions: {}\n- Quality check: {}\n- Working local clue: {}\n{}\n{}",
+            "Text Task Workflow:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Constraints: {}\n- Assumptions: {}\n- Quality target: {}\n- Verification checks: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
             join_or_default(&state.plan_steps, "identify target tone; rewrite; check fidelity and clarity"),
+            join_or_default(&state.deliverables, "rewritten text; style/tone summary"),
             join_or_default(&state.constraints, "preserve meaning while improving the writing"),
             join_or_default(&state.assumptions, "the user wants a direct rewrite or edit"),
             if state.tests.trim().is_empty() {
@@ -1128,6 +1185,7 @@ fn render_local_intent_response(
             } else {
                 state.tests.clone()
             },
+            join_or_default(&state.verification_checks, "preserve meaning and match requested style"),
             decoded_hint,
             guidance_line,
             signal_line
@@ -1325,6 +1383,19 @@ mod proxy_utility_tests {
     }
 
     #[test]
+    fn test_workflow_contract_for_code_and_text_tasks() {
+        let (code_deliverables, code_checks) =
+            workflow_contract_for_intent(&AssistantIntent::CodeTask, "fix parser bug");
+        assert!(code_deliverables.iter().any(|item| item.contains("verification")));
+        assert!(code_checks.iter().any(|item| item.contains("verification command")));
+
+        let (text_deliverables, text_checks) =
+            workflow_contract_for_intent(&AssistantIntent::TextTask, "rewrite this paragraph");
+        assert!(text_deliverables.iter().any(|item| item.contains("rewritten text")));
+        assert!(text_checks.iter().any(|item| item.contains("preserve core meaning")));
+    }
+
+    #[test]
     fn test_render_local_intent_response_for_code_task() {
         let state = StructuredState {
             intent: AssistantIntent::CodeTask,
@@ -1333,6 +1404,15 @@ mod proxy_utility_tests {
                 "inspect the parser".to_string(),
                 "patch the bug".to_string(),
                 "run tests".to_string(),
+            ],
+            deliverables: vec![
+                "change plan".to_string(),
+                "implementation summary".to_string(),
+                "verification summary".to_string(),
+            ],
+            verification_checks: vec![
+                "state the concrete verification command or reason it could not run".to_string(),
+                "call out behavior changes or residual risks".to_string(),
             ],
             entities: HashMap::new(),
             constraints: vec!["Inspect the existing code path before editing".to_string()],
@@ -1351,9 +1431,10 @@ mod proxy_utility_tests {
             Some(0.7),
         );
 
-        assert!(rendered.contains("Code Task Plan"));
+        assert!(rendered.contains("Code Task Workflow"));
         assert!(rendered.contains("fix parser bug"));
         assert!(rendered.contains("Run cargo build"));
+        assert!(rendered.contains("verification summary"));
         assert!(rendered.contains("PLAN -> REFINE"));
         assert!(rendered.contains("avg 0.200"));
     }
@@ -1367,6 +1448,16 @@ mod proxy_utility_tests {
                 "restate the investigation target".to_string(),
                 "collect evidence".to_string(),
                 "summarize findings".to_string(),
+            ],
+            deliverables: vec![
+                "concise findings summary".to_string(),
+                "evidence summary".to_string(),
+                "open questions".to_string(),
+            ],
+            verification_checks: vec![
+                "answer must stay anchored to the investigation target: investigate architecture drift"
+                    .to_string(),
+                "findings and assumptions must be separated".to_string(),
             ],
             entities: HashMap::new(),
             constraints: vec!["Collect evidence before concluding".to_string()],
@@ -1390,6 +1481,8 @@ mod proxy_utility_tests {
             intent: AssistantIntent::Investigation,
             goal: "investigate architecture drift".to_string(),
             plan_steps: vec!["inspect runtime".to_string(), "compare docs".to_string()],
+            deliverables: vec!["findings summary".to_string()],
+            verification_checks: vec!["separate findings from assumptions".to_string()],
             entities: HashMap::new(),
             constraints: vec!["Collect evidence before concluding".to_string()],
             assumptions: vec!["Some modules may be placeholders".to_string()],
@@ -1605,6 +1698,7 @@ mod reasoning_consistency_tests {
         let last = memory.back().expect("episode should be recorded");
         assert_eq!(last.assistant_intent, Some(AssistantIntent::Reasoning));
         assert!(!last.plan_steps.is_empty());
+        assert!(last.deliverables.is_empty());
         assert_eq!(last.reasoning_task, Some(ReasoningTask::Multiply { a: 17, b: 23 }));
         assert_eq!(last.expected_output.as_deref(), Some("391"));
     }

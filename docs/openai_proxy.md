@@ -251,6 +251,34 @@ This gives the assistant a basic evidence memory:
 - open questions survive across sessions when persistence is enabled
 - the retrieval path is narrow and evidence-oriented rather than generic chat history replay
 
+### 12. Code And Text Workflows
+
+`code_task` and `text_task` are now backed by an explicit workflow contract instead of only a task label.
+
+For code and text requests, `StructuredState` now carries:
+- `plan_steps`
+- `deliverables`
+- `verification_checks`
+- task-specific constraints, assumptions, and tests
+
+Current effect in the proxy:
+- system guidance for code/text requests includes required deliverables and verification checks
+- local fallback responses render as structured workflows instead of generic chat text
+- episodic memory and sleep logs retain the workflow contract so replay/training can learn from more than final output text
+
+Code-task contract currently emphasizes:
+- inspect before edit
+- smallest coherent change
+- explicit verification command or an explicit reason it could not run
+- residual risk reporting
+
+Text-task contract currently emphasizes:
+- preserving core meaning and facts
+- matching requested tone/brevity constraints
+- returning both rewritten text and a compact style summary
+
+This is still not a full executor, but it moves code/text handling from prompt flavoring into a stable state contract that later execution loops can build on directly.
+
 **Configuration**:
 ```toml
 [backend_config]

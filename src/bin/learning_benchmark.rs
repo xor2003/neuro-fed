@@ -717,6 +717,8 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
                 }),
                 goal: Some(spec.raw_query.clone()),
                 plan_steps: spec.ops.iter().map(ToString::to_string).collect(),
+                deliverables: Vec::new(),
+                verification_checks: Vec::new(),
                 constraints: Vec::new(),
                 assumptions: Vec::new(),
                 tests: spec.expected_output.clone(),
