@@ -335,6 +335,20 @@ They now see a stable output structure that can be:
 - reused as workflow memory
 - extended later into more explicit evaluator logic
 
+### 15. Structured Benchmark Scoring
+
+The learning benchmark now evaluates structured assistant behavior more directly.
+
+Two concrete changes:
+- `learning_feedback.csv` now includes assistant `intent` and `structured_section_score`
+- `--reasoning-check` now includes proxy structure checks for:
+  - investigation output sections
+  - code-task output sections
+  - text-task output sections
+
+This means regressions are no longer limited to arithmetic/state-path failures.
+The benchmark can now fail if the assistant collapses from structured workflow outputs back into unstructured generic text.
+
 **Configuration**:
 ```toml
 [backend_config]

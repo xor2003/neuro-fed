@@ -62,6 +62,36 @@ struct Args {
     minimal_pc: bool,
 }
 
+fn expected_sections_for_intent(intent: &str) -> &'static [&'static str] {
+    match intent {
+        "Investigation" => &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"],
+        "CodeTask" => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Implementation:",
+            "Verification:",
+            "Risks:",
+        ],
+        "TextTask" => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Rewritten Text:",
+            "Quality Check:",
+        ],
+        _ => &[],
+    }
+}
+
+fn structured_section_score(intent: &str, answer: &str) -> usize {
+    let normalized = answer.replace("\r\n", "\n");
+    expected_sections_for_intent(intent)
+        .iter()
+        .filter(|section| normalized.contains(**section))
+        .count()
+}
+
 fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
     let raw = fs::read_to_string(path).context("reading detail.log")?;
     let mut results = Vec::new();
@@ -74,6 +104,8 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
         let mut task_id = None;
         let mut loss = None;
         let mut trajectory = None;
+        let mut intent = None;
+        let mut answer = None;
         for line in block.lines() {
             if line.starts_with("Question:") {
                 if let Some(json) = line.splitn(2, ':').nth(1) {
@@ -112,6 +144,20 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                         .to_string(),
                 );
             }
+            if line.trim_start().starts_with("Intent:") {
+                intent = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .map(str::trim)
+                    .map(str::to_string);
+            }
+            if line.trim_start().starts_with("Answer:") {
+                answer = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .map(str::trim)
+                    .map(str::to_string);
+            }
             if line.trim_start().starts_with("Input Question:") && task_id.is_none() {
                 if let Some(raw) = line.splitn(2, ':').nth(1) {
                     let cleaned = raw.trim();
@@ -122,10 +168,17 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
             }
         }
         if let (Some(task_id), Some(loss)) = (task_id, loss) {
+            let intent_label = intent.unwrap_or_else(|| "Unknown".to_string());
+            let section_score = answer
+                .as_deref()
+                .map(|value| structured_section_score(&intent_label, value))
+                .unwrap_or(0);
             results.push(LearningRecord {
                 task_id,
+                intent: intent_label,
                 loss,
                 trajectory,
+                structured_section_score: section_score,
             });
         }
     }
@@ -134,12 +187,14 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
 
 fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
     let mut wtr = csv::Writer::from_path(output)?;
-    wtr.write_record(&["task_id", "loss", "trajectory"])?;
+    wtr.write_record(&["task_id", "intent", "loss", "trajectory", "structured_section_score"])?;
     for record in records {
         wtr.write_record(&[
             &record.task_id,
+            &record.intent,
             &record.loss,
             record.trajectory.as_deref().unwrap_or_default(),
+            &record.structured_section_score.to_string(),
         ])?;
     }
     wtr.flush()?;
@@ -267,6 +322,9 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
         let mut proxy_failures = Vec::new();
         let mut config = NodeConfig::load_or_default();
         config.proxy_config.pc_learning_enabled = false;
+        config.proxy_config.require_thought_ops = false;
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.require_thought_ops = false;
         let engine = Arc::new(RwLock::new(MLEngine::mock()?));
         let embedding_dim = engine.read().await.embedding_dim();
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
@@ -285,7 +343,7 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
         let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
         let proxy = OpenAiProxy::new(
             config,
-            ProxyConfig::default(),
+            proxy_config,
             engine,
             pc_hierarchy,
             embedding_dim,
@@ -350,6 +408,82 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
                         "false",
                         "error",
                         expected,
+                        "",
+                        "1",
+                        "1",
+                        "true",
+                        &err.to_string(),
+                    ])?;
+                    proxy_failures.push(case_id.to_string());
+                }
+            }
+        }
+
+        let structured_cases = vec![
+            (
+                "proxy_investigation_structure",
+                "investigate architecture drift in this repo",
+                "Investigation",
+                vec!["Goal:", "Findings:", "Evidence:"],
+            ),
+            (
+                "proxy_code_structure",
+                "implement a parser and add tests",
+                "CodeTask",
+                vec!["Goal:", "Implementation:", "Verification:"],
+            ),
+            (
+                "proxy_text_structure",
+                "rewrite this paragraph to be shorter",
+                "TextTask",
+                vec!["Goal:", "Rewritten Text:", "Quality Check:"],
+            ),
+        ];
+
+        for (case_id, query, intent, sections) in structured_cases {
+            let response = proxy
+                .handle_chat_completion(OpenAiRequest {
+                    model: "neurofed-response".to_string(),
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!(query),
+                        name: None,
+                    }],
+                    ..OpenAiRequest::default()
+                })
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let actual_output = resp.choices.first()
+                        .and_then(|choice| choice.message.content.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let section_hits = sections.iter().filter(|section| actual_output.contains(**section)).count();
+                    let success = section_hits == sections.len();
+                    wtr.write_record(&[
+                        case_id,
+                        "proxy_structure",
+                        &success.to_string(),
+                        intent,
+                        &sections.join(" | "),
+                        &actual_output,
+                        "0",
+                        &(sections.len() - section_hits).to_string(),
+                        "false",
+                        if success { "" } else { "missing structured sections" },
+                    ])?;
+                    if !success {
+                        proxy_failures.push(case_id.to_string());
+                    }
+                }
+                Err(err) => {
+                    wtr.write_record(&[
+                        case_id,
+                        "proxy_structure",
+                        "false",
+                        intent,
+                        &sections.join(" | "),
                         "",
                         "1",
                         "1",
@@ -745,7 +879,7 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
 }
 
 #[cfg(test)]
-mod tests {
+mod section_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -812,8 +946,29 @@ mod tests {
 #[derive(Debug)]
 struct LearningRecord {
     task_id: String,
+    intent: String,
     loss: String,
     trajectory: Option<String>,
+    structured_section_score: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_structured_section_score_for_code_task() {
+        let score = structured_section_score(
+            "CodeTask",
+            "Goal:\nfix parser\n\nPlan:\n- inspect\n\nDeliverables:\n- summary\n\nImplementation:\nchanged parser\n\nVerification:\nran cargo build\n\nRisks:\n- edge cases",
+        );
+        assert_eq!(score, 6);
+    }
+
+    #[test]
+    fn test_structured_section_score_for_unknown_intent_is_zero() {
+        assert_eq!(structured_section_score("Unknown", "Goal:\nwhatever"), 0);
+    }
 }
 
 fn main() -> Result<()> {
