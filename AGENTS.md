@@ -282,6 +282,18 @@ If you want the local non-LLM path only:
   --dry-run
 ```
 
+Validate dataset quality before training:
+```bash
+.venv/bin/python scripts/validate_reasoning_dataset.py --input data/merged_learning.jsonl --apply-prepare
+.venv/bin/python scripts/validate_reasoning_dataset.py --input data/reasoning_ready.jsonl
+.venv/bin/python scripts/validate_reasoning_dataset.py --input data/reasoning_ready_llm.jsonl
+```
+Use this as the minimum gate:
+1. raw merged dataset report
+2. heuristic-prepared reasoning dataset report
+3. optional LLM-prepared reasoning dataset report
+Do not start a reasoning-focused training run if generic assistant contamination is still high or reasoning-ready coverage is weak.
+
 ### Dataset Fetch (Required Sources)
 Use `scripts/fetch_datasets.py` to download and convert the required datasets into raw JSONL:
 ```bash
