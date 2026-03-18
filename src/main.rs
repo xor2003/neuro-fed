@@ -412,8 +412,12 @@ async fn main() -> Result<()> {
         study_state.clone(),
         episodic_memory.clone(),
         calibration_store.clone(),
+        Some(persistence.clone()),
         semantic_cache.clone(),
     ));
+    if let Err(e) = proxy.load_investigation_notes().await {
+        tracing::warn!("Failed to load investigation notes: {}", e);
+    }
 
     // Initialize Nostr federation and brain sharing (config-driven)
     let nostr_federation = Arc::new(NostrFederation::new(config.nostr_config.clone()));

@@ -224,6 +224,33 @@ Practical effect:
 
 This is the first step toward replaying full assistant behavior instead of replaying only a response string.
 
+### 11. Investigation Memory
+
+The proxy now keeps a dedicated investigation-note layer on top of episodic memory.
+
+When an investigation request succeeds:
+- the proxy builds an `InvestigationNote`
+- stores a semantic embedding for the query
+- persists the note through the main Redb persistence layer when available
+
+Each note captures:
+- query and goal
+- compact summary
+- evidence summary
+- open questions
+- plan steps
+- constraints and assumptions
+
+For later investigation requests, the proxy:
+1. embeds the new query
+2. retrieves the most similar stored investigation notes
+3. injects those prior findings back into the investigation guidance path
+
+This gives the assistant a basic evidence memory:
+- repeated investigations can reuse prior findings
+- open questions survive across sessions when persistence is enabled
+- the retrieval path is narrow and evidence-oriented rather than generic chat history replay
+
 **Configuration**:
 ```toml
 [backend_config]

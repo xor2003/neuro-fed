@@ -25,11 +25,13 @@ use crate::openai_proxy::types::{
 };
 use crate::pc_decoder::{ThoughtConstraints, ThoughtDecoder};
 use crate::pc_hierarchy::PredictiveCoding;
+use crate::persistence::PCPersistence;
 use crate::reasoning_state::{execute_plan, recommended_ops, render_output};
 use crate::semantic_cache::SemanticCache;
 use crate::sleep_phase::SleepManager;
 use crate::types::{
-    AssistantIntent, CognitiveDictionary, Episode, ReasoningTask, StructuredState, StudyState,
+    AssistantIntent, CognitiveDictionary, Episode, InvestigationNote, ReasoningTask,
+    StructuredState, StudyState,
 };
 use candle_core::Tensor;
 
@@ -56,14 +58,28 @@ pub struct OpenAiProxy {
     pub cognitive_dict: Arc<RwLock<CognitiveDictionary>>,
     pub metrics: Arc<RwLock<ProxyMetrics>>,
     pub cache: Option<Arc<RwLock<SemanticCache>>>,
+    pub persistence: Option<Arc<PCPersistence>>,
 
     episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
+    investigation_notes: Arc<RwLock<Vec<InvestigationNote>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
     pub study_state: Arc<RwLock<StudyState>>,
     pub ui_state: Arc<RwLock<UiState>>,
 }
 
 impl OpenAiProxy {
+    pub async fn load_investigation_notes(&self) -> Result<(), ProxyError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let notes = persistence
+            .load_investigation_notes()
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Failed to load investigation notes: {}", e)))?;
+        *self.investigation_notes.write().await = notes;
+        Ok(())
+    }
+
     pub fn new(
         config: NodeConfig,
         proxy_config: ProxyConfig,
@@ -75,6 +91,7 @@ impl OpenAiProxy {
         study_state: Arc<RwLock<StudyState>>,
         episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
         calibration: Arc<RwLock<CalibrationStore>>,
+        persistence: Option<Arc<PCPersistence>>,
         cache: Option<Arc<RwLock<SemanticCache>>>,
     ) -> Self {
         let metrics = Arc::new(RwLock::new(ProxyMetrics::default()));
@@ -89,7 +106,9 @@ impl OpenAiProxy {
             cognitive_dict,
             metrics,
             cache,
+            persistence,
             episodic_memory,
+            investigation_notes: Arc::new(RwLock::new(Vec::new())),
             calibration,
             study_state,
             ui_state,
@@ -140,6 +159,61 @@ impl OpenAiProxy {
         metrics.thought_decoder_calls += 1;
     }
 
+    async fn retrieve_investigation_notes(&self, raw_query: &str) -> Vec<InvestigationNote> {
+        let query_embedding = match self.local_engine.read().await.process_text(raw_query).await {
+            Ok(tensor) => match tensor.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                Ok(values) => values,
+                Err(_) => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+
+        let mut ranked = self
+            .investigation_notes
+            .read()
+            .await
+            .iter()
+            .filter_map(|note| {
+                let score = cosine_similarity(&query_embedding, &note.embedding)?;
+                Some((score, note.clone()))
+            })
+            .filter(|(score, _)| *score >= 0.72)
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ranked.into_iter().take(3).map(|(_, note)| note).collect()
+    }
+
+    async fn persist_investigation_note(
+        &self,
+        state: &StructuredState,
+        final_text: &str,
+    ) -> Result<(), ProxyError> {
+        let embedding = self
+            .local_engine
+            .read()
+            .await
+            .process_text(&state.raw_query)
+            .await
+            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to embed investigation note: {}", e)))?
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten investigation note embedding: {}", e)))?;
+
+        let timestamp = Utc::now().timestamp();
+        let note = build_investigation_note(state, final_text, embedding, timestamp);
+        self.investigation_notes.write().await.push(note.clone());
+
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .save_investigation_note(&note)
+                .await
+                .map_err(|e| ProxyError::CacheError(format!("Failed to save investigation note: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
     /// Main handler with iterative reasoning, calibration, and verification
     pub async fn handle_chat_completion(
         &self,
@@ -166,6 +240,16 @@ impl OpenAiProxy {
         }
         self.ui_reset("Answering...").await;
         let state = self.extract_structured_state(&req).await;
+        let related_investigation_notes = if matches!(state.intent, AssistantIntent::Investigation) {
+            let notes = self.retrieve_investigation_notes(&state.raw_query).await;
+            if !notes.is_empty() {
+                self.ui_push_step(format!("Investigation memory hits: {}", notes.len()))
+                    .await;
+            }
+            notes
+        } else {
+            Vec::new()
+        };
         self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
             .await;
         self.ui_push_step("PC reasoning: embed + infer").await;
@@ -303,6 +387,11 @@ impl OpenAiProxy {
         }
         if let Some(intent_guidance) = build_intent_guidance(&state) {
             guidance_parts.push(intent_guidance);
+        }
+        if !related_investigation_notes.is_empty() {
+            guidance_parts.push(build_investigation_memory_guidance(
+                &related_investigation_notes,
+            ));
         }
         if !guidance_parts.is_empty() {
             req.messages.insert(0, Message {
@@ -460,6 +549,12 @@ impl OpenAiProxy {
             .write()
             .await
             .record_outcome(raw_confidence, success);
+
+        if success && matches!(state.intent, AssistantIntent::Investigation) {
+            if let Err(err) = self.persist_investigation_note(&state, &final_text).await {
+                tracing::warn!("Failed to persist investigation note: {}", err);
+            }
+        }
 
         self.episodic_memory.write().await.push_back(Episode {
             raw_query: state.raw_query.clone(),
@@ -881,6 +976,87 @@ fn build_intent_guidance(state: &StructuredState) -> Option<String> {
     }
 }
 
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (left, right) in a.iter().zip(b.iter()) {
+        dot += left * right;
+        norm_a += left * left;
+        norm_b += right * right;
+    }
+    if norm_a <= 1e-6 || norm_b <= 1e-6 {
+        return None;
+    }
+    Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(max_chars).collect::<String>() + "..."
+}
+
+fn extract_open_questions(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with('?'))
+        .map(str::to_string)
+        .take(3)
+        .collect()
+}
+
+fn build_investigation_note(
+    state: &StructuredState,
+    final_text: &str,
+    embedding: Vec<f32>,
+    timestamp: i64,
+) -> InvestigationNote {
+    let open_questions = extract_open_questions(final_text);
+    InvestigationNote {
+        id: timestamp as u64,
+        query: state.raw_query.clone(),
+        goal: state.goal.clone(),
+        summary: compact_text(final_text, 280),
+        evidence_summary: compact_text(
+            if state.tests.trim().is_empty() {
+                final_text
+            } else {
+                state.tests.as_str()
+            },
+            180,
+        ),
+        open_questions,
+        plan_steps: state.plan_steps.clone(),
+        constraints: state.constraints.clone(),
+        assumptions: state.assumptions.clone(),
+        embedding,
+        updated_at: timestamp,
+    }
+}
+
+fn build_investigation_memory_guidance(notes: &[InvestigationNote]) -> String {
+    let mut lines = vec!["Investigation memory: reuse prior evidence when relevant.".to_string()];
+    for note in notes {
+        lines.push(format!(
+            "- Prior query: {}\n  Summary: {}\n  Evidence: {}",
+            note.query, note.summary, note.evidence_summary
+        ));
+        if !note.open_questions.is_empty() {
+            lines.push(format!(
+                "  Open questions: {}",
+                note.open_questions.join(" | ")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 fn join_or_default(items: &[String], fallback: &str) -> String {
     if items.is_empty() {
         fallback.to_string()
@@ -1207,6 +1383,55 @@ mod proxy_utility_tests {
         assert!(rendered.contains("evidence summary"));
         assert!(rendered.contains("predictive-coding belief unavailable"));
     }
+
+    #[test]
+    fn test_build_investigation_note_captures_open_questions() {
+        let state = StructuredState {
+            intent: AssistantIntent::Investigation,
+            goal: "investigate architecture drift".to_string(),
+            plan_steps: vec!["inspect runtime".to_string(), "compare docs".to_string()],
+            entities: HashMap::new(),
+            constraints: vec!["Collect evidence before concluding".to_string()],
+            assumptions: vec!["Some modules may be placeholders".to_string()],
+            tests: "Return findings, evidence summary, and remaining uncertainties".to_string(),
+            raw_query: "investigate architecture drift".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let note = build_investigation_note(
+            &state,
+            "Summary of drift.\nWhat is the next integration target?",
+            vec![0.1, 0.2, 0.3],
+            99,
+        );
+
+        assert_eq!(note.id, 99);
+        assert_eq!(note.goal, "investigate architecture drift");
+        assert_eq!(note.open_questions.len(), 1);
+        assert!(note.evidence_summary.contains("remaining uncertainties"));
+    }
+
+    #[test]
+    fn test_build_investigation_memory_guidance_lists_prior_notes() {
+        let guidance = build_investigation_memory_guidance(&[InvestigationNote {
+            id: 1,
+            query: "investigate architecture drift".to_string(),
+            goal: "find drift".to_string(),
+            summary: "Runtime path is narrower than docs.".to_string(),
+            evidence_summary: "Compared main.rs against docs.".to_string(),
+            open_questions: vec!["Which module should be integrated next?".to_string()],
+            plan_steps: vec![],
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 1,
+        }]);
+
+        assert!(guidance.contains("Investigation memory"));
+        assert!(guidance.contains("Prior query"));
+        assert!(guidance.contains("Open questions"));
+    }
 }
 #[cfg(test)]
 mod proxy_integration_tests {
@@ -1294,6 +1519,7 @@ mod reasoning_consistency_tests {
             episodic_memory,
             calibration,
             None,
+            None,
         );
 
         let query_text = "Calculate the square root of 144";
@@ -1350,6 +1576,7 @@ mod reasoning_consistency_tests {
             study_state,
             episodic_memory.clone(),
             calibration,
+            None,
             None,
         );
 

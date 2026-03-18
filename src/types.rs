@@ -343,6 +343,21 @@ pub struct Episode {
     pub expected_output: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InvestigationNote {
+    pub id: u64,
+    pub query: String,
+    pub goal: String,
+    pub summary: String,
+    pub evidence_summary: String,
+    pub open_questions: Vec<String>,
+    pub plan_steps: Vec<String>,
+    pub constraints: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub embedding: Vec<f32>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitiveDictionary {
     pub id_to_op: HashMap<u32, ThoughtOp>,

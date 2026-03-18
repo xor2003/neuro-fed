@@ -295,6 +295,7 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
             episodic_memory,
             calibration,
             None,
+            None,
         );
 
         let proxy_cases = vec![

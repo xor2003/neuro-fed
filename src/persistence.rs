@@ -2,7 +2,7 @@
 // Pure Rust Redb database and state persistence for PC weights
 
 use crate::openai_proxy::calibration::CalibrationStore;
-use crate::types::CognitiveDictionary;
+use crate::types::{CognitiveDictionary, InvestigationNote};
 use candle_core::Error as CandleError;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,7 @@ const THOUGHT_DECODER: TableDefinition<u64, &[u8]> = TableDefinition::new("thoug
 const COGNITIVE_DICTIONARY: TableDefinition<u64, &[u8]> =
     TableDefinition::new("cognitive_dictionary");
 const CALIBRATION_STORE: TableDefinition<u64, &[u8]> = TableDefinition::new("calibration_store");
+const INVESTIGATION_NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("investigation_notes");
 
 /// Database manager for PC persistence using pure Rust Redb
 pub struct PCPersistence {
@@ -101,6 +102,7 @@ impl PCPersistence {
             let _ = write_txn.open_table(THOUGHT_DECODER);
             let _ = write_txn.open_table(COGNITIVE_DICTIONARY);
             let _ = write_txn.open_table(CALIBRATION_STORE);
+            let _ = write_txn.open_table(INVESTIGATION_NOTES);
         }
         write_txn
             .commit()
@@ -563,6 +565,57 @@ impl PCPersistence {
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         Ok(())
     }
+
+    pub async fn save_investigation_note(
+        &self,
+        note: &InvestigationNote,
+    ) -> Result<(), PersistenceError> {
+        let serialized = bincode::serialize(note)
+            .map_err(|e| PersistenceError::SerializationError(e.to_string()))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(INVESTIGATION_NOTES)
+                .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+            table
+                .insert(note.id, serialized.as_slice())
+                .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn load_investigation_notes(
+        &self,
+    ) -> Result<Vec<InvestigationNote>, PersistenceError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        let table = match read_txn.open_table(INVESTIGATION_NOTES) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut notes = Vec::new();
+        for result in table
+            .iter()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?
+        {
+            let (_, data) = result.map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+            let note: InvestigationNote = bincode::deserialize(data.value())
+                .map_err(|e| PersistenceError::SerializationError(e.to_string()))?;
+            notes.push(note);
+        }
+
+        notes.sort_by_key(|note| std::cmp::Reverse(note.updated_at));
+        Ok(notes)
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +711,34 @@ mod persistence_integrity_tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].prompt_hash, "abcdef123");
         assert_eq!(loaded[0].access_count, 5);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_investigation_note_storage() {
+        let db_path = temp_db_path();
+        let persistence = PCPersistence::new(&db_path).await.unwrap();
+
+        let note = InvestigationNote {
+            id: 7,
+            query: "investigate architecture drift".into(),
+            goal: "find runtime and doc drift".into(),
+            summary: "Runtime path is narrower than docs imply.".into(),
+            evidence_summary: "Compared main startup path with documented modules.".into(),
+            open_questions: vec!["Which module should be integrated next?".into()],
+            plan_steps: vec!["inspect runtime".into(), "compare docs".into()],
+            constraints: vec!["Collect evidence before concluding".into()],
+            assumptions: vec!["Some modules are placeholders".into()],
+            embedding: vec![0.1, 0.2, 0.3],
+            updated_at: 42,
+        };
+
+        persistence.save_investigation_note(&note).await.unwrap();
+        let loaded = persistence.load_investigation_notes().await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], note);
 
         let _ = std::fs::remove_file(db_path);
     }
