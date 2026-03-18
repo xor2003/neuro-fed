@@ -260,6 +260,28 @@ For reasoning training, the merged dataset is not sufficient by itself. Use the 
 ```
 This keeps reasoning/code/agent rows and only retains assistant rows that look reasoning-relevant, while attaching `reasoning_score` metadata and synthesizing minimal thought traces when safe.
 
+If you want an OpenAI-compatible remote LLM to preprocess rows further, use:
+```bash
+.venv/bin/python scripts/llm_prepare_reasoning_dataset.py \
+  --input data/merged_learning.jsonl \
+  --output data/reasoning_ready_llm.jsonl \
+  --base-url http://YOUR_OPENAI_COMPATIBLE_HOST/v1 \
+  --api-key YOUR_KEY \
+  --model YOUR_MODEL
+```
+Recommended flow:
+1. run `prepare_reasoning_dataset.py` first for cheap local filtering
+2. then run `llm_prepare_reasoning_dataset.py` on the merged or filtered dataset
+3. keep `--min-heuristic-score` above 2 so the remote LLM only sees likely reasoning rows
+
+If you want the local non-LLM path only:
+```bash
+.venv/bin/python scripts/llm_prepare_reasoning_dataset.py \
+  --input data/merged_learning.jsonl \
+  --output data/reasoning_ready_dryrun.jsonl \
+  --dry-run
+```
+
 ### Dataset Fetch (Required Sources)
 Use `scripts/fetch_datasets.py` to download and convert the required datasets into raw JSONL:
 ```bash
