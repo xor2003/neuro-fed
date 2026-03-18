@@ -42,6 +42,10 @@
       <button class="mode-chip" data-mode="investigation">Investigate</button>
       <button class="mode-chip" data-mode="code">Code</button>
       <button class="mode-chip" data-mode="text">Write</button>
+      <div class="mode-actions">
+        <button class="ghost small" id="focus-prompt">Focus Prompt</button>
+        <button class="ghost small" id="reset-workspace">Reset Workspace</button>
+      </div>
       <div class="mode-hint" id="mode-hint">General conversation with local memory and telemetry.</div>
     </section>
 
@@ -86,6 +90,10 @@
           <div>
             <h2>Structured Answer</h2>
             <p class="panel-copy">Parsed sections from the latest assistant response.</p>
+          </div>
+          <div class="panel-actions">
+            <button class="ghost small" id="reuse-answer">Reuse in Prompt</button>
+            <button class="ghost small" id="copy-answer">Copy Answer</button>
           </div>
         </div>
         <div class="inspector-meta">

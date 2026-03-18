@@ -62,12 +62,19 @@ const SECTION_ORDER = [
 ];
 
 const STORAGE_KEY = "neurofed_chat_v2";
+const MODE_STORAGE_KEY = "neurofed_mode_v1";
+const DRAFT_STORAGE_KEY = "neurofed_drafts_v1";
+const UI_PREFS_STORAGE_KEY = "neurofed_ui_prefs_v1";
 
 const messages = document.getElementById("messages");
 const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
 const askOnceBtn = document.getElementById("ask-once");
 const clearHistoryBtn = document.getElementById("clear-history");
+const resetWorkspaceBtn = document.getElementById("reset-workspace");
+const focusPromptBtn = document.getElementById("focus-prompt");
+const reuseAnswerBtn = document.getElementById("reuse-answer");
+const copyAnswerBtn = document.getElementById("copy-answer");
 const showThoughtOps = document.getElementById("show-thoughtops");
 const stepsEl = document.getElementById("step-list");
 const statusPill = document.getElementById("status-pill");
@@ -97,6 +104,12 @@ let processingNode = null;
 let chatHistory = [];
 let currentMode = "chat";
 let lastStructuredContent = "";
+let draftsByMode = {
+  chat: "",
+  investigation: "",
+  code: "",
+  text: "",
+};
 
 function loadHistory() {
   try {
@@ -119,6 +132,49 @@ function loadHistory() {
 function saveHistory() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(chatHistory));
+  } catch (_) {
+  }
+}
+
+function loadDrafts() {
+  try {
+    const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== "object") return;
+    Object.keys(draftsByMode).forEach((mode) => {
+      if (typeof parsed[mode] === "string") {
+        draftsByMode[mode] = parsed[mode];
+      }
+    });
+  } catch (_) {
+  }
+}
+
+function saveDrafts() {
+  try {
+    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draftsByMode));
+  } catch (_) {
+  }
+}
+
+function loadUiPrefs() {
+  try {
+    const raw = localStorage.getItem(UI_PREFS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== "object") return;
+    if (typeof parsed.showThoughtOps === "boolean") {
+      showThoughtOps.checked = parsed.showThoughtOps;
+    }
+  } catch (_) {
+  }
+}
+
+function saveUiPrefs() {
+  try {
+    localStorage.setItem(
+      UI_PREFS_STORAGE_KEY,
+      JSON.stringify({ showThoughtOps: !!showThoughtOps.checked })
+    );
   } catch (_) {
   }
 }
@@ -247,12 +303,18 @@ function buildPrompt(text) {
   return MODE_CONFIG[currentMode].transform(text.trim());
 }
 
+function updatePromptDraft(value) {
+  draftsByMode[currentMode] = value;
+  saveDrafts();
+}
+
 async function executeRequest({ persistHistory }) {
   const text = promptEl.value.trim();
   if (!text) return;
 
   appendMessage("user", text, persistHistory, currentMode);
   promptEl.value = "";
+  updatePromptDraft("");
   const node = appendProcessing();
 
   const payload = {
@@ -325,6 +387,7 @@ function renderQuickPrompts() {
 }
 
 function setMode(mode) {
+  draftsByMode[currentMode] = promptEl.value;
   currentMode = mode;
   modeButtons.forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === mode);
@@ -332,7 +395,29 @@ function setMode(mode) {
   activeModeBadge.textContent = MODE_CONFIG[mode].label;
   modeHint.textContent = MODE_CONFIG[mode].hint;
   promptEl.placeholder = MODE_CONFIG[mode].placeholder;
+  promptEl.value = draftsByMode[mode] || "";
+  try {
+    localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch (_) {
+  }
+  saveDrafts();
   renderQuickPrompts();
+}
+
+function resetWorkspace() {
+  chatHistory = [];
+  lastStructuredContent = "";
+  draftsByMode = {
+    chat: "",
+    investigation: "",
+    code: "",
+    text: "",
+  };
+  promptEl.value = "";
+  messages.innerHTML = "";
+  renderStructuredSections("");
+  saveHistory();
+  saveDrafts();
 }
 
 async function refreshState() {
@@ -419,6 +504,31 @@ clearHistoryBtn.addEventListener("click", () => {
   messages.innerHTML = "";
   renderStructuredSections(lastStructuredContent);
 });
+resetWorkspaceBtn.addEventListener("click", resetWorkspace);
+focusPromptBtn.addEventListener("click", () => promptEl.focus());
+reuseAnswerBtn.addEventListener("click", () => {
+  if (!lastStructuredContent) return;
+  const existing = promptEl.value.trim();
+  promptEl.value = existing
+    ? `${existing}\n\n${lastStructuredContent}`
+    : lastStructuredContent;
+  updatePromptDraft(promptEl.value);
+  promptEl.focus();
+});
+copyAnswerBtn.addEventListener("click", async () => {
+  if (!lastStructuredContent || !navigator.clipboard?.writeText) return;
+  try {
+    await navigator.clipboard.writeText(lastStructuredContent);
+    copyAnswerBtn.textContent = "Copied";
+    setTimeout(() => {
+      copyAnswerBtn.textContent = "Copy Answer";
+    }, 1200);
+  } catch (_) {
+  }
+});
+showThoughtOps.addEventListener("change", saveUiPrefs);
+
+promptEl.addEventListener("input", () => updatePromptDraft(promptEl.value));
 
 promptEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
@@ -427,15 +537,42 @@ promptEl.addEventListener("keydown", (e) => {
   }
 });
 
+document.addEventListener("keydown", (e) => {
+  if (e.target === promptEl) return;
+  if (e.key === "/") {
+    e.preventDefault();
+    promptEl.focus();
+    return;
+  }
+  if (!e.ctrlKey || e.altKey || e.shiftKey) return;
+  const shortcutMap = {
+    "1": "chat",
+    "2": "investigation",
+    "3": "code",
+    "4": "text",
+  };
+  const nextMode = shortcutMap[e.key];
+  if (nextMode) {
+    e.preventDefault();
+    setMode(nextMode);
+    promptEl.focus();
+  }
+});
+
 modeButtons.forEach((button) => {
   button.addEventListener("click", () => setMode(button.dataset.mode));
 });
 
-setInterval(refreshState, 1000);
-setInterval(refreshMetrics, 2000);
-setInterval(refreshStats, 2000);
-
 loadHistory();
+loadDrafts();
+loadUiPrefs();
+try {
+  const storedMode = localStorage.getItem(MODE_STORAGE_KEY);
+  if (storedMode && MODE_CONFIG[storedMode]) {
+    currentMode = storedMode;
+  }
+} catch (_) {
+}
 setMode(currentMode);
 chatHistory.forEach((msg) => appendMessage(msg.role, msg.content, false, msg.mode));
 if (chatHistory.length) {
@@ -447,3 +584,6 @@ if (chatHistory.length) {
 refreshState();
 refreshMetrics();
 refreshStats();
+setInterval(refreshState, 1000);
+setInterval(refreshMetrics, 2000);
+setInterval(refreshStats, 2000);

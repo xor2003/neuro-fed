@@ -11,19 +11,13 @@ NeuroFed (NeuroFed) Node is a decentralized federated AGI system based on pure h
 - Use modern algorithms; support CPU/GPU/TPU when available; prioritize CPU cache locality.
 - Avoid long-term degradation (stability of learned knowledge over time).
 - TODO: Share database with other users (e.g., via Nostr). Support federated redundancy and multi-user desktop deployment to share compute resources and resist corporate centralization.
-- TODO: Viral and eye-candy experience (memorable UI/UX and shareable story).
+- Viral and eye-candy experience (memorable UI/UX and shareable story).
 - License: GPL-3.0-or-later.
 - Support fast and slow thinking modes.
 - Primary target: x86_64_v3, 32 GB RAM.
 
 ## Current Status
-- Treat the current codebase as an experimental single-process prototype, not a fully integrated node.
 - The authoritative architecture is the code under `src/`, not the aspirational module list below.
-- `cargo check` currently passes, but several top-level modules are only partially wired into the runtime.
-- When reviewing or extending the system, distinguish between:
-  - implemented runtime path: `main.rs` -> `ml_engine.rs` -> `pc_hierarchy.rs`
-  - implemented but not fully composed infrastructure: `persistence.rs`, `model_manager.rs`
-  - compatibility and placeholder surfaces: `types.rs`, some re-exports in `lib.rs`
 
 ## Directory Structure
 ```
@@ -80,7 +74,6 @@ neuro-pc-node/
 ### Prerequisites
 - Rust (stable 2026 or nightly)
 - Git
-- For development: Docker (optional)
 
 ### Installation
 ```bash
@@ -138,9 +131,8 @@ For every future plan, the final step must always be:
 - create the next best plan from the new project state and continue on it
 
 Operationally, each completed step should follow this loop:
-1. implement the current best step
+1. implement the current best step(s)
 2. run the Learning/Generation Quality Gate
-3. update the relevant docs
 4. create a non-amended commit for the validated step
 5. create the next best plan from the new state and continue without stopping
 
@@ -424,6 +416,9 @@ The current UI should expose:
 - visible assistant intent and memory-hit counters
 - live steps and telemetry
 - reusable quick prompts for the active mode
+- remembered mode, per-mode drafts, and ThoughtOps toggle state across refreshes
+- `Ctrl+1`/`Ctrl+2`/`Ctrl+3`/`Ctrl+4` mode switching and `/` prompt focus
+- `Reuse in Prompt`, `Copy Answer`, and `Reset Workspace` controls for session ergonomics
 Ask a question and verify the response includes ThoughtOps and a coherent answer.
 Use **Ask Once** for a single-shot query without storing chat history in local storage.
 

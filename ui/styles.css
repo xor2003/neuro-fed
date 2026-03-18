@@ -191,6 +191,11 @@ body {
   flex-wrap: wrap;
 }
 
+.mode-actions {
+  display: inline-flex;
+  gap: 10px;
+}
+
 .mode-chip {
   min-width: 0;
   border: 1px solid transparent;
@@ -264,6 +269,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .toggle {
@@ -629,9 +635,18 @@ button.small {
 
   .topbar-side {
     width: 100%;
+    flex-wrap: wrap;
   }
 
   .status-card {
+    flex: 1;
+  }
+
+  .mode-actions {
+    width: 100%;
+  }
+
+  .mode-actions button {
     flex: 1;
   }
 
