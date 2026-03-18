@@ -303,6 +303,38 @@ This gives the assistant a basic cross-session memory for:
 - prior rewrite/edit patterns on text tasks
 - reusing deliverable structure instead of starting from a blank prompt every time
 
+### 14. Structured Assistant Outputs
+
+The proxy now normalizes non-chat assistant outputs into stable sectioned responses.
+
+Current structured response shapes:
+- investigation:
+  - `Goal`
+  - `Plan`
+  - `Findings`
+  - `Evidence`
+  - `Open Questions`
+- code task:
+  - `Goal`
+  - `Plan`
+  - `Deliverables`
+  - `Implementation`
+  - `Verification`
+  - `Risks`
+- text task:
+  - `Goal`
+  - `Plan`
+  - `Deliverables`
+  - `Rewritten Text`
+  - `Quality Check`
+
+This matters for the learning loop because replay and memory no longer see only a flat answer string.
+They now see a stable output structure that can be:
+- scored more consistently
+- mined for evidence and open questions
+- reused as workflow memory
+- extended later into more explicit evaluator logic
+
 **Configuration**:
 ```toml
 [backend_config]

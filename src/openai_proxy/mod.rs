@@ -605,6 +605,8 @@ impl OpenAiProxy {
             );
         }
 
+        final_text = structure_assistant_output(&state, &final_text);
+
         let _verification_result: Result<String, String> = Ok("Verification skipped".to_string());
         let success = !final_text.starts_with("No response");
 
@@ -1253,6 +1255,133 @@ fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
     lines.join("\n")
 }
 
+fn normalize_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn has_heading(text: &str, heading: &str) -> bool {
+    let prefix = format!("{}:", heading);
+    text.lines().any(|line| line.trim_start().starts_with(&prefix))
+}
+
+fn format_section(heading: &str, body: String) -> String {
+    format!("{}:\n{}", heading, body.trim())
+}
+
+fn bulletize(items: &[String], fallback: &str) -> String {
+    if items.is_empty() {
+        format!("- {}", fallback)
+    } else {
+        items.iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String {
+    let text = normalize_line_breaks(raw_text);
+    if text.is_empty() {
+        return text;
+    }
+
+    match state.intent {
+        AssistantIntent::Chat | AssistantIntent::Reasoning => text,
+        AssistantIntent::Investigation => {
+            if has_heading(&text, "Findings") && has_heading(&text, "Evidence") {
+                return text;
+            }
+            [
+                format_section("Goal", state.goal.clone()),
+                format_section("Plan", bulletize(&state.plan_steps, "collect evidence and synthesize findings")),
+                format_section("Findings", text.clone()),
+                format_section(
+                    "Evidence",
+                    if state.tests.trim().is_empty() {
+                        "Evidence summary not yet extracted.".to_string()
+                    } else {
+                        state.tests.clone()
+                    },
+                ),
+                format_section(
+                    "Open Questions",
+                    {
+                        let questions = extract_open_questions(&text);
+                        if questions.is_empty() {
+                            "- none".to_string()
+                        } else {
+                            questions
+                                .iter()
+                                .map(|item| format!("- {}", item))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    },
+                ),
+            ]
+            .join("\n\n")
+        }
+        AssistantIntent::CodeTask => {
+            if has_heading(&text, "Implementation") && has_heading(&text, "Verification") {
+                return text;
+            }
+            [
+                format_section("Goal", state.goal.clone()),
+                format_section("Plan", bulletize(&state.plan_steps, "inspect, implement, verify")),
+                format_section("Deliverables", bulletize(&state.deliverables, "implementation summary")),
+                format_section("Implementation", text.clone()),
+                format_section(
+                    "Verification",
+                    if state.tests.trim().is_empty() {
+                        bulletize(
+                            &state.verification_checks,
+                            "state what verification should run or why it could not run",
+                        )
+                    } else {
+                        format!(
+                            "{}\n{}",
+                            state.tests,
+                            bulletize(
+                                &state.verification_checks,
+                                "state what verification should run or why it could not run",
+                            )
+                        )
+                    },
+                ),
+                format_section(
+                    "Risks",
+                    bulletize(&state.assumptions, "unknown code-path constraints may remain"),
+                ),
+            ]
+            .join("\n\n")
+        }
+        AssistantIntent::TextTask => {
+            if has_heading(&text, "Rewritten Text") && has_heading(&text, "Quality Check") {
+                return text;
+            }
+            [
+                format_section("Goal", state.goal.clone()),
+                format_section("Plan", bulletize(&state.plan_steps, "rewrite while preserving meaning")),
+                format_section("Deliverables", bulletize(&state.deliverables, "rewritten text")),
+                format_section("Rewritten Text", text.clone()),
+                format_section(
+                    "Quality Check",
+                    if state.tests.trim().is_empty() {
+                        bulletize(&state.verification_checks, "preserve meaning and requested tone")
+                    } else {
+                        format!(
+                            "{}\n{}",
+                            state.tests,
+                            bulletize(&state.verification_checks, "preserve meaning and requested tone")
+                        )
+                    },
+                ),
+            ]
+            .join("\n\n")
+        }
+    }
+}
+
 fn join_or_default(items: &[String], fallback: &str) -> String {
     if items.is_empty() {
         fallback.to_string()
@@ -1713,6 +1842,56 @@ mod proxy_utility_tests {
         assert!(guidance.contains("Workflow memory"));
         assert!(guidance.contains("Verification checks"));
         assert!(guidance.contains("TextTask"));
+    }
+
+    #[test]
+    fn test_structure_assistant_output_for_code_task() {
+        let state = StructuredState {
+            intent: AssistantIntent::CodeTask,
+            goal: "fix parser bug".to_string(),
+            plan_steps: vec![
+                "inspect parser".to_string(),
+                "patch bug".to_string(),
+                "run tests".to_string(),
+            ],
+            deliverables: vec!["implementation summary".to_string()],
+            verification_checks: vec!["run cargo build".to_string()],
+            entities: HashMap::new(),
+            constraints: vec!["preserve behavior".to_string()],
+            assumptions: vec!["edge cases may remain".to_string()],
+            tests: "Verification target: cargo build".to_string(),
+            raw_query: "fix parser bug".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let rendered = structure_assistant_output(&state, "Patched the parser branch.");
+        assert!(rendered.contains("Implementation:"));
+        assert!(rendered.contains("Verification:"));
+        assert!(rendered.contains("Risks:"));
+    }
+
+    #[test]
+    fn test_structure_assistant_output_for_text_task() {
+        let state = StructuredState {
+            intent: AssistantIntent::TextTask,
+            goal: "rewrite this paragraph".to_string(),
+            plan_steps: vec!["identify tone".to_string(), "rewrite".to_string()],
+            deliverables: vec!["rewritten text".to_string()],
+            verification_checks: vec!["preserve core meaning".to_string()],
+            entities: HashMap::new(),
+            constraints: vec!["be concise".to_string()],
+            assumptions: vec!["factual content must stay intact".to_string()],
+            tests: "Keep the same meaning while making it shorter".to_string(),
+            raw_query: "rewrite this paragraph".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let rendered = structure_assistant_output(&state, "Shorter rewritten paragraph.");
+        assert!(rendered.contains("Rewritten Text:"));
+        assert!(rendered.contains("Quality Check:"));
+        assert!(rendered.contains("Goal:"));
     }
 }
 #[cfg(test)]
