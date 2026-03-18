@@ -45,6 +45,9 @@ pub struct UiState {
     pub last_updated: i64,
     pub last_source: String,
     pub saved_total_usd: f64,
+    pub last_intent: String,
+    pub investigation_memory_hits: usize,
+    pub workflow_memory_hits: usize,
 }
 
 /// Main OpenAI proxy struct with integrated Thought Decoder
@@ -133,6 +136,9 @@ impl OpenAiProxy {
         let mut ui = self.ui_state.write().await;
         ui.status = status.to_string();
         ui.steps.clear();
+        ui.last_intent.clear();
+        ui.investigation_memory_hits = 0;
+        ui.workflow_memory_hits = 0;
         ui.last_updated = Utc::now().timestamp();
     }
 
@@ -160,6 +166,19 @@ impl OpenAiProxy {
     async fn ui_add_saved(&self, saved: f64) {
         let mut ui = self.ui_state.write().await;
         ui.saved_total_usd += saved;
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_set_intent(&self, intent: &AssistantIntent) {
+        let mut ui = self.ui_state.write().await;
+        ui.last_intent = intent_label(intent).to_string();
+        ui.last_updated = Utc::now().timestamp();
+    }
+
+    async fn ui_set_memory_hits(&self, investigation_hits: usize, workflow_hits: usize) {
+        let mut ui = self.ui_state.write().await;
+        ui.investigation_memory_hits = investigation_hits;
+        ui.workflow_memory_hits = workflow_hits;
         ui.last_updated = Utc::now().timestamp();
     }
 
@@ -337,6 +356,12 @@ impl OpenAiProxy {
             } else {
                 Vec::new()
             };
+        self.ui_set_intent(&state.intent).await;
+        self.ui_set_memory_hits(
+            related_investigation_notes.len(),
+            related_workflow_notes.len(),
+        )
+        .await;
         self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
             .await;
         self.ui_push_step("PC reasoning: embed + infer").await;

@@ -421,6 +421,7 @@ Then open:
 The current UI should expose:
 - mode chips for `Chat`, `Investigate`, `Code`, and `Write`
 - a structured answer panel on the right
+- visible assistant intent and memory-hit counters
 - live steps and telemetry
 - reusable quick prompts for the active mode
 Ask a question and verify the response includes ThoughtOps and a coherent answer.

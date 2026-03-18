@@ -89,6 +89,9 @@ const mMem = document.getElementById("m-mem");
 const mCpu = document.getElementById("m-cpu");
 const mSaved = document.getElementById("m-saved");
 const mSource = document.getElementById("m-source");
+const mIntent = document.getElementById("m-intent");
+const mInvestigationHits = document.getElementById("m-investigation-hits");
+const mWorkflowHits = document.getElementById("m-workflow-hits");
 
 let processingNode = null;
 let chatHistory = [];
@@ -361,6 +364,11 @@ async function refreshState() {
     if (data.last_source) {
       mSource.textContent = data.last_source;
     }
+    if (data.last_intent) {
+      mIntent.textContent = data.last_intent;
+    }
+    mInvestigationHits.textContent = data.investigation_memory_hits ?? 0;
+    mWorkflowHits.textContent = data.workflow_memory_hits ?? 0;
     if (typeof data.progress_percent === "number") {
       const pct = Math.max(0, Math.min(100, data.progress_percent));
       progressBar.style.width = `${pct}%`;

@@ -51,6 +51,9 @@ struct UiStatePayload {
     progress_total: u64,
     saved_total_usd: f64,
     last_source: String,
+    last_intent: String,
+    investigation_memory_hits: usize,
+    workflow_memory_hits: usize,
 }
 
 async fn ui_state(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStatePayload> {
@@ -77,6 +80,9 @@ async fn ui_state(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStatePayload>
         progress_total,
         saved_total_usd: ui.saved_total_usd,
         last_source: ui.last_source,
+        last_intent: ui.last_intent,
+        investigation_memory_hits: ui.investigation_memory_hits,
+        workflow_memory_hits: ui.workflow_memory_hits,
     })
 }
 

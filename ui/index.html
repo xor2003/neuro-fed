@@ -27,6 +27,10 @@
           <span class="value" id="status-pill">idle</span>
         </div>
         <div class="status-card">
+          <span class="label">Intent</span>
+          <span class="value" id="m-intent">chat</span>
+        </div>
+        <div class="status-card">
           <span class="label">Source</span>
           <span class="value" id="m-source">local_llm</span>
         </div>
@@ -78,16 +82,26 @@
 
       <section class="sidebar">
         <div class="panel inspector-panel">
-          <div class="panel-head">
-            <div>
-              <h2>Structured Answer</h2>
-              <p class="panel-copy">Parsed sections from the latest assistant response.</p>
-            </div>
-          </div>
-          <div class="section-cards" id="section-cards">
-            <div class="empty-state">No structured answer yet.</div>
+        <div class="panel-head">
+          <div>
+            <h2>Structured Answer</h2>
+            <p class="panel-copy">Parsed sections from the latest assistant response.</p>
           </div>
         </div>
+        <div class="inspector-meta">
+          <div class="context-chip">
+            <span class="label">Investigation Memory</span>
+            <span class="value" id="m-investigation-hits">0</span>
+          </div>
+          <div class="context-chip">
+            <span class="label">Workflow Memory</span>
+            <span class="value" id="m-workflow-hits">0</span>
+          </div>
+        </div>
+        <div class="section-cards" id="section-cards">
+          <div class="empty-state">No structured answer yet.</div>
+        </div>
+      </div>
 
         <div class="panel steps-panel">
           <div class="panel-head">
