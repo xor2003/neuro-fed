@@ -55,6 +55,56 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
     if joined.is_empty() { None } else { Some(joined) }
 }
 
+fn extract_bullets(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn extract_command_like_lines(section: &str) -> Vec<String> {
+    extract_bullets(section)
+        .into_iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cargo ")
+                || lower.contains("pytest")
+                || lower.contains("npm ")
+                || lower.contains("pnpm ")
+                || lower.contains("yarn ")
+                || lower.contains("python ")
+                || lower.contains("uv ")
+                || lower.contains("just ")
+                || lower.contains("make ")
+                || lower.contains("cmd /c")
+                || lower.contains("powershell")
+                || lower.contains("build")
+                || lower.contains("test")
+        })
+        .collect()
+}
+
+fn investigation_evidence_point_count(answer: &str) -> usize {
+    extract_section(answer, "Evidence")
+        .map(|section| extract_bullets(&section).len())
+        .unwrap_or(0)
+}
+
+fn code_verification_command_count(answer: &str) -> usize {
+    extract_section(answer, "Verification")
+        .map(|section| extract_command_like_lines(&section).len())
+        .unwrap_or(0)
+}
+
 fn structured_quality_score(intent: &str, answer: &str) -> usize {
     match intent {
         "Investigation" => {
@@ -235,8 +285,18 @@ impl SleepManager {
                     .unwrap_or_else(|| "Unknown".to_string());
                 let section_score = structured_section_score(&intent_label, &ep.generated_code);
                 let quality_score = structured_quality_score(&intent_label, &ep.generated_code);
+                let evidence_point_count = if intent_label == "Investigation" {
+                    investigation_evidence_point_count(&ep.generated_code)
+                } else {
+                    0
+                };
+                let verification_command_count = if intent_label == "CodeTask" {
+                    code_verification_command_count(&ep.generated_code)
+                } else {
+                    0
+                };
                 detail_logs.push(format!(
-                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nDeliverables: {}\nVerification checks: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nStructured section score: {}\nStructured quality score: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
+                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nDeliverables: {}\nVerification checks: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nStructured section score: {}\nStructured quality score: {}\nEvidence point count: {}\nVerification command count: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
                     ep.raw_query,
                     intent_label,
                     ep.goal.clone().unwrap_or_else(|| ep.raw_query.clone()),
@@ -269,6 +329,8 @@ impl SleepManager {
                     ep.generated_code,
                     section_score,
                     quality_score,
+                    evidence_point_count,
+                    verification_command_count,
                     trajectory,
                     ep.thought_sequence,
                     ep.confidence,

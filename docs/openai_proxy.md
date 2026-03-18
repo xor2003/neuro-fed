@@ -391,6 +391,14 @@ This makes the learning data more useful for future consolidation and dataset ge
 - evaluator quality signals
 - reasoning/trajectory information
 
+The replay/export path now also records richer artifact counts:
+- `evidence_point_count` for investigation outputs
+- `verification_command_count` for code-task outputs
+
+Those counts are written into sleep logs when present and exported into `learning_feedback.csv`, so consolidation and dataset generation can distinguish:
+- vague prose from evidence-backed investigation answers
+- generic “verified” claims from outputs that actually preserve reusable build/test commands
+
 ### 18. Evaluator-Aware Workflow Memory
 
 Workflow memory for `code_task` and `text_task` requests now stores evaluator metadata directly instead of treating every retrieved prior note as equally useful.

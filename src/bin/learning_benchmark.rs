@@ -109,6 +109,56 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
     if joined.is_empty() { None } else { Some(joined) }
 }
 
+fn extract_bullets(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn extract_command_like_lines(section: &str) -> Vec<String> {
+    extract_bullets(section)
+        .into_iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cargo ")
+                || lower.contains("pytest")
+                || lower.contains("npm ")
+                || lower.contains("pnpm ")
+                || lower.contains("yarn ")
+                || lower.contains("python ")
+                || lower.contains("uv ")
+                || lower.contains("just ")
+                || lower.contains("make ")
+                || lower.contains("cmd /c")
+                || lower.contains("powershell")
+                || lower.contains("build")
+                || lower.contains("test")
+        })
+        .collect()
+}
+
+fn investigation_evidence_point_count(answer: &str) -> usize {
+    extract_section(answer, "Evidence")
+        .map(|section| extract_bullets(&section).len())
+        .unwrap_or(0)
+}
+
+fn code_verification_command_count(answer: &str) -> usize {
+    extract_section(answer, "Verification")
+        .map(|section| extract_command_like_lines(&section).len())
+        .unwrap_or(0)
+}
+
 fn structured_quality_score(intent: &str, answer: &str) -> usize {
     match intent {
         "Investigation" => {
@@ -167,6 +217,8 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
         let mut answer = None;
         let mut explicit_section_score = None;
         let mut explicit_quality_score = None;
+        let mut explicit_evidence_point_count = None;
+        let mut explicit_verification_command_count = None;
         for line in block.lines() {
             if line.starts_with("Question:") {
                 if let Some(json) = line.splitn(2, ':').nth(1) {
@@ -231,6 +283,18 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                     .nth(1)
                     .and_then(|value| value.trim().parse::<usize>().ok());
             }
+            if line.trim_start().starts_with("Evidence point count:") {
+                explicit_evidence_point_count = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+            }
+            if line.trim_start().starts_with("Verification command count:") {
+                explicit_verification_command_count = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+            }
             if line.trim_start().starts_with("Input Question:") && task_id.is_none() {
                 if let Some(raw) = line.splitn(2, ':').nth(1) {
                     let cleaned = raw.trim();
@@ -254,6 +318,19 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                     .map(|value| structured_quality_score(&intent_label, value))
                     .unwrap_or(0)
             });
+            let evidence_point_count = explicit_evidence_point_count.unwrap_or_else(|| {
+                answer
+                    .as_deref()
+                    .map(investigation_evidence_point_count)
+                    .unwrap_or(0)
+            });
+            let verification_command_count =
+                explicit_verification_command_count.unwrap_or_else(|| {
+                    answer
+                        .as_deref()
+                        .map(code_verification_command_count)
+                        .unwrap_or(0)
+                });
             results.push(LearningRecord {
                 task_id,
                 intent: intent_label,
@@ -261,6 +338,8 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                 trajectory,
                 structured_section_score: section_score,
                 structured_quality_score: quality_score,
+                evidence_point_count,
+                verification_command_count,
             });
         }
     }
@@ -276,6 +355,8 @@ fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
         "trajectory",
         "structured_section_score",
         "structured_quality_score",
+        "evidence_point_count",
+        "verification_command_count",
     ])?;
     for record in records {
         wtr.write_record(&[
@@ -285,6 +366,8 @@ fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
             record.trajectory.as_deref().unwrap_or_default(),
             &record.structured_section_score.to_string(),
             &record.structured_quality_score.to_string(),
+            &record.evidence_point_count.to_string(),
+            &record.verification_command_count.to_string(),
         ])?;
     }
     wtr.flush()?;
@@ -1041,6 +1124,8 @@ struct LearningRecord {
     trajectory: Option<String>,
     structured_section_score: usize,
     structured_quality_score: usize,
+    evidence_point_count: usize,
+    verification_command_count: usize,
 }
 
 #[cfg(test)]
@@ -1077,6 +1162,18 @@ mod tests {
             extract_section(answer, "Verification").as_deref(),
             Some("run cargo build")
         );
+    }
+
+    #[test]
+    fn test_investigation_evidence_point_count_uses_bullets() {
+        let answer = "Goal:\ncheck drift\n\nEvidence:\n- compared main.rs\n- compared docs\n\nOpen Questions:\n- next step?";
+        assert_eq!(investigation_evidence_point_count(answer), 2);
+    }
+
+    #[test]
+    fn test_code_verification_command_count_detects_commands() {
+        let answer = "Goal:\nfix parser\n\nVerification:\n- cargo build\n- cargo test --lib\n- describe residual risks";
+        assert_eq!(code_verification_command_count(answer), 2);
     }
 }
 
