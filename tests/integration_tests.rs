@@ -118,6 +118,12 @@ async fn test_story_sleep_phase_dreaming() -> anyhow::Result<()> {
             generated_code: "def calc(): return 1+1".into(),
             thought_sequence: vec![define_id, compute_id, eof_id],
             success: true,
+            assistant_intent: None,
+            goal: None,
+            plan_steps: Vec::new(),
+            constraints: Vec::new(),
+            assumptions: Vec::new(),
+            tests: None,
             reasoning_task: None,
             expected_output: None,
         });

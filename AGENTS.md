@@ -133,6 +133,17 @@ Proceed through the current plan step-by-step without asking for confirmation:
 3. Add a JSONL reasoning dataset loader for replay.
 After each step, run the Learning/Generation Quality Gate and only advance if metrics are stable or improved.
 
+### Recursive Execution Rule
+For every future plan, the final step must always be:
+- create the next best plan from the new project state and continue on it
+
+Operationally, each completed step should follow this loop:
+1. implement the current best step
+2. run the Learning/Generation Quality Gate
+3. update the relevant docs
+4. create a non-amended commit for the validated step
+5. create the next best plan from the new state and continue without stopping
+
 ### Reasoning Replay JSONL Format
 To exercise reasoning → state → output paths via `learning_benchmark --reasoning-replay`, provide JSONL with fields:
 - `task`: one of `multiply`, `reverse_string`, `sum_even`, `max`, `sort_list`
@@ -143,6 +154,11 @@ To exercise reasoning → state → output paths via `learning_benchmark --reaso
 - Optional:
   - `ops`: array of ThoughtOps (e.g., `PLAN`, `DECOMPOSE`, `INITIALIZE_VARIABLE`, `COMPUTE_MATH`, `RETURN_VALUE`, `EOF`)
   - `expected_output`: string used for text-loss check
+  - query aliases: `raw_query`, `query`, `problem`, or `instruction`
+  - `expected` is also accepted as an alias for `expected_output`, including numeric values for solver tasks
+
+If `ops` is omitted, the benchmark now fills in the canonical recommended ThoughtOp chain for the task automatically.
+If no query field is provided, it synthesizes a stable default query string from the task payload so replay logs stay readable and comparable.
 
 Example line:
 ```json

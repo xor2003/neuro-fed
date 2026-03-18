@@ -178,6 +178,7 @@ async fn ui_stats(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStats> {
     })
 }
 
+#[cfg(unix)]
 fn read_proc_rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let mut parts = statm.split_whitespace();
@@ -189,6 +190,11 @@ fn read_proc_rss_bytes() -> Option<u64> {
         return None;
     }
     Some(rss_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(not(unix))]
+fn read_proc_rss_bytes() -> Option<u64> {
+    None
 }
 
 async fn get_brain_introspection(State(proxy): State<Arc<OpenAiProxy>>) -> Json<serde_json::Value> {

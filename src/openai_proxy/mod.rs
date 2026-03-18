@@ -25,9 +25,12 @@ use crate::openai_proxy::types::{
 };
 use crate::pc_decoder::{ThoughtConstraints, ThoughtDecoder};
 use crate::pc_hierarchy::PredictiveCoding;
+use crate::reasoning_state::{execute_plan, recommended_ops, render_output};
 use crate::semantic_cache::SemanticCache;
 use crate::sleep_phase::SleepManager;
-use crate::types::{CognitiveDictionary, Episode, StructuredState, StudyState};
+use crate::types::{
+    AssistantIntent, CognitiveDictionary, Episode, ReasoningTask, StructuredState, StudyState,
+};
 use candle_core::Tensor;
 
 const REMOTE_PRICE_PER_1K_TOKENS_USD: f64 = 0.002;
@@ -162,10 +165,11 @@ impl OpenAiProxy {
             metrics.status_message = "Answering...".to_string();
         }
         self.ui_reset("Answering...").await;
+        let state = self.extract_structured_state(&req).await;
+        self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
+            .await;
         self.ui_push_step("PC reasoning: embed + infer").await;
         let start_time = Instant::now();
-
-        let state = self.extract_structured_state(&req).await;
         let mut final_text = String::new();
         let mut thought_trajectory: Vec<u32> = Vec::new();
         let mut sequence_tensors_vec = Vec::new();
@@ -177,6 +181,8 @@ impl OpenAiProxy {
         let mut local_error: Option<String> = None;
         let mut pc_thoughts_string = String::new();
         let mut pc_belief: Option<Tensor> = None;
+        let mut effective_reasoning_task = state.reasoning_task.clone();
+        let mut effective_expected_output = state.expected_output.clone();
 
         tracing::info!("🤖 STARTING COGNITIVE STEP: Attempting PC Inference first...");
 
@@ -288,25 +294,71 @@ impl OpenAiProxy {
             }
         }
 
+        let mut guidance_parts = Vec::new();
         if !pc_thoughts_string.is_empty() {
-            let guidance = format!(
-                "[INTERNAL_THOUGHT_PLAN]: {}\n[CONFIDENCE]: {:.2}",
+            guidance_parts.push(format!(
+                "Use this internal thought plan when relevant.\n[INTERNAL_THOUGHT_PLAN]: {}\n[CONFIDENCE]: {:.2}",
                 pc_thoughts_string, raw_confidence
-            );
-
+            ));
+        }
+        if let Some(intent_guidance) = build_intent_guidance(&state) {
+            guidance_parts.push(intent_guidance);
+        }
+        if !guidance_parts.is_empty() {
             req.messages.insert(0, Message {
                 role: "system".to_string(),
                 content: serde_json::json!(format!(
-                    "You are a NeuroFed executor. Use the provided internal thought plan to craft your answer. {}",
-                    guidance
+                    "You are a NeuroFed executor.\n{}",
+                    guidance_parts.join("\n\n")
                 )),
                 name: None,
             });
 
-            tracing::info!("📝 Injected PC guidance into LLM prompt for caching");
+            tracing::info!("Injected assistant guidance into prompt");
         }
 
-        if self.proxy_config.require_thought_ops && thought_trajectory.is_empty() {
+        if let Some(task) = effective_reasoning_task.clone() {
+            if thought_trajectory.is_empty() {
+                let canonical_ops = recommended_ops(&task);
+                let dict = self.cognitive_dict.read().await;
+                thought_trajectory = canonical_ops
+                    .iter()
+                    .filter_map(|op| dict.op_to_id.get(op).copied())
+                    .collect();
+                pc_thoughts_string = canonical_ops
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                if !pc_thoughts_string.is_empty() {
+                    self.ui_push_step(format!("ThoughtOps: {}", pc_thoughts_string))
+                        .await;
+                }
+            }
+
+            let canonical_ops: Vec<_> = {
+                let dict = self.cognitive_dict.read().await;
+                thought_trajectory
+                    .iter()
+                    .map(|id| dict.get_op(*id))
+                    .collect()
+            };
+            let outcome = execute_plan(&task, &canonical_ops);
+            if let Some(answer) = render_output(&task, &outcome) {
+                final_text = answer.clone();
+                last_source = "reasoning_state";
+                raw_confidence = raw_confidence.max(0.95);
+                effective_expected_output = Some(answer);
+                self.ui_push_step("Deterministic reasoning execution".to_string())
+                    .await;
+            } else if self.proxy_config.require_thought_ops {
+                self.ui_set_status("error").await;
+                return Err(ProxyError::PCError(format!(
+                    "Reasoning required but state execution failed: {}",
+                    outcome.errors.join(" | ")
+                )));
+            }
+        } else if self.proxy_config.require_thought_ops && thought_trajectory.is_empty() {
             self.ui_set_status("error").await;
             return Err(ProxyError::PCError(
                 "Reasoning required but no ThoughtOp sequence produced".to_string(),
@@ -417,8 +469,18 @@ impl OpenAiProxy {
             generated_code: final_text.clone(),
             thought_sequence: thought_trajectory,
             success,
-            reasoning_task: None,
-            expected_output: None,
+            assistant_intent: Some(state.intent.clone()),
+            goal: Some(state.goal.clone()),
+            plan_steps: state.plan_steps.clone(),
+            constraints: state.constraints.clone(),
+            assumptions: state.assumptions.clone(),
+            tests: if state.tests.trim().is_empty() {
+                None
+            } else {
+                Some(state.tests.clone())
+            },
+            reasoning_task: effective_reasoning_task.take(),
+            expected_output: effective_expected_output.take(),
         });
 
         // 🔴 FIX: PREVENT OOM AND ENFORCE SLEEP CYCLE WHEN MEMORY IS FULL
@@ -506,14 +568,26 @@ impl OpenAiProxy {
     }
 
     async fn extract_structured_state(&self, req: &OpenAiRequest) -> StructuredState {
-        let raw_query = req.messages.last().unwrap().content.to_string();
+        let raw_query = req
+            .messages
+            .last()
+            .map(extract_message_text)
+            .unwrap_or_default();
+        let (reasoning_task, expected_output) = detect_reasoning_task(&raw_query);
+        let intent = detect_intent(&raw_query, reasoning_task.is_some());
+        let plan_steps = build_plan_steps(&intent, &raw_query);
+        let (constraints, assumptions, tests) = scaffold_state_for_intent(&intent, &raw_query);
         StructuredState {
+            intent,
             goal: raw_query.clone(),
+            plan_steps,
             entities: HashMap::new(),
-            constraints: Vec::new(),
-            assumptions: Vec::new(),
-            tests: "".to_string(),
+            constraints,
+            assumptions,
+            tests,
             raw_query,
+            reasoning_task,
+            expected_output,
         }
     }
 
@@ -569,20 +643,20 @@ impl OpenAiProxy {
                 .map_err(|e| {
                     ProxyError::BackendError(format!("Local fallback decode failed: {}", e))
                 })?;
-            if !pc_summary.is_empty() {
-                return Ok(format!(
-                    "Local fallback (PC): {} | guidance: {} | logit avg {:.3} max {:.3}",
-                    decoded, pc_summary, avg, max
-                ));
-            }
-            return Ok(format!(
-                "Local fallback (PC): {} | logit avg {:.3} max {:.3}",
-                decoded, avg, max
+            return Ok(render_local_intent_response(
+                state,
+                Some(decoded.as_str()),
+                pc_summary,
+                Some(avg),
+                Some(max),
             ));
         }
-        Ok(format!(
-            "Local fallback (PC unavailable) rephrasing query: {}",
-            state.raw_query
+        Ok(render_local_intent_response(
+            state,
+            None,
+            pc_summary,
+            None,
+            None,
         ))
     }
 
@@ -653,6 +727,314 @@ fn estimate_tokens_from_text(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }
 
+fn extract_message_text(message: &Message) -> String {
+    message
+        .content
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| message.content.to_string())
+}
+
+fn parse_i64_tokens(text: &str) -> Vec<i64> {
+    text.split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter(|part| !part.is_empty() && *part != "-")
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
+}
+
+fn detect_reasoning_task(raw_query: &str) -> (Option<ReasoningTask>, Option<String>) {
+    let normalized = raw_query.trim();
+    let lower = normalized.to_lowercase();
+    let numbers = parse_i64_tokens(normalized);
+
+    if lower.contains('*') && numbers.len() >= 2 {
+        let task = ReasoningTask::Multiply {
+            a: numbers[0],
+            b: numbers[1],
+        };
+        return (Some(task), Some((numbers[0] * numbers[1]).to_string()));
+    }
+
+    if lower.contains("multiply") && numbers.len() >= 2 {
+        let task = ReasoningTask::Multiply {
+            a: numbers[0],
+            b: numbers[1],
+        };
+        return (Some(task), Some((numbers[0] * numbers[1]).to_string()));
+    }
+
+    if let Some(idx) = lower.find("reverse") {
+        let remainder = normalized[idx + "reverse".len()..]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if !remainder.is_empty() {
+            let task = ReasoningTask::ReverseString {
+                input: remainder.to_string(),
+            };
+            let expected = remainder.chars().rev().collect::<String>();
+            return (Some(task), Some(expected));
+        }
+    }
+
+    if lower.contains("sum") && lower.contains("even") && !numbers.is_empty() {
+        let task = ReasoningTask::SumEven {
+            values: numbers.clone(),
+        };
+        let expected = numbers
+            .iter()
+            .filter(|value| **value % 2 == 0)
+            .sum::<i64>()
+            .to_string();
+        return (Some(task), Some(expected));
+    }
+
+    if (lower.contains("max") || lower.contains("maximum")) && !numbers.is_empty() {
+        if let Some(max_value) = numbers.iter().max() {
+            let task = ReasoningTask::Max {
+                values: numbers.clone(),
+            };
+            return (Some(task), Some(max_value.to_string()));
+        }
+    }
+
+    if (lower.contains("sort") || lower.contains("ordered")) && !numbers.is_empty() {
+        let mut sorted = numbers.clone();
+        sorted.sort();
+        let task = ReasoningTask::SortList { values: numbers };
+        let expected = sorted
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (Some(task), Some(expected));
+    }
+
+    (None, None)
+}
+
+fn detect_intent(raw_query: &str, has_reasoning_task: bool) -> AssistantIntent {
+    if has_reasoning_task {
+        return AssistantIntent::Reasoning;
+    }
+
+    let lower = raw_query.to_lowercase();
+    if lower.contains("investigate")
+        || lower.contains("research")
+        || lower.contains("analyze")
+        || lower.contains("compare")
+        || lower.contains("find out")
+    {
+        return AssistantIntent::Investigation;
+    }
+    if lower.contains("write code")
+        || lower.contains("fix")
+        || lower.contains("refactor")
+        || lower.contains("implement")
+        || lower.contains("cargo")
+        || lower.contains("rust")
+        || lower.contains("function")
+        || lower.contains("test")
+    {
+        return AssistantIntent::CodeTask;
+    }
+    if lower.contains("rewrite")
+        || lower.contains("summarize")
+        || lower.contains("draft")
+        || lower.contains("edit")
+        || lower.contains("improve this text")
+    {
+        return AssistantIntent::TextTask;
+    }
+
+    AssistantIntent::Chat
+}
+
+fn intent_label(intent: &AssistantIntent) -> &'static str {
+    match intent {
+        AssistantIntent::Chat => "chat",
+        AssistantIntent::Reasoning => "reasoning",
+        AssistantIntent::Investigation => "investigation",
+        AssistantIntent::CodeTask => "code_task",
+        AssistantIntent::TextTask => "text_task",
+    }
+}
+
+fn build_intent_guidance(state: &StructuredState) -> Option<String> {
+    match state.intent {
+        AssistantIntent::Chat | AssistantIntent::Reasoning => None,
+        AssistantIntent::Investigation => Some(format!(
+            "Investigation mode:\n- restate the question precisely\n- gather evidence before conclusions\n- separate findings from assumptions\n- end with open questions or uncertainties if any remain\nPlanned steps:\n- {}\nTask: {}",
+            state.plan_steps.join("\n- "),
+            state.raw_query
+        )),
+        AssistantIntent::CodeTask => Some(format!(
+            "Code-task mode:\n- inspect the relevant code path first\n- propose or follow a concrete change plan\n- preserve behavior unless intentionally changed\n- verify with tests or build commands when possible\nPlanned steps:\n- {}\nTask: {}",
+            state.plan_steps.join("\n- "),
+            state.raw_query
+        )),
+        AssistantIntent::TextTask => Some(format!(
+            "Text-task mode:\n- identify audience, goal, and tone\n- preserve key facts and constraints\n- optimize for clarity and structure\nPlanned steps:\n- {}\nTask: {}",
+            state.plan_steps.join("\n- "),
+            state.raw_query
+        )),
+    }
+}
+
+fn join_or_default(items: &[String], fallback: &str) -> String {
+    if items.is_empty() {
+        fallback.to_string()
+    } else {
+        items.join("; ")
+    }
+}
+
+fn render_local_intent_response(
+    state: &StructuredState,
+    decoded_hint: Option<&str>,
+    pc_summary: &str,
+    avg: Option<f32>,
+    max: Option<f32>,
+) -> String {
+    let decoded_hint = decoded_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("no decoded local belief");
+    let signal_line = match (avg, max) {
+        (Some(avg), Some(max)) => format!("Local signal: avg {:.3}, max {:.3}.", avg, max),
+        _ => "Local signal: predictive-coding belief unavailable.".to_string(),
+    };
+    let guidance_line = if pc_summary.trim().is_empty() {
+        "ThoughtOps: none.".to_string()
+    } else {
+        format!("ThoughtOps: {}.", pc_summary)
+    };
+
+    match state.intent {
+        AssistantIntent::Investigation => format!(
+            "Investigation Plan:\n- Goal: {}\n- Steps: {}\n- Evidence needed: {}\n- Assumptions: {}\n- Open questions: {}\n- Working local clue: {}\n{}\n{}",
+            state.raw_query,
+            join_or_default(&state.plan_steps, "restate the question; collect evidence; synthesize findings"),
+            join_or_default(&state.constraints, "collect evidence before concluding"),
+            join_or_default(&state.assumptions, "the available local context is incomplete"),
+            if state.tests.trim().is_empty() {
+                "document uncertainty and list missing evidence".to_string()
+            } else {
+                state.tests.clone()
+            },
+            decoded_hint,
+            guidance_line,
+            signal_line
+        ),
+        AssistantIntent::CodeTask => format!(
+            "Code Task Plan:\n- Goal: {}\n- Steps: {}\n- Constraints: {}\n- Assumptions: {}\n- Verification: {}\n- Working local clue: {}\n{}\n{}",
+            state.raw_query,
+            join_or_default(&state.plan_steps, "inspect code path; implement smallest coherent change; verify behavior"),
+            join_or_default(&state.constraints, "preserve existing behavior until validated"),
+            join_or_default(&state.assumptions, "the repository needs inspection before editing"),
+            if state.tests.trim().is_empty() {
+                "run build/tests for the touched path".to_string()
+            } else {
+                state.tests.clone()
+            },
+            decoded_hint,
+            guidance_line,
+            signal_line
+        ),
+        AssistantIntent::TextTask => format!(
+            "Text Task Plan:\n- Goal: {}\n- Steps: {}\n- Constraints: {}\n- Assumptions: {}\n- Quality check: {}\n- Working local clue: {}\n{}\n{}",
+            state.raw_query,
+            join_or_default(&state.plan_steps, "identify target tone; rewrite; check fidelity and clarity"),
+            join_or_default(&state.constraints, "preserve meaning while improving the writing"),
+            join_or_default(&state.assumptions, "the user wants a direct rewrite or edit"),
+            if state.tests.trim().is_empty() {
+                "check clarity, consistency, and tone".to_string()
+            } else {
+                state.tests.clone()
+            },
+            decoded_hint,
+            guidance_line,
+            signal_line
+        ),
+        AssistantIntent::Reasoning => format!(
+            "Reasoning fallback:\n- Goal: {}\n- Working local clue: {}\n{}\n{}",
+            state.raw_query, decoded_hint, guidance_line, signal_line
+        ),
+        AssistantIntent::Chat => format!(
+            "Chat fallback:\n- User request: {}\n- Working local clue: {}\n{}\n{}",
+            state.raw_query, decoded_hint, guidance_line, signal_line
+        ),
+    }
+}
+
+fn build_plan_steps(intent: &AssistantIntent, raw_query: &str) -> Vec<String> {
+    match intent {
+        AssistantIntent::Chat => Vec::new(),
+        AssistantIntent::Reasoning => vec![
+            "extract the structured task".to_string(),
+            "execute the canonical reasoning plan".to_string(),
+            "render the deterministic answer".to_string(),
+        ],
+        AssistantIntent::Investigation => vec![
+            format!("restate the investigation target: {}", raw_query),
+            "collect evidence and competing explanations".to_string(),
+            "synthesize findings and remaining uncertainties".to_string(),
+        ],
+        AssistantIntent::CodeTask => vec![
+            "inspect the existing code path and constraints".to_string(),
+            "implement the smallest coherent change".to_string(),
+            "verify with build/tests and summarize risks".to_string(),
+        ],
+        AssistantIntent::TextTask => vec![
+            "identify audience, tone, and constraints".to_string(),
+            "rewrite while preserving meaning".to_string(),
+            "check clarity, brevity, and factual consistency".to_string(),
+        ],
+    }
+}
+
+fn scaffold_state_for_intent(
+    intent: &AssistantIntent,
+    raw_query: &str,
+) -> (Vec<String>, Vec<String>, String) {
+    match intent {
+        AssistantIntent::Chat | AssistantIntent::Reasoning => (Vec::new(), Vec::new(), String::new()),
+        AssistantIntent::Investigation => (
+            vec![
+                "Collect evidence before concluding".to_string(),
+                "Separate findings from assumptions".to_string(),
+                "State open questions explicitly".to_string(),
+            ],
+            vec!["The initial user request may be underspecified".to_string()],
+            format!(
+                "Return findings, evidence summary, and remaining uncertainties for: {}",
+                raw_query
+            ),
+        ),
+        AssistantIntent::CodeTask => (
+            vec![
+                "Inspect the existing code path before editing".to_string(),
+                "Preserve intended behavior unless changing it explicitly".to_string(),
+                "Verify changes with build or tests when possible".to_string(),
+            ],
+            vec!["The current implementation may already encode hidden constraints".to_string()],
+            "Verification target: cargo build plus the narrowest relevant tests".to_string(),
+        ),
+        AssistantIntent::TextTask => (
+            vec![
+                "Preserve core meaning and factual content".to_string(),
+                "Improve clarity and structure".to_string(),
+                "Match the requested tone and brevity".to_string(),
+            ],
+            vec!["The original text may contain signal that should be preserved".to_string()],
+            format!(
+                "Check that the rewritten text still satisfies the user goal: {}",
+                raw_query
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod proxy_utility_tests {
     use super::*;
@@ -687,6 +1069,143 @@ mod proxy_utility_tests {
         ];
         let msg_tokens = estimate_tokens_from_messages(&msgs);
         assert!(msg_tokens >= 3, "Message token estimation failed");
+    }
+
+    #[test]
+    fn test_detect_reasoning_task_for_supported_queries() {
+        let (task, expected) = detect_reasoning_task("17 * 23");
+        assert_eq!(task, Some(ReasoningTask::Multiply { a: 17, b: 23 }));
+        assert_eq!(expected.as_deref(), Some("391"));
+
+        let (task, expected) = detect_reasoning_task("reverse abc");
+        assert_eq!(
+            task,
+            Some(ReasoningTask::ReverseString {
+                input: "abc".to_string()
+            })
+        );
+        assert_eq!(expected.as_deref(), Some("cba"));
+
+        let (task, expected) = detect_reasoning_task("sum even 1 2 4 5");
+        assert_eq!(
+            task,
+            Some(ReasoningTask::SumEven {
+                values: vec![1, 2, 4, 5]
+            })
+        );
+        assert_eq!(expected.as_deref(), Some("6"));
+    }
+
+    #[test]
+    fn test_detect_intent_for_assistant_modes() {
+        assert_eq!(
+            detect_intent("17 * 23", true),
+            AssistantIntent::Reasoning
+        );
+        assert_eq!(
+            detect_intent("investigate the architecture drift in this repo", false),
+            AssistantIntent::Investigation
+        );
+        assert_eq!(
+            detect_intent("implement a parser and add tests", false),
+            AssistantIntent::CodeTask
+        );
+        assert_eq!(
+            detect_intent("rewrite this paragraph to be shorter", false),
+            AssistantIntent::TextTask
+        );
+        assert_eq!(detect_intent("hello there", false), AssistantIntent::Chat);
+    }
+
+    #[test]
+    fn test_scaffold_state_for_code_and_investigation_intents() {
+        let (constraints, assumptions, tests) = scaffold_state_for_intent(
+            &AssistantIntent::CodeTask,
+            "implement a parser and verify it",
+        );
+        assert!(constraints.iter().any(|item| item.contains("Inspect the existing code path")));
+        assert!(!assumptions.is_empty());
+        assert!(tests.contains("cargo build"));
+
+        let (constraints, assumptions, tests) = scaffold_state_for_intent(
+            &AssistantIntent::Investigation,
+            "investigate architecture drift",
+        );
+        assert!(constraints.iter().any(|item| item.contains("Collect evidence")));
+        assert!(!assumptions.is_empty());
+        assert!(tests.contains("evidence summary"));
+    }
+
+    #[test]
+    fn test_build_plan_steps_for_assistant_modes() {
+        let code_steps = build_plan_steps(&AssistantIntent::CodeTask, "fix parser bug");
+        assert_eq!(code_steps.len(), 3);
+        assert!(code_steps[0].contains("inspect"));
+
+        let investigation_steps =
+            build_plan_steps(&AssistantIntent::Investigation, "investigate architecture drift");
+        assert_eq!(investigation_steps.len(), 3);
+        assert!(investigation_steps[0].contains("investigation target"));
+    }
+
+    #[test]
+    fn test_render_local_intent_response_for_code_task() {
+        let state = StructuredState {
+            intent: AssistantIntent::CodeTask,
+            goal: "fix parser bug".to_string(),
+            plan_steps: vec![
+                "inspect the parser".to_string(),
+                "patch the bug".to_string(),
+                "run tests".to_string(),
+            ],
+            entities: HashMap::new(),
+            constraints: vec!["Inspect the existing code path before editing".to_string()],
+            assumptions: vec!["Tests are the main correctness gate".to_string()],
+            tests: "Run cargo build and the relevant parser tests".to_string(),
+            raw_query: "fix parser bug".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let rendered = render_local_intent_response(
+            &state,
+            Some("parser -> token stream"),
+            "PLAN -> REFINE",
+            Some(0.2),
+            Some(0.7),
+        );
+
+        assert!(rendered.contains("Code Task Plan"));
+        assert!(rendered.contains("fix parser bug"));
+        assert!(rendered.contains("Run cargo build"));
+        assert!(rendered.contains("PLAN -> REFINE"));
+        assert!(rendered.contains("avg 0.200"));
+    }
+
+    #[test]
+    fn test_render_local_intent_response_for_investigation_without_belief() {
+        let state = StructuredState {
+            intent: AssistantIntent::Investigation,
+            goal: "investigate architecture drift".to_string(),
+            plan_steps: vec![
+                "restate the investigation target".to_string(),
+                "collect evidence".to_string(),
+                "summarize findings".to_string(),
+            ],
+            entities: HashMap::new(),
+            constraints: vec!["Collect evidence before concluding".to_string()],
+            assumptions: vec!["The local context may be incomplete".to_string()],
+            tests: "Return an evidence summary and open questions".to_string(),
+            raw_query: "investigate architecture drift".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let rendered = render_local_intent_response(&state, None, "", None, None);
+
+        assert!(rendered.contains("Investigation Plan"));
+        assert!(rendered.contains("evidence summary"));
+        assert!(rendered.contains("predictive-coding belief unavailable"));
     }
 }
 #[cfg(test)]
@@ -727,6 +1246,8 @@ mod proxy_integration_tests {
 mod reasoning_consistency_tests {
     use super::*;
     use crate::config::NodeConfig;
+    use crate::openai_proxy::components::ProxyConfig;
+    use crate::openai_proxy::types::OpenAiRequest;
     use candle_core::{Device, Tensor};
 
     #[tokio::test]
@@ -796,5 +1317,68 @@ mod reasoning_consistency_tests {
         assert_eq!(stats1.total_surprise, stats2.total_surprise);
         assert_eq!(stats1.level_surprises, stats2.level_surprises);
         assert!((stats1.confidence_score - stats2.confidence_score).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_uses_reasoning_state_for_simple_math() {
+        let mut config = NodeConfig::load_or_default();
+        config.proxy_config.pc_learning_enabled = false;
+        let device = Device::Cpu;
+        let engine = Arc::new(RwLock::new(MLEngine::mock().unwrap()));
+        let embedding_dim = engine.read().await.embedding_dim();
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        let pc_hierarchy = Arc::new(RwLock::new(
+            PredictiveCoding::new(config.pc_config.clone()).unwrap(),
+        ));
+        let dict_len = dict.read().await.len();
+        let vocab_capacity = config.pc_config.thought_vocab_capacity.max(dict_len);
+        let thought_decoder = Arc::new(RwLock::new(
+            ThoughtDecoder::new(512, vocab_capacity, &device).unwrap(),
+        ));
+        let study_state = Arc::new(RwLock::new(StudyState::default()));
+        let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
+        let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
+
+        let proxy = OpenAiProxy::new(
+            config,
+            ProxyConfig::default(),
+            engine,
+            pc_hierarchy,
+            embedding_dim,
+            thought_decoder,
+            dict,
+            study_state,
+            episodic_memory.clone(),
+            calibration,
+            None,
+        );
+
+        let response = proxy
+            .handle_chat_completion(OpenAiRequest {
+                model: "neurofed-response".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("17 * 23"),
+                    name: None,
+                }],
+                ..OpenAiRequest::default()
+            })
+            .await
+            .expect("reasoning-state request should succeed");
+
+        let content = response.choices[0]
+            .message
+            .content
+            .as_str()
+            .expect("assistant response should be a string");
+        assert_eq!(content, "391");
+        assert_eq!(response.neurofed_source.as_deref(), Some("reasoning_state"));
+
+        let memory = episodic_memory.read().await;
+        let last = memory.back().expect("episode should be recorded");
+        assert_eq!(last.assistant_intent, Some(AssistantIntent::Reasoning));
+        assert!(!last.plan_steps.is_empty());
+        assert_eq!(last.reasoning_task, Some(ReasoningTask::Multiply { a: 17, b: 23 }));
+        assert_eq!(last.expected_output.as_deref(), Some("391"));
     }
 }

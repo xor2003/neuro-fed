@@ -271,6 +271,16 @@ pub enum ReasoningTask {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AssistantIntent {
+    #[default]
+    Chat,
+    Reasoning,
+    Investigation,
+    CodeTask,
+    TextTask,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkingMemory {
     pub language: String,
@@ -281,17 +291,25 @@ pub struct WorkingMemory {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StructuredState {
+    pub intent: AssistantIntent,
     pub goal: String,
+    pub plan_steps: Vec<String>,
     pub entities: HashMap<String, String>,
     pub constraints: Vec<String>,
     pub assumptions: Vec<String>,
     pub tests: String, // NEW: Task-specific assertions/unit tests
     pub raw_query: String,
+    pub reasoning_task: Option<ReasoningTask>,
+    pub expected_output: Option<String>,
 }
 
 impl StructuredState {
     pub fn get_pc_context(&self) -> String {
-        let mut ctx = format!("Goal: {}", self.goal);
+        let mut ctx = format!("Intent: {:?}\nGoal: {}", self.intent, self.goal);
+        if !self.plan_steps.is_empty() {
+            ctx.push_str("\nPlan: ");
+            ctx.push_str(&self.plan_steps.join(" -> "));
+        }
         if !self.assumptions.is_empty() {
             ctx.push_str("\nCorrected Assumptions: ");
             ctx.push_str(&self.assumptions.join("; "));
@@ -315,6 +333,12 @@ pub struct Episode {
     pub generated_code: String,
     pub thought_sequence: Vec<u32>,
     pub success: bool,
+    pub assistant_intent: Option<AssistantIntent>,
+    pub goal: Option<String>,
+    pub plan_steps: Vec<String>,
+    pub constraints: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub tests: Option<String>,
     pub reasoning_task: Option<ReasoningTask>,
     pub expected_output: Option<String>,
 }
@@ -478,6 +502,12 @@ mod cognitive_dictionary_tests {
                 generated_code: "".into(),
                 thought_sequence: vec![define_id, check_id, dict.op_to_id[&ThoughtOp::EOF]],
                 success: true,
+                assistant_intent: None,
+                goal: None,
+                plan_steps: Vec::new(),
+                constraints: Vec::new(),
+                assumptions: Vec::new(),
+                tests: None,
                 reasoning_task: None,
                 expected_output: None,
             });
@@ -509,7 +539,13 @@ mod types_architecture_tests {
     #[test]
     fn test_structured_state_generates_correct_pc_context() {
         let state = StructuredState {
+            intent: AssistantIntent::CodeTask,
             goal: "Write a binary search tree".to_string(),
+            plan_steps: vec![
+                "inspect existing constraints".to_string(),
+                "design the data structure".to_string(),
+                "verify behavior with a test".to_string(),
+            ],
             entities: HashMap::new(),
             constraints: vec!["O(log n)".to_string()],
             assumptions: vec![
@@ -518,13 +554,17 @@ mod types_architecture_tests {
             ],
             tests: "assert bst([1,2,3], 2) == 1".to_string(),
             raw_query: "Provide a BST".to_string(),
+            reasoning_task: None,
+            expected_output: None,
         };
 
         let context = state.get_pc_context();
 
         // The PC context must include both the goal and the corrective assumptions
         // to ensure it learns from its past failures.
+        assert!(context.contains("Intent: CodeTask"));
         assert!(context.contains("Goal: Write a binary search tree"));
+        assert!(context.contains("Plan: inspect existing constraints -> design the data structure -> verify behavior with a test"));
         assert!(context.contains(
             "Corrected Assumptions: The array is already sorted; Failed previously on empty array"
         ));

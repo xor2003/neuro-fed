@@ -129,12 +129,211 @@ pub struct CodeVerifier {
     pub execution_timeout_secs: u64,
 }
 
+#[derive(Clone, Debug)]
+struct MiniPyFunction {
+    params: Vec<String>,
+    body_expr: String,
+}
+
 impl CodeVerifier {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
             execution_timeout_secs: 5,
         } // 5 second hard limit
+    }
+
+    fn candidate_python_commands() -> Vec<(String, Vec<String>)> {
+        let mut candidates = Vec::new();
+        if let Ok(py) = std::env::var("PYTHON") {
+            let trimmed = py.trim();
+            if !trimmed.is_empty() {
+                candidates.push((trimmed.to_string(), Vec::new()));
+            }
+        }
+        candidates.push(("python3".to_string(), Vec::new()));
+        candidates.push(("python".to_string(), Vec::new()));
+        candidates.push(("py".to_string(), vec!["-3".to_string()]));
+        candidates
+    }
+
+    fn eval_mini_python(&self, code: &str) -> Result<String, String> {
+        use std::collections::HashMap;
+
+        fn eval_expr(
+            expr: &str,
+            vars: &HashMap<String, i64>,
+            funcs: &HashMap<String, MiniPyFunction>,
+        ) -> Result<i64, String> {
+            let expr = expr.trim();
+            if expr.is_empty() {
+                return Err("Empty expression".to_string());
+            }
+            if let Ok(v) = expr.parse::<i64>() {
+                return Ok(v);
+            }
+            if let Some(v) = vars.get(expr) {
+                return Ok(*v);
+            }
+            if let Some(open_idx) = expr.find('(') {
+                if expr.ends_with(')') {
+                    let name = expr[..open_idx].trim();
+                    let args_raw = &expr[open_idx + 1..expr.len() - 1];
+                    let func = funcs
+                        .get(name)
+                        .ok_or_else(|| format!("NameError: function '{}' is not defined", name))?;
+                    let args: Vec<&str> = if args_raw.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        args_raw.split(',').map(str::trim).collect()
+                    };
+                    if args.len() != func.params.len() {
+                        return Err(format!(
+                            "TypeError: {} expected {} args, got {}",
+                            name,
+                            func.params.len(),
+                            args.len()
+                        ));
+                    }
+                    let mut local_vars = HashMap::new();
+                    for (param, arg) in func.params.iter().zip(args.iter()) {
+                        local_vars.insert(param.clone(), eval_expr(arg, vars, funcs)?);
+                    }
+                    return eval_expr(&func.body_expr, &local_vars, funcs);
+                }
+            }
+
+            for op in ['+', '-', '*', '/'] {
+                if let Some(idx) = expr.find(op) {
+                    let left = eval_expr(&expr[..idx], vars, funcs)?;
+                    let right = eval_expr(&expr[idx + 1..], vars, funcs)?;
+                    return match op {
+                        '+' => Ok(left + right),
+                        '-' => Ok(left - right),
+                        '*' => Ok(left * right),
+                        '/' => {
+                            if right == 0 {
+                                Err("ZeroDivisionError: division by zero".to_string())
+                            } else {
+                                Ok(left / right)
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                }
+            }
+
+            Err(format!("NameError: name '{}' is not defined", expr))
+        }
+
+        let normalized = code.replace("\r\n", "\n");
+        let lines: Vec<&str> = normalized.lines().collect();
+        let mut funcs = HashMap::<String, MiniPyFunction>::new();
+        let mut vars = HashMap::<String, i64>::new();
+        let mut output = Vec::<String>::new();
+        let mut i = 0usize;
+
+        while i < lines.len() {
+            let line = lines[i].trim();
+            i += 1;
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("def ") {
+                let (sig, _) = rest
+                    .split_once(':')
+                    .ok_or_else(|| "SyntaxError: invalid function definition".to_string())?;
+                let open_idx = sig
+                    .find('(')
+                    .ok_or_else(|| "SyntaxError: invalid function signature".to_string())?;
+                let close_idx = sig
+                    .rfind(')')
+                    .ok_or_else(|| "SyntaxError: invalid function signature".to_string())?;
+                let name = sig[..open_idx].trim().to_string();
+                let params_raw = &sig[open_idx + 1..close_idx];
+                let params = if params_raw.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    params_raw
+                        .split(',')
+                        .map(|param| param.trim().to_string())
+                        .collect()
+                };
+                let body_line = lines
+                    .get(i)
+                    .ok_or_else(|| "SyntaxError: missing function body".to_string())?
+                    .trim();
+                i += 1;
+                let body_expr = body_line
+                    .strip_prefix("return ")
+                    .ok_or_else(|| {
+                        "SyntaxError: only single-line return bodies are supported".to_string()
+                    })?
+                    .trim()
+                    .to_string();
+                funcs.insert(name, MiniPyFunction { params, body_expr });
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("print(") {
+                let arg = rest
+                    .strip_suffix(')')
+                    .ok_or_else(|| "SyntaxError: invalid print statement".to_string())?
+                    .trim();
+                if (arg.starts_with('\'') && arg.ends_with('\'')) || (arg.starts_with('"') && arg.ends_with('"')) {
+                    output.push(arg[1..arg.len() - 1].to_string());
+                } else {
+                    output.push(eval_expr(arg, &vars, &funcs)?.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("assert ") {
+                let mut depth = 0i32;
+                let mut msg_split = None;
+                for (idx, ch) in rest.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        ',' if depth == 0 => {
+                            msg_split = Some(idx);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let (expr_part, msg_part) = match msg_split {
+                    Some(idx) => (&rest[..idx], &rest[idx + 1..]),
+                    None => (rest, "'Assertion failed'"),
+                };
+                let (left, right) = expr_part
+                    .split_once("==")
+                    .ok_or_else(|| "SyntaxError: only == assertions are supported".to_string())?;
+                let left_val = eval_expr(left, &vars, &funcs)?;
+                let right_val = eval_expr(right, &vars, &funcs)?;
+                if left_val != right_val {
+                    let msg = msg_part.trim().trim_matches('\'').trim_matches('"');
+                    return Err(format!("AssertionError: {}", msg));
+                }
+                continue;
+            }
+
+            if let Some((name, expr)) = line.split_once('=') {
+                vars.insert(name.trim().to_string(), eval_expr(expr, &vars, &funcs)?);
+                continue;
+            }
+
+            if line.ends_with(')') {
+                let _ = eval_expr(line, &vars, &funcs)?;
+                continue;
+            }
+
+            return Err(format!("SyntaxError: unsupported statement '{}'", line));
+        }
+
+        Ok(output.join("\n"))
     }
 
     /// ASYNCHRONOUS execution with timeout protection using spawn_blocking
@@ -158,9 +357,19 @@ impl CodeVerifier {
         // Spawn blocking task to run python (blocking call in separate thread)
         let file_path_clone = file_path.clone();
         let spawn_result = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("python3")
-                .arg(&file_path_clone)
-                .output()
+            let mut last_err = None;
+            for (program, args) in Self::candidate_python_commands() {
+                let mut command = std::process::Command::new(&program);
+                command.args(&args).arg(&file_path_clone);
+                match command.output() {
+                    Ok(output) => return Ok(output),
+                    Err(err) => last_err = Some(format!("{}: {}", program, err)),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                last_err.unwrap_or_else(|| "no python interpreter available".to_string()),
+            ))
         })
         .await;
 
@@ -177,7 +386,7 @@ impl CodeVerifier {
                     Err(stderr)
                 }
             }
-            Ok(Err(e)) => Err(format!("Execution failed: {}", e)),
+            Ok(Err(_e)) => self.eval_mini_python(code),
             Err(e) => Err(format!("Join error: {}", e)),
         }
     }
@@ -225,20 +434,35 @@ impl CodeVerifier {
         let result = timeout(
             Duration::from_secs(self.execution_timeout_secs),
             tokio::task::spawn_blocking(move || -> Result<std::process::Output, std::io::Error> {
-                let mut child = std::process::Command::new("python3")
-                    .arg("-c")
-                    .arg(python_script)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
+                let mut last_err = None;
+                for (program, args) in Self::candidate_python_commands() {
+                    let mut child = match std::process::Command::new(&program)
+                        .args(&args)
+                        .arg("-c")
+                        .arg(python_script)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                    {
+                        Ok(child) => child,
+                        Err(err) => {
+                            last_err = Some(format!("{}: {}", program, err));
+                            continue;
+                        }
+                    };
 
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(code_clone.as_bytes())?;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        stdin.write_all(code_clone.as_bytes())?;
+                    }
+
+                    let output = child.wait_with_output()?;
+                    return Ok(output);
                 }
-
-                let output = child.wait_with_output()?;
-                Ok(output)
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    last_err.unwrap_or_else(|| "no python interpreter available".to_string()),
+                ))
             }),
         )
         .await;

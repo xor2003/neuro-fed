@@ -182,6 +182,93 @@ pub fn required_ops(task: &ReasoningTask) -> Vec<ThoughtOp> {
     }
 }
 
+pub fn recommended_ops(task: &ReasoningTask) -> Vec<ThoughtOp> {
+    match task {
+        ReasoningTask::Multiply { .. } => vec![
+            ThoughtOp::Plan,
+            ThoughtOp::Decompose,
+            ThoughtOp::Initialize,
+            ThoughtOp::Compute,
+            ThoughtOp::Refine,
+            ThoughtOp::Return,
+            ThoughtOp::EOF,
+        ],
+        ReasoningTask::ReverseString { .. } => vec![
+            ThoughtOp::Plan,
+            ThoughtOp::Initialize,
+            ThoughtOp::Iterate,
+            ThoughtOp::Return,
+            ThoughtOp::EOF,
+        ],
+        ReasoningTask::SumEven { .. } => vec![
+            ThoughtOp::Plan,
+            ThoughtOp::Initialize,
+            ThoughtOp::Iterate,
+            ThoughtOp::Check,
+            ThoughtOp::Return,
+            ThoughtOp::EOF,
+        ],
+        ReasoningTask::Max { .. } => vec![
+            ThoughtOp::Plan,
+            ThoughtOp::Initialize,
+            ThoughtOp::Iterate,
+            ThoughtOp::Return,
+            ThoughtOp::EOF,
+        ],
+        ReasoningTask::SortList { .. } => vec![
+            ThoughtOp::Plan,
+            ThoughtOp::Initialize,
+            ThoughtOp::Aggregate,
+            ThoughtOp::Return,
+            ThoughtOp::EOF,
+        ],
+        ReasoningTask::SympyEval { .. } => vec![ThoughtOp::SympyEval, ThoughtOp::EOF],
+        ReasoningTask::Z3Solve { .. } => vec![ThoughtOp::Z3Solve, ThoughtOp::EOF],
+    }
+}
+
+pub fn render_output(task: &ReasoningTask, outcome: &ReasoningOutcome) -> Option<String> {
+    if !outcome.success {
+        return None;
+    }
+
+    match task {
+        ReasoningTask::Multiply { .. } => match outcome.state.get("result") {
+            Some(StateValue::Int(v)) => Some(v.to_string()),
+            _ => None,
+        },
+        ReasoningTask::ReverseString { .. } => match outcome.state.get("output") {
+            Some(StateValue::Str(v)) => Some(v.clone()),
+            _ => None,
+        },
+        ReasoningTask::SumEven { .. } => match outcome.state.get("sum") {
+            Some(StateValue::Int(v)) => Some(v.to_string()),
+            _ => None,
+        },
+        ReasoningTask::Max { .. } => match outcome.state.get("max") {
+            Some(StateValue::Int(v)) => Some(v.to_string()),
+            _ => None,
+        },
+        ReasoningTask::SortList { .. } => match outcome.state.get("sorted") {
+            Some(StateValue::List(v)) => Some(
+                v.iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        },
+        ReasoningTask::SympyEval { .. } => match outcome.state.get("result") {
+            Some(StateValue::Str(v)) => Some(v.clone()),
+            _ => None,
+        },
+        ReasoningTask::Z3Solve { var, .. } => match outcome.state.get(var) {
+            Some(StateValue::Int(v)) => Some(v.to_string()),
+            _ => None,
+        },
+    }
+}
+
 fn expected_state(task: &ReasoningTask) -> HashMap<String, StateValue> {
     let mut state = HashMap::new();
     match task {

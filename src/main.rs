@@ -50,7 +50,7 @@ fn select_device(config: &NodeConfig) -> Device {
         }
 
         tracing::warn!(
-            "GPU requested but no compatible NVIDIA/AMD/Metal device found. Falling back to CPU."
+            "GPU requested but no compatible CUDA or Metal device was found. Falling back to CPU."
         );
         Device::Cpu
     } else {

@@ -69,7 +69,7 @@ Where $\pi_{\text{default}}$ is the default precision for unverified information
 #### 1. `PrecisionCalculator`
 The main struct that calculates precision values based on context:
 - **Free Energy Tracker**: Maintains a sliding window of free energy history
-- **Code Verifier**: Stub interface for code execution verification
+- **Code Verifier**: Execution verification with external Python preference and an internal fallback for restricted environments
 - **Nostr Zap Tracker**: Stub interface for checking zap consensus
 - **Configuration**: Precision thresholds and settings
 
@@ -118,6 +118,24 @@ The `PCLevel::update_weights` method now accepts an optional precision matrix:
 ```rust
 pub fn update_weights(&mut self, eta: f32, next_level_beliefs: &Array2<f32>, precision: Option<&Array2<f32>>)
 ```
+
+## Execution Fallback Notes
+
+`CodeVerifier` prefers a real Python interpreter when one is available through:
+- `PYTHON`
+- `python3`
+- `python`
+- `py -3`
+
+When none of those interpreters are available, the verifier now falls back to a minimal internal evaluator for the narrow subset already used by the test harness:
+- integer arithmetic
+- variable assignment
+- single-line `def ...: return ...`
+- direct function calls
+- `print(...)`
+- `assert ... == ...`
+
+This keeps verification-related learning tests and basic execution checks working on constrained Windows setups instead of failing only because Python is absent from `PATH`.
 
 ## Usage Examples
 

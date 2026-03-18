@@ -1,15 +1,23 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use csv::Writer;
+use neuro_fed_node::config::NodeConfig;
+use neuro_fed_node::ml_engine::MLEngine;
+use neuro_fed_node::openai_proxy::calibration::CalibrationStore;
+use neuro_fed_node::openai_proxy::components::ProxyConfig;
+use neuro_fed_node::openai_proxy::types::{Message, OpenAiRequest};
+use neuro_fed_node::openai_proxy::OpenAiProxy;
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use neuro_fed_node::reasoning_state::execute_plan;
+use neuro_fed_node::reasoning_state::{
+    execute_plan, recommended_ops, render_output, state_error, text_error,
+};
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::sleep_phase::SleepManager;
-use neuro_fed_node::types::{CognitiveDictionary, Episode, ReasoningTask, ThoughtOp};
+use neuro_fed_node::types::{CognitiveDictionary, Episode, ReasoningTask, StudyState, ThoughtOp};
 use neuro_fed_node::{PCConfig, PredictiveCoding};
 use candle_core::Device;
 use std::collections::VecDeque;
@@ -140,7 +148,18 @@ fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
 
 fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
     let mut wtr = Writer::from_path(output)?;
-    wtr.write_record(&["case_id", "success", "errors"])?;
+    wtr.write_record(&[
+        "case_id",
+        "check_kind",
+        "success",
+        "source",
+        "expected_output",
+        "actual_output",
+        "state_error",
+        "text_error",
+        "fallback_used",
+        "errors",
+    ])?;
 
     let cases: Vec<(&str, ReasoningTask, Vec<ThoughtOp>)> = vec![
         (
@@ -215,9 +234,24 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
     let mut failures = Vec::new();
     for (case_id, task, ops) in cases {
         let outcome = execute_plan(&task, &ops);
+        let actual_output = render_output(&task, &outcome).unwrap_or_default();
+        let expected_output = expected_output_for(&task);
+        let state_error_value = outcome.errors.len().to_string();
+        let text_error_value = if expected_output.is_empty() {
+            "0".to_string()
+        } else {
+            text_error(&expected_output, &actual_output).to_string()
+        };
         wtr.write_record(&[
             case_id,
+            "state_engine",
             &outcome.success.to_string(),
+            "reasoning_state",
+            &expected_output,
+            &actual_output,
+            &state_error_value,
+            &text_error_value,
+            "false",
             &outcome.errors.join(" | "),
         ])?;
         if !outcome.success && case_id != "missing_compute" {
@@ -227,6 +261,108 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
             failures.push(case_id.to_string());
         }
     }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let proxy_failures = rt.block_on(async {
+        let mut proxy_failures = Vec::new();
+        let mut config = NodeConfig::load_or_default();
+        config.proxy_config.pc_learning_enabled = false;
+        let engine = Arc::new(RwLock::new(MLEngine::mock()?));
+        let embedding_dim = engine.read().await.embedding_dim();
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        let pc_hierarchy = Arc::new(RwLock::new(
+            PredictiveCoding::new(config.pc_config.clone())?,
+        ));
+        let dict_len = dict.read().await.len();
+        let vocab_capacity = config.pc_config.thought_vocab_capacity.max(dict_len);
+        let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
+            512,
+            vocab_capacity,
+            &Device::Cpu,
+        )?));
+        let study_state = Arc::new(RwLock::new(StudyState::default()));
+        let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
+        let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
+        let proxy = OpenAiProxy::new(
+            config,
+            ProxyConfig::default(),
+            engine,
+            pc_hierarchy,
+            embedding_dim,
+            thought_decoder,
+            dict,
+            study_state,
+            episodic_memory,
+            calibration,
+            None,
+        );
+
+        let proxy_cases = vec![
+            ("proxy_mul_17_23", "17 * 23", "391"),
+            ("proxy_reverse_abc", "reverse abc", "cba"),
+            ("proxy_sum_even", "sum even 1 2 4 5", "6"),
+            ("proxy_sort_list", "sort 3 1 2", "1 2 3"),
+        ];
+
+        for (case_id, query, expected) in proxy_cases {
+            let response = proxy
+                .handle_chat_completion(OpenAiRequest {
+                    model: "neurofed-response".to_string(),
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!(query),
+                        name: None,
+                    }],
+                    ..OpenAiRequest::default()
+                })
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let actual_output = resp.choices.first()
+                        .and_then(|choice| choice.message.content.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let source = resp.neurofed_source.unwrap_or_else(|| "unknown".to_string());
+                    let fallback_used = (source != "reasoning_state").to_string();
+                    let success = actual_output == expected && source == "reasoning_state";
+                    wtr.write_record(&[
+                        case_id,
+                        "proxy_path",
+                        &success.to_string(),
+                        &source,
+                        expected,
+                        &actual_output,
+                        "0",
+                        &text_error(expected, &actual_output).to_string(),
+                        &fallback_used,
+                        "",
+                    ])?;
+                    if !success {
+                        proxy_failures.push(case_id.to_string());
+                    }
+                }
+                Err(err) => {
+                    wtr.write_record(&[
+                        case_id,
+                        "proxy_path",
+                        "false",
+                        "error",
+                        expected,
+                        "",
+                        "1",
+                        "1",
+                        "true",
+                        &err.to_string(),
+                    ])?;
+                    proxy_failures.push(case_id.to_string());
+                }
+            }
+        }
+
+        Ok::<Vec<String>, anyhow::Error>(proxy_failures)
+    })?;
+    failures.extend(proxy_failures);
     wtr.flush()?;
 
     if !failures.is_empty() {
@@ -234,6 +370,12 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn expected_output_for(task: &ReasoningTask) -> String {
+    let ops = recommended_ops(task);
+    let (_, outcome) = state_error(task, &ops);
+    render_output(task, &outcome).unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -284,46 +426,65 @@ fn parse_op_token(token: &str) -> Option<ThoughtOp> {
 }
 
 fn default_ops_for(task: &ReasoningTask) -> Vec<ThoughtOp> {
+    recommended_ops(task)
+}
+
+fn parse_i64_values(value: &Value, key: &str) -> Vec<i64> {
+    value
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn default_raw_query_for_task(task: &ReasoningTask) -> String {
     match task {
-        ReasoningTask::Multiply { .. } => vec![
-            ThoughtOp::Plan,
-            ThoughtOp::Decompose,
-            ThoughtOp::Initialize,
-            ThoughtOp::Compute,
-            ThoughtOp::Refine,
-            ThoughtOp::Return,
-            ThoughtOp::EOF,
-        ],
-        ReasoningTask::ReverseString { .. } => vec![
-            ThoughtOp::Plan,
-            ThoughtOp::Initialize,
-            ThoughtOp::Iterate,
-            ThoughtOp::Return,
-            ThoughtOp::EOF,
-        ],
-        ReasoningTask::SumEven { .. } => vec![
-            ThoughtOp::Plan,
-            ThoughtOp::Initialize,
-            ThoughtOp::Iterate,
-            ThoughtOp::Return,
-            ThoughtOp::EOF,
-        ],
-        ReasoningTask::Max { .. } => vec![
-            ThoughtOp::Plan,
-            ThoughtOp::Initialize,
-            ThoughtOp::Iterate,
-            ThoughtOp::Return,
-            ThoughtOp::EOF,
-        ],
-        ReasoningTask::SortList { .. } => vec![
-            ThoughtOp::Plan,
-            ThoughtOp::Initialize,
-            ThoughtOp::Aggregate,
-            ThoughtOp::Return,
-            ThoughtOp::EOF,
-        ],
-        ReasoningTask::SympyEval { .. } => vec![ThoughtOp::SympyEval, ThoughtOp::EOF],
-        ReasoningTask::Z3Solve { .. } => vec![ThoughtOp::Z3Solve, ThoughtOp::EOF],
+        ReasoningTask::Multiply { a, b } => format!("multiply {} and {}", a, b),
+        ReasoningTask::ReverseString { input } => format!("reverse {}", input),
+        ReasoningTask::SumEven { values } => format!(
+            "sum even {}",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        ReasoningTask::Max { values } => format!(
+            "max {}",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        ReasoningTask::SortList { values } => format!(
+            "sort {}",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        ReasoningTask::SympyEval {
+            expression,
+            operation,
+            ..
+        } => format!("sympy {} {}", operation, expression),
+        ReasoningTask::Z3Solve {
+            var,
+            constraints,
+            ..
+        } => format!("solve {} with {}", var, constraints.join(", ")),
     }
 }
 
@@ -355,39 +516,15 @@ fn parse_reasoning_jsonl(paths: &[String]) -> Result<Vec<ReasoningEpisodeSpec>> 
                     ReasoningTask::ReverseString { input }
                 }
                 "sum_even" => {
-                    let values = value
-                        .get("values")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_i64())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let values = parse_i64_values(&value, "values");
                     ReasoningTask::SumEven { values }
                 }
                 "max" => {
-                    let values = value
-                        .get("values")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_i64())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let values = parse_i64_values(&value, "values");
                     ReasoningTask::Max { values }
                 }
                 "sort_list" => {
-                    let values = value
-                        .get("values")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_i64())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let values = parse_i64_values(&value, "values");
                     ReasoningTask::SortList { values }
                 }
                 "sympy_eval" => {
@@ -445,9 +582,12 @@ fn parse_reasoning_jsonl(paths: &[String]) -> Result<Vec<ReasoningEpisodeSpec>> 
 
             let raw_query = value
                 .get("raw_query")
+                .or_else(|| value.get("query"))
+                .or_else(|| value.get("problem"))
+                .or_else(|| value.get("instruction"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{:?}", task));
+                .unwrap_or_else(|| default_raw_query_for_task(&task));
 
             let ops = value
                 .get("ops")
@@ -463,8 +603,7 @@ fn parse_reasoning_jsonl(paths: &[String]) -> Result<Vec<ReasoningEpisodeSpec>> 
             let expected_output = value
                 .get("expected_output")
                 .or_else(|| value.get("expected"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .and_then(value_to_string);
 
             let expected_from_task = match &task {
                 ReasoningTask::SympyEval { expected, .. } => expected.clone(),
@@ -566,6 +705,20 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
                     .unwrap_or_else(|| "<missing>".to_string()),
                 thought_sequence: op_ids,
                 success: true,
+                assistant_intent: Some(match spec.task {
+                    ReasoningTask::Multiply { .. }
+                    | ReasoningTask::ReverseString { .. }
+                    | ReasoningTask::SumEven { .. }
+                    | ReasoningTask::Max { .. }
+                    | ReasoningTask::SortList { .. }
+                    | ReasoningTask::SympyEval { .. }
+                    | ReasoningTask::Z3Solve { .. } => neuro_fed_node::types::AssistantIntent::Reasoning,
+                }),
+                goal: Some(spec.raw_query.clone()),
+                plan_steps: spec.ops.iter().map(ToString::to_string).collect(),
+                constraints: Vec::new(),
+                assumptions: Vec::new(),
+                tests: spec.expected_output.clone(),
                 reasoning_task: Some(spec.task.clone()),
                 expected_output: spec.expected_output.clone(),
             });
@@ -586,6 +739,71 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_jsonl(contents: &str) -> Result<PathBuf> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("reasoning-replay-{}.jsonl", unique));
+        fs::write(&path, contents)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn test_parse_reasoning_jsonl_supports_aliases_and_defaults() -> Result<()> {
+        let path = write_temp_jsonl(
+            r#"{"task":"multiply","a":17,"b":23,"query":"solve this product","expected_output":391}
+{"task":"sort_list","values":[3,1,2]}
+"#,
+        )?;
+
+        let specs = parse_reasoning_jsonl(&[path.to_string_lossy().to_string()])?;
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].raw_query, "solve this product");
+        assert_eq!(specs[0].expected_output.as_deref(), Some("391"));
+        assert_eq!(
+            specs[0].ops,
+            recommended_ops(&ReasoningTask::Multiply { a: 17, b: 23 })
+        );
+        assert_eq!(specs[1].raw_query, "sort 3 1 2");
+        assert_eq!(
+            specs[1].ops,
+            recommended_ops(&ReasoningTask::SortList {
+                values: vec![3, 1, 2]
+            })
+        );
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_reasoning_jsonl_parses_tool_tasks_and_ops() -> Result<()> {
+        let path = write_temp_jsonl(
+            r#"{"task":"sympy_eval","expression":"2*x + 2*x","operation":"simplify","expected":"4*x","ops":["sympy_eval","eof"]}
+{"task":"z3_solve","var":"x","constraints":["x > 1","x < 3"],"expected":2,"problem":"find x","ops":["z3_solve"]}
+"#,
+        )?;
+
+        let specs = parse_reasoning_jsonl(&[path.to_string_lossy().to_string()])?;
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].raw_query, "sympy simplify 2*x + 2*x");
+        assert_eq!(specs[0].expected_output.as_deref(), Some("4*x"));
+        assert_eq!(specs[0].ops, vec![ThoughtOp::SympyEval, ThoughtOp::EOF]);
+        assert_eq!(specs[1].raw_query, "find x");
+        assert_eq!(specs[1].expected_output.as_deref(), Some("2"));
+        assert_eq!(specs[1].ops, vec![ThoughtOp::Z3Solve]);
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

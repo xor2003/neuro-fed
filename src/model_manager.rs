@@ -188,8 +188,12 @@ impl ModelManager {
         if let Ok(memory) = self.detect_memory_windows().await {
             return Ok(memory);
         }
+        if let Ok(memory) = self.detect_memory_windows_fallback().await {
+            return Ok(memory);
+        }
 
-        Err("Failed to detect available memory on this platform".to_string())
+        warn!("Failed to detect available memory on this platform, using conservative fallback");
+        Ok(4096)
     }
 
     /// Detect memory on Linux
@@ -257,10 +261,10 @@ impl ModelManager {
     async fn detect_memory_windows(&self) -> Result<u64, String> {
         use tokio::process::Command;
 
-        let output = match Command::new("wmic")
-            .arg("OS")
-            .arg("get")
-            .arg("FreePhysicalMemory")
+        let output = match Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg("(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory")
             .output()
             .await
         {
@@ -271,15 +275,46 @@ impl ModelManager {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
 
-        if lines.len() < 2 {
-            return Err("Invalid wmic output".to_string());
-        }
+        let free_memory_str = lines
+            .iter()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .ok_or_else(|| "Invalid Windows memory output".to_string())?;
 
-        let free_memory_str = lines[1].trim();
         free_memory_str
             .parse::<u64>()
             .map(|kb| kb / 1024)
             .map_err(|_| "Failed to parse free memory".to_string())
+    }
+
+    #[allow(dead_code)]
+    async fn detect_memory_windows_fallback(&self) -> Result<u64, String> {
+        use tokio::process::Command;
+
+        let output = match Command::new("cmd")
+            .arg("/C")
+            .arg("systeminfo | findstr /C:\"Available Physical Memory\"")
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let digits: String = stdout.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return Err("Invalid Windows fallback memory output".to_string());
+        }
+        digits
+            .parse::<u64>()
+            .map_err(|_| "Failed to parse fallback free memory".to_string())
     }
 
     /// Check if model is already downloaded

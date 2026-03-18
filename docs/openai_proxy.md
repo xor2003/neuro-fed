@@ -7,8 +7,10 @@ The OpenAI Smart Proxy is a transparent proxy server that sits between clients a
 1. **Tool Calling Bypass**: Automatically detects and bypasses tool/function calls to external APIs
 2. **Semantic Caching**: Caches responses based on semantic similarity of requests
 3. **Predictive Coding Integration**: Uses hierarchical predictive coding for inference and learning
-4. **Multiple Backend Support**: Routes requests to OpenAI API, Ollama, or local fallback
-5. **Metrics Collection**: Comprehensive monitoring of proxy performance and usage
+4. **Deterministic Reasoning Tasks**: Routes supported arithmetic/string/list tasks through the internal reasoning state engine before backend fallback
+5. **Multiple Backend Support**: Routes requests to OpenAI API, Ollama, or local fallback
+6. **Metrics Collection**: Comprehensive monitoring of proxy performance and usage
+7. **Intent-Aware Guidance**: Distinguishes chat, reasoning, investigation, code, and text tasks and injects mode-specific execution guidance into the request path
 
 ## Architecture
 
@@ -33,11 +35,13 @@ pub struct OpenAiProxy {
 2. **Tool Detection**: Check if request contains `tools`, `tool_calls`, or `function_call`
 3. **Tool Bypass**: If tools detected and bypass enabled, forward directly to backend
 4. **Semantic Cache Check**: Generate embedding, check for semantically similar cached responses
-5. **PC Inference**: If cache miss and PC inference enabled, generate response via predictive coding
-6. **Backend Forwarding**: Forward to configured backend (OpenAI API or Ollama)
-7. **PC Learning**: If PC learning enabled, learn from the response
-8. **Cache Update**: Update semantic cache with new response
-9. **Metrics Update**: Update performance metrics
+5. **PC Inference**: Decode ThoughtOps and confidence from predictive coding
+6. **Reasoning-State Execution**: For supported tasks such as multiply, reverse, sum-even, max, and sort-list, execute a deterministic state plan and return the rendered result
+7. **Intent Routing**: Detect whether the request is primarily chat, investigation, code, or text work
+8. **Backend Forwarding**: If deterministic reasoning does not apply, forward to configured backend (OpenAI API or Ollama) with intent-aware planning guidance
+9. **PC Learning**: If PC learning enabled, learn from the response
+10. **Cache Update**: Update semantic cache with new response
+11. **Metrics Update**: Update performance metrics
 
 ## Key Features
 
@@ -89,6 +93,136 @@ pub struct SemanticCacheEntry {
 - Learns from actual API responses
 - Updates PC hierarchy weights
 - Improves future inference accuracy
+
+### 4. Deterministic Reasoning Tasks
+
+The proxy now detects a small set of structured tasks directly from the last user message and executes them through the shared `reasoning_state` engine instead of waiting on a remote or local language-model fallback.
+
+Supported task families:
+- multiplication such as `17 * 23` or `multiply 17 and 23`
+- reverse-string requests such as `reverse abc`
+- even-sum requests such as `sum even 1 2 4 5`
+- maximum selection over integer lists
+- sort-list requests over integer lists
+
+For these tasks the proxy:
+1. extracts a `ReasoningTask`
+2. uses canonical `ThoughtOp` plans from the shared reasoning module
+3. executes the state engine
+4. renders a deterministic answer
+5. stores `reasoning_task` and `expected_output` in episodic memory so sleep/replay training can score state and text quality later
+
+### 5. Benchmark Gate
+
+The reasoning benchmark now validates two layers instead of only one:
+
+1. `state_engine`:
+   verifies canonical `ThoughtOp` plans produce the expected state and rendered output
+2. `proxy_path`:
+   instantiates the OpenAI proxy with a mock local engine and verifies supported queries are answered from `_neurofed_source = reasoning_state` rather than falling back to remote or local text generation
+
+Use:
+
+```bash
+cargo run --bin learning_benchmark -- --reasoning-check --skip-run
+```
+
+The generated CSV now includes:
+- `check_kind`
+- `source`
+- `expected_output`
+- `actual_output`
+- `state_error`
+- `text_error`
+- `fallback_used`
+
+This is intended to catch regressions where deterministic assistant tasks silently stop using the internal reasoning engine.
+
+### 6. Intent Routing
+
+The proxy now assigns each request to a lightweight assistant mode:
+- `chat`
+- `reasoning`
+- `investigation`
+- `code_task`
+- `text_task`
+
+Current use:
+- deterministic reasoning requests are routed to the internal state engine
+- non-deterministic investigation/code/text requests receive a mode-specific planning prompt before remote or local fallback
+
+This is a routing layer, not yet a full planner/executor. Its purpose is to keep the assistant behavior from collapsing into a single generic chat mode while the larger planner system is being built.
+
+### 7. Structured Assistant State
+
+`StructuredState` is no longer populated with empty placeholders for non-chat tasks.
+
+For investigation, code, and text requests the proxy now pre-fills:
+- `plan_steps`
+- `constraints`
+- `assumptions`
+- `tests`
+
+Examples:
+- investigation: evidence-first constraints and an explicit uncertainty/evidence check
+- code tasks: inspect-before-edit and build/test verification expectations
+- text tasks: preserve meaning while improving clarity/tone
+
+This scaffolding is intentionally lightweight. It gives later planner/executor work a stable state representation without pretending the full task orchestration system already exists.
+
+### 8. Planner Scaffold
+
+For non-chat tasks the proxy now generates an explicit ordered plan inside `StructuredState.plan_steps`.
+
+Examples:
+- investigation: restate target -> collect evidence -> synthesize findings
+- code task: inspect code path -> implement smallest coherent change -> verify and summarize risks
+- text task: identify audience/tone -> rewrite -> check clarity and consistency
+
+This is still a scaffold rather than a full executor, but it changes the assistant contract in an important way:
+- planning is now explicit state
+- prompt guidance is derived from that state
+- later executor work can reuse the same plan representation instead of inventing a new one
+
+### 9. Intent-Aware Local Fallback
+
+When remote generation is unavailable, the proxy no longer falls back to a generic "rephrase the query" response.
+
+The local fallback now renders a structured assistant response from `StructuredState`:
+- investigation requests return goal, plan, evidence needs, assumptions, and open questions
+- code tasks return goal, plan, constraints, assumptions, and verification steps
+- text tasks return goal, rewrite plan, constraints, assumptions, and quality checks
+- chat and reasoning still return a simpler fallback, but now include ThoughtOps and local signal metadata when available
+
+This matters because the assistant path now preserves task shape even when generation quality is weak:
+- investigation remains evidence-oriented
+- code remains verification-oriented
+- text work remains constraint-oriented
+
+That makes the fallback path compatible with future planner/executor work instead of collapsing everything back into generic chat.
+
+### 10. Structured Episodic Memory
+
+Assistant episodes now retain more than raw query, ThoughtOps, and final text.
+
+The proxy records the planner scaffold into episodic memory:
+- `assistant_intent`
+- `goal`
+- `plan_steps`
+- `constraints`
+- `assumptions`
+- `tests`
+- optional `reasoning_task` and `expected_output`
+
+This is consumed by the sleep/replay path so learning logs include task shape, not just the final answer.
+
+Practical effect:
+- investigation episodes preserve evidence-oriented plans
+- code episodes preserve verification intent
+- text episodes preserve rewrite constraints
+- reasoning episodes keep deterministic targets for state/text loss checks
+
+This is the first step toward replaying full assistant behavior instead of replaying only a response string.
 
 **Configuration**:
 ```toml

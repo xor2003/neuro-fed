@@ -572,13 +572,16 @@ mod persistence_integrity_tests {
 
     // Helper to get a unique temp DB path for tests
     fn temp_db_path() -> String {
-        format!(
-            "/tmp/neurofed_test_db_{}.redb",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
+        std::env::temp_dir()
+            .join(format!(
+                "neurofed_test_db_{}.redb",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string()
     }
 
     #[tokio::test]

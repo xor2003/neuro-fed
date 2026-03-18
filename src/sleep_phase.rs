@@ -142,8 +142,29 @@ impl SleepManager {
                         .join(" -> ")
                 };
                 detail_logs.push(format!(
-                    "Input Question: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
+                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
                     ep.raw_query,
+                    ep.assistant_intent
+                        .as_ref()
+                        .map(|intent| format!("{:?}", intent))
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    ep.goal.clone().unwrap_or_else(|| ep.raw_query.clone()),
+                    if ep.plan_steps.is_empty() {
+                        "none".to_string()
+                    } else {
+                        ep.plan_steps.join(" -> ")
+                    },
+                    if ep.constraints.is_empty() {
+                        "none".to_string()
+                    } else {
+                        ep.constraints.join("; ")
+                    },
+                    if ep.assumptions.is_empty() {
+                        "none".to_string()
+                    } else {
+                        ep.assumptions.join("; ")
+                    },
+                    ep.tests.clone().unwrap_or_else(|| "none".to_string()),
                     ep.generated_code,
                     trajectory,
                     ep.thought_sequence,
@@ -216,6 +237,12 @@ mod tests {
             generated_code: "".into(),
             thought_sequence: vec![0, 1, 2],
             success: true,
+            assistant_intent: None,
+            goal: None,
+            plan_steps: Vec::new(),
+            constraints: Vec::new(),
+            assumptions: Vec::new(),
+            tests: None,
             reasoning_task: None,
             expected_output: None,
         });
@@ -277,6 +304,12 @@ mod sleep_phase_integration_tests {
                 generated_code: "print('X')".into(),
                 thought_sequence: vec![0, 1, eof_id], // Define -> Iterate -> EOF
                 success: true,
+                assistant_intent: None,
+                goal: None,
+                plan_steps: Vec::new(),
+                constraints: Vec::new(),
+                assumptions: Vec::new(),
+                tests: None,
                 reasoning_task: None,
                 expected_output: None,
             });
@@ -361,6 +394,12 @@ mod deep_consolidation_tests {
                 thought_sequence: vec![define_id, iterate_id, eof_id],
                 // Will chunk Define -> Iterate (EOF ensures termination)
                 success: true,
+                assistant_intent: None,
+                goal: None,
+                plan_steps: Vec::new(),
+                constraints: Vec::new(),
+                assumptions: Vec::new(),
+                tests: None,
                 reasoning_task: None,
                 expected_output: None,
             });

@@ -20,9 +20,9 @@ path = "src/bin/neurofed-tauri.rs"
 # Core dependencies
 z3 = { version = "0.19", optional = true }
 
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+candle-transformers = { version = "0.9", default-features = false }
 anyhow = "1.0"
 notify = "8.2"
 ring = "0.17"
@@ -133,6 +133,8 @@ privacy = []
 federation = ["bitcoin", "lightning"]
 virality = []
 web-ui = ["tauri"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
 vulkan = []
 z3-tools = ["z3"]
 

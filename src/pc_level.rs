@@ -304,10 +304,17 @@ impl PCLevel {
 
         // L2 decay + большой шаг при Aha!
         let l2_decay = 1e-4;
-        let new_weights = self
+        let mut new_weights = self
             .weights
-            .affine(1.0 - l2_decay, 0.0)? // L2 decay
+            .affine(1.0 - l2_decay, 0.0)?
             .broadcast_add(&delta.affine(adaptive_eta as f64, 0.0)?)?;
+
+        if let Some(mask) = &self.freeze_mask {
+            let protected_mask = mask.affine(-1.0, 1.0)?;
+            let frozen_weights = self.weights.broadcast_mul(&protected_mask)?;
+            let plastic_weights = new_weights.broadcast_mul(mask)?;
+            new_weights = plastic_weights.broadcast_add(&frozen_weights)?;
+        }
 
         self.weights = new_weights.contiguous()?;
         Ok(())
@@ -702,7 +709,8 @@ mod neuron_protection_tests {
     #[test]
     fn test_check_if_random_detects_untrained() -> Result<(), Box<dyn std::error::Error>> {
         let device = Device::Cpu;
-        let level = PCLevel::new(16, 8, &device)?;
+        // Use a larger matrix so variance-based random detection is stable across runs.
+        let level = PCLevel::new(256, 128, &device)?;
 
         // Freshly initialized level should be detected as random
         let is_random = level.check_if_random()?;

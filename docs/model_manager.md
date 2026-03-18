@@ -8,6 +8,7 @@ The `ModelManager` component is responsible for automatic model download and sel
 
 - **Automatic Model Selection**: Dynamically selects the most appropriate model based on available system memory
 - **Cross-Platform Memory Detection**: Works on Linux, macOS, and Windows systems
+- **Windows-Friendly Detection**: Uses PowerShell/CIM-based memory detection instead of relying only on deprecated `wmic`
 - **Progress Tracking**: Real-time download progress with callbacks
 - **Error Handling**: Comprehensive error types and recovery mechanisms
 - **Candle-Core Integration**: Seamless integration with the candle-core framework for model operations
@@ -89,6 +90,17 @@ Detects available system memory in MB.
 let memory_mb = manager.detect_available_memory().await?;
 println!("Available memory: {} MB", memory_mb);
 ```
+
+### Detection Strategy Notes
+
+The manager now tries multiple platform-specific probes in order and falls back conservatively when they fail:
+- Linux: `free -m`
+- macOS: `vm_stat`
+- Windows: PowerShell `Get-CimInstance Win32_OperatingSystem`
+- Windows fallback: `systeminfo`
+- Final conservative fallback: `4096` MB
+
+The fallback is deliberate. Model recommendation should degrade conservatively rather than fail outright when host memory introspection is blocked or unavailable.
 
 ##### `get_available_models() -> Vec<ModelInfo>`
 Returns a list of all available models.
