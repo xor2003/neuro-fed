@@ -418,6 +418,11 @@ cargo run --features web-ui --bin neuro-fed-node -- --config config.toml
 ```
 Then open:
 - `http://localhost:8080/ui`
+The current UI should expose:
+- mode chips for `Chat`, `Investigate`, `Code`, and `Write`
+- a structured answer panel on the right
+- live steps and telemetry
+- reusable quick prompts for the active mode
 Ask a question and verify the response includes ThoughtOps and a coherent answer.
 Use **Ask Once** for a single-shot query without storing chat history in local storage.
 
