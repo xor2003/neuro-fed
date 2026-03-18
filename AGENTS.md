@@ -147,59 +147,64 @@ Operationally, each completed step should follow this loop:
 ### Enormous Recursive Roadmap
 Use this as the default long-horizon execution order for all future plans. Do not try to finish all of it in one step; always pick the highest-leverage next slice that can end in a working validated state.
 
-1. Structured assistant outputs
-- Every investigation, code, and text response should expose stable sections so replay, memory, and benchmarks can score behavior directly.
+1. Keep the current build, tests, and learning gate green at every step.
+2. Preserve deterministic reasoning tasks as a non-regressing baseline.
+3. Keep investigation, code, and text outputs structurally sectioned.
+4. Score structured assistant sections in replay and benchmark logs.
+5. Add heuristic evaluators for investigation findings/evidence quality.
+6. Add heuristic evaluators for code implementation/verification/risk quality.
+7. Add heuristic evaluators for text rewrite/quality-check fidelity.
+8. Reuse prior investigation notes through persistent retrieval.
+9. Reuse prior code workflow notes through persistent retrieval.
+10. Reuse prior text workflow notes through persistent retrieval.
+11. Strengthen code-task workflow contracts with touched-area summaries.
+12. Strengthen code-task workflow contracts with explicit verification commands.
+13. Strengthen code-task workflow contracts with residual-risk summaries.
+14. Strengthen text-task workflow contracts with tone/length constraints.
+15. Strengthen text-task workflow contracts with fidelity checks.
+16. Strengthen investigation workflows with evidence/open-question persistence.
+17. Convert successful assistant episodes into richer replay rows.
+18. Add benchmark cases for structured investigation outputs.
+19. Add benchmark cases for structured code-task outputs.
+20. Add benchmark cases for structured text-task outputs.
+21. Fail the gate when structured outputs collapse into generic chat.
+22. Fail the gate when code verification disappears from code-task outputs.
+23. Fail the gate when evidence/open-questions disappear from investigations.
+24. Fail the gate when text quality checks disappear from rewrites.
+25. Add planner state that can mark substeps pending/in-progress/completed.
+26. Split planner state from execution state.
+27. Allow plan revision when new evidence invalidates assumptions.
+28. Make the assistant summarize why a plan changed.
+29. Add a bounded software-development executor loop.
+30. Let the assistant inspect code paths before proposing edits.
+31. Let the assistant choose the narrowest relevant verification command.
+32. Let the assistant store verified coding patterns for reuse.
+33. Add a bounded text-editing executor loop.
+34. Let the assistant store reusable text transformation patterns.
+35. Add a bounded investigation executor loop.
+36. Let the assistant carry unresolved questions across sessions.
+37. Add user-preference memory for writing/help style.
+38. Add reminder/task continuity for personal-assistant behavior.
+39. Add durable project-specific architecture notes for coding assistance.
+40. Expand dataset normalization to include structured assistant outputs.
+41. Expand replay scoring to use section-level evaluator signals.
+42. Expand sleep consolidation to learn from structured workflow episodes.
+43. Add anti-cheat metrics for missing or trivial workflow structure.
+44. Add evaluator summaries back into the stored workflow memories.
+45. Add queueable background tasks for deferred study and follow-up.
+46. Start integrating real executor behavior into `node_loop.rs`.
+47. Reduce runtime/documentation drift after each integrated subsystem step.
+48. Reduce type drift between config/types/pc_types while preserving behavior.
+49. Prefer changes that compound verification, memory, and replay quality together.
+50. End every completed plan by creating the next best plan from the new state and continuing automatically.
 
-2. Structured replay scoring
-- Score assistant sections such as findings, evidence, verification, risks, rewritten text, and quality checks instead of only flat answer text.
-
-3. Retrieval-backed workflows
-- Reuse prior successful investigations, code workflows, and text workflows through semantic retrieval and persistent notes.
-
-4. Verification-aware code assistance
-- Make code tasks produce explicit change plans, touched-area summaries, verification commands, and residual-risk reporting.
-
-5. Quality-aware text assistance
-- Make text tasks preserve meaning, respect tone/brevity constraints, and emit explicit quality checks.
-
-6. Investigation system maturation
-- Preserve evidence summaries, unresolved questions, and competing explanations across sessions.
-
-7. Evaluator loop
-- Add lightweight evaluators that can inspect structured assistant outputs and score section presence, fidelity, and verification quality.
-
-8. Planner/executor separation
-- Split planning state from execution state so the assistant can revise plans, mark completed substeps, and explain failures cleanly.
-
-9. Software-development agent loop
-- Make the assistant inspect code, plan edits, implement changes, run tests, summarize results, and store verified workflow memories.
-
-10. Personal-assistant loop
-- Add durable notes, reminders, preference memory, task follow-up, and investigation continuity without losing evidence quality.
-
-11. Learning-data expansion
-- Convert successful assistant episodes into replayable structured rows with intent, sections, verification, and expected outcomes.
-
-12. Benchmark expansion
-- Add assistant-facing benchmark suites for investigation, code, and text tasks, not only deterministic reasoning tasks.
-
-13. Anti-regression gates
-- Fail the gate if structured outputs collapse back into generic chat, if verification disappears, or if retrieval stops being used where expected.
-
-14. Background orchestration
-- Move from single-turn proxy behavior toward queued jobs, deferred study, sleep consolidation, and follow-up task execution.
-
-15. Architecture consolidation
-- Reduce drift between runtime, docs, benchmarks, and persistence so the system becomes easier to improve recursively.
-
-16. Capability compounding
-- Each completed plan should either:
-  - improve output structure
-  - improve verification
-  - improve memory/retrieval
-  - improve replay/benchmark coverage
-  - improve autonomous software-development behavior
-If a proposed step does none of these, it is probably not the best next step.
+Selection rule:
+- If several possible next steps exist, prefer the smallest step that improves at least one of:
+  - output structure
+  - evaluation quality
+  - retrieval memory
+  - replay/benchmark coverage
+  - autonomous software-development usefulness
 
 ### Reasoning Replay JSONL Format
 To exercise reasoning → state → output paths via `learning_benchmark --reasoning-replay`, provide JSONL with fields:

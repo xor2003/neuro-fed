@@ -92,6 +92,65 @@ fn structured_section_score(intent: &str, answer: &str) -> usize {
         .count()
 }
 
+fn extract_section(answer: &str, heading: &str) -> Option<String> {
+    let normalized = answer.replace("\r\n", "\n");
+    let marker = format!("{}:", heading);
+    let start = normalized.find(&marker)?;
+    let after = &normalized[start + marker.len()..];
+    let mut section = Vec::new();
+    for line in after.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.ends_with(':') && !trimmed.starts_with('-') && !trimmed.is_empty() {
+            break;
+        }
+        section.push(trimmed);
+    }
+    let joined = section.join("\n").trim().to_string();
+    if joined.is_empty() { None } else { Some(joined) }
+}
+
+fn structured_quality_score(intent: &str, answer: &str) -> usize {
+    match intent {
+        "Investigation" => {
+            let findings = extract_section(answer, "Findings")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let evidence = extract_section(answer, "Evidence")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let open_questions = extract_section(answer, "Open Questions")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            findings + evidence + open_questions
+        }
+        "CodeTask" => {
+            let implementation = extract_section(answer, "Implementation")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let verification = extract_section(answer, "Verification")
+                .map(|s| s.to_lowercase().contains("build") || s.to_lowercase().contains("test"))
+                .unwrap_or(false) as usize;
+            let risks = extract_section(answer, "Risks")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            implementation + verification + risks
+        }
+        "TextTask" => {
+            let rewritten = extract_section(answer, "Rewritten Text")
+                .map(|s| s.len() > 10)
+                .unwrap_or(false) as usize;
+            let quality = extract_section(answer, "Quality Check")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let plan = extract_section(answer, "Plan")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            rewritten + quality + plan
+        }
+        _ => 0,
+    }
+}
+
 fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
     let raw = fs::read_to_string(path).context("reading detail.log")?;
     let mut results = Vec::new();
@@ -173,12 +232,17 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                 .as_deref()
                 .map(|value| structured_section_score(&intent_label, value))
                 .unwrap_or(0);
+            let quality_score = answer
+                .as_deref()
+                .map(|value| structured_quality_score(&intent_label, value))
+                .unwrap_or(0);
             results.push(LearningRecord {
                 task_id,
                 intent: intent_label,
                 loss,
                 trajectory,
                 structured_section_score: section_score,
+                structured_quality_score: quality_score,
             });
         }
     }
@@ -187,7 +251,14 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
 
 fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
     let mut wtr = csv::Writer::from_path(output)?;
-    wtr.write_record(&["task_id", "intent", "loss", "trajectory", "structured_section_score"])?;
+    wtr.write_record(&[
+        "task_id",
+        "intent",
+        "loss",
+        "trajectory",
+        "structured_section_score",
+        "structured_quality_score",
+    ])?;
     for record in records {
         wtr.write_record(&[
             &record.task_id,
@@ -195,6 +266,7 @@ fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
             &record.loss,
             record.trajectory.as_deref().unwrap_or_default(),
             &record.structured_section_score.to_string(),
+            &record.structured_quality_score.to_string(),
         ])?;
     }
     wtr.flush()?;
@@ -950,6 +1022,7 @@ struct LearningRecord {
     loss: String,
     trajectory: Option<String>,
     structured_section_score: usize,
+    structured_quality_score: usize,
 }
 
 #[cfg(test)]
@@ -968,6 +1041,24 @@ mod tests {
     #[test]
     fn test_structured_section_score_for_unknown_intent_is_zero() {
         assert_eq!(structured_section_score("Unknown", "Goal:\nwhatever"), 0);
+    }
+
+    #[test]
+    fn test_structured_quality_score_for_code_task() {
+        let score = structured_quality_score(
+            "CodeTask",
+            "Goal:\nfix parser\n\nPlan:\n- inspect\n\nDeliverables:\n- summary\n\nImplementation:\nPatched parser branch and preserved current behavior.\n\nVerification:\nran cargo build and parser tests\n\nRisks:\n- edge cases may remain",
+        );
+        assert_eq!(score, 3);
+    }
+
+    #[test]
+    fn test_extract_section_reads_until_next_heading() {
+        let answer = "Goal:\nship feature\n\nVerification:\nrun cargo build\n\nRisks:\n- minor";
+        assert_eq!(
+            extract_section(answer, "Verification").as_deref(),
+            Some("run cargo build")
+        );
     }
 }
 

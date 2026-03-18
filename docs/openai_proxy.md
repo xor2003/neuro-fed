@@ -349,6 +349,26 @@ Two concrete changes:
 This means regressions are no longer limited to arithmetic/state-path failures.
 The benchmark can now fail if the assistant collapses from structured workflow outputs back into unstructured generic text.
 
+### 16. Structured Output Evaluators
+
+The benchmark now applies lightweight evaluator heuristics on top of section-presence scoring.
+
+Current heuristic examples:
+- investigation:
+  - findings section present
+  - evidence section non-trivial
+  - open-questions section present
+- code task:
+  - implementation section non-trivial
+  - verification mentions build/test execution
+  - risks section present
+- text task:
+  - rewritten-text section non-trivial
+  - quality-check section present
+  - plan section present
+
+These are still shallow evaluators, but they matter because they begin turning structured assistant behavior into something the system can measure and improve iteratively instead of merely storing.
+
 **Configuration**:
 ```toml
 [backend_config]
