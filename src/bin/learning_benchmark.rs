@@ -3,6 +3,7 @@ use clap::Parser;
 use csv::Writer;
 use neuro_fed_node::config::NodeConfig;
 use neuro_fed_node::ml_engine::MLEngine;
+use neuro_fed_node::openai_proxy::{investigation_note_rank_score, workflow_memory_rank_score};
 use neuro_fed_node::openai_proxy::calibration::CalibrationStore;
 use neuro_fed_node::openai_proxy::components::ProxyConfig;
 use neuro_fed_node::openai_proxy::types::{Message, OpenAiRequest};
@@ -17,7 +18,10 @@ use neuro_fed_node::reasoning_state::{
 };
 use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::sleep_phase::SleepManager;
-use neuro_fed_node::types::{CognitiveDictionary, Episode, ReasoningTask, StudyState, ThoughtOp};
+use neuro_fed_node::types::{
+    AssistantIntent, CognitiveDictionary, Episode, InvestigationNote, ReasoningTask, StudyState,
+    ThoughtOp, WorkflowMemoryNote,
+};
 use neuro_fed_node::{PCConfig, PredictiveCoding};
 use candle_core::Device;
 use std::collections::VecDeque;
@@ -488,6 +492,127 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
         if outcome.success && case_id == "missing_compute" {
             failures.push(case_id.to_string());
         }
+    }
+
+    let sparse_investigation = InvestigationNote {
+        id: 1,
+        query: "investigate drift".to_string(),
+        goal: "find drift".to_string(),
+        summary: "Short note.".to_string(),
+        findings_summary: "".to_string(),
+        evidence_summary: "brief".to_string(),
+        evidence_points: vec![],
+        open_questions: vec![],
+        plan_steps: vec![],
+        constraints: vec![],
+        assumptions: vec![],
+        embedding: vec![0.1, 0.2],
+        updated_at: 1,
+    };
+    let rich_investigation = InvestigationNote {
+        id: 2,
+        query: "investigate drift".to_string(),
+        goal: "find drift".to_string(),
+        summary: "Rich note.".to_string(),
+        findings_summary: "Runtime path is narrower than docs.".to_string(),
+        evidence_summary:
+            "Compared main.rs startup path, proxy path, and documented architecture in detail."
+                .to_string(),
+        evidence_points: vec![
+            "main.rs starts only the narrow runtime path".to_string(),
+            "node_loop handlers remain placeholders".to_string(),
+        ],
+        open_questions: vec!["Which module should integrate next?".to_string()],
+        plan_steps: vec![],
+        constraints: vec![],
+        assumptions: vec![],
+        embedding: vec![0.1, 0.2],
+        updated_at: 2,
+    };
+    let sparse_inv_score = investigation_note_rank_score(0.8, &sparse_investigation);
+    let rich_inv_score = investigation_note_rank_score(0.8, &rich_investigation);
+    let investigation_rank_ok = rich_inv_score > sparse_inv_score;
+    wtr.write_record(&[
+        "investigation_memory_ranking",
+        "memory_ranking",
+        &investigation_rank_ok.to_string(),
+        "Investigation",
+        "evidence-rich note outranks sparse note",
+        &format!("rich={rich_inv_score:.3} sparse={sparse_inv_score:.3}"),
+        "0",
+        if investigation_rank_ok { "0" } else { "1" },
+        "false",
+        if investigation_rank_ok {
+            ""
+        } else {
+            "ranking did not prefer evidence-rich investigation note"
+        },
+    ])?;
+    if !investigation_rank_ok {
+        failures.push("investigation_memory_ranking".to_string());
+    }
+
+    let weak_workflow = WorkflowMemoryNote {
+        id: 1,
+        intent: AssistantIntent::CodeTask,
+        query: "fix parser".to_string(),
+        goal: "fix parser".to_string(),
+        summary: "Changed parser.".to_string(),
+        implementation_summary: "".to_string(),
+        deliverables: vec![],
+        verification_checks: vec![],
+        verification_commands: vec![],
+        verification_summary: "verified".to_string(),
+        risk_summary: "".to_string(),
+        evaluator_summary: "sections=1 quality=0".to_string(),
+        structured_section_score: 1,
+        structured_quality_score: 0,
+        constraints: vec![],
+        assumptions: vec![],
+        embedding: vec![0.1, 0.2],
+        updated_at: 1,
+    };
+    let strong_workflow = WorkflowMemoryNote {
+        id: 2,
+        intent: AssistantIntent::CodeTask,
+        query: "fix parser".to_string(),
+        goal: "fix parser".to_string(),
+        summary: "Patched parser and verified.".to_string(),
+        implementation_summary: "Patched the empty-token branch.".to_string(),
+        deliverables: vec!["change summary".to_string()],
+        verification_checks: vec!["run cargo build".to_string()],
+        verification_commands: vec!["cargo build".to_string(), "cargo test --lib".to_string()],
+        verification_summary: "cargo build and cargo test --lib passed".to_string(),
+        risk_summary: "Malformed-token edge cases may remain.".to_string(),
+        evaluator_summary: "sections=6 quality=3".to_string(),
+        structured_section_score: 6,
+        structured_quality_score: 3,
+        constraints: vec![],
+        assumptions: vec![],
+        embedding: vec![0.1, 0.2],
+        updated_at: 2,
+    };
+    let weak_workflow_score = workflow_memory_rank_score(0.8, &weak_workflow);
+    let strong_workflow_score = workflow_memory_rank_score(0.8, &strong_workflow);
+    let workflow_rank_ok = strong_workflow_score > weak_workflow_score;
+    wtr.write_record(&[
+        "workflow_memory_ranking",
+        "memory_ranking",
+        &workflow_rank_ok.to_string(),
+        "CodeTask",
+        "verification-backed note outranks weak note",
+        &format!("strong={strong_workflow_score:.3} weak={weak_workflow_score:.3}"),
+        "0",
+        if workflow_rank_ok { "0" } else { "1" },
+        "false",
+        if workflow_rank_ok {
+            ""
+        } else {
+            "ranking did not prefer verification-backed workflow note"
+        },
+    ])?;
+    if !workflow_rank_ok {
+        failures.push("workflow_memory_ranking".to_string());
     }
 
     let rt = tokio::runtime::Runtime::new()?;

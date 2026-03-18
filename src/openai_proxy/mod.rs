@@ -1151,7 +1151,7 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     trimmed.chars().take(max_chars).collect::<String>() + "..."
 }
 
-fn investigation_note_rank_score(similarity: f32, note: &InvestigationNote) -> f32 {
+pub fn investigation_note_rank_score(similarity: f32, note: &InvestigationNote) -> f32 {
     let findings_bonus = if note.findings_summary.trim().is_empty() {
         0.0
     } else {
@@ -1163,7 +1163,7 @@ fn investigation_note_rank_score(similarity: f32, note: &InvestigationNote) -> f
     similarity + findings_bonus + evidence_bonus + open_question_bonus
 }
 
-fn workflow_memory_rank_score(similarity: f32, note: &WorkflowMemoryNote) -> f32 {
+pub fn workflow_memory_rank_score(similarity: f32, note: &WorkflowMemoryNote) -> f32 {
     let quality_bonus = (note.structured_quality_score as f32 * 0.05)
         + (note.structured_section_score as f32 * 0.02);
     let command_bonus = note.verification_commands.len().min(4) as f32 * 0.03;

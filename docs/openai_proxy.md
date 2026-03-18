@@ -138,6 +138,12 @@ The generated CSV now includes:
 
 This is intended to catch regressions where deterministic assistant tasks silently stop using the internal reasoning engine.
 
+The benchmark now also includes memory-ranking checks:
+- investigation ranking must prefer evidence-rich notes over sparse notes at equal similarity
+- workflow ranking must prefer verification-backed, high-quality notes over weaker notes at equal similarity
+
+Those checks use the same ranking functions as the runtime, so retrieval-policy drift is now part of the required gate rather than only unit-test coverage.
+
 ### 6. Intent Routing
 
 The proxy now assigns each request to a lightweight assistant mode:
