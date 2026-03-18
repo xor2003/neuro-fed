@@ -236,7 +236,9 @@ When an investigation request succeeds:
 Each note captures:
 - query and goal
 - compact summary
+- findings summary
 - evidence summary
+- evidence points
 - open questions
 - plan steps
 - constraints and assumptions
@@ -248,6 +250,7 @@ For later investigation requests, the proxy:
 
 This gives the assistant a basic evidence memory:
 - repeated investigations can reuse prior findings
+- repeated investigations can reuse concrete evidence bullets instead of only prose summaries
 - open questions survive across sessions when persistence is enabled
 - the retrieval path is narrow and evidence-oriented rather than generic chat history replay
 
@@ -287,9 +290,12 @@ Each workflow-memory note keeps:
 - task intent
 - query and goal
 - compact outcome summary
+- implementation summary
 - deliverables
 - verification checks
+- extracted verification commands when present
 - verification summary
+- risk summary
 - constraints and assumptions
 - semantic embedding for retrieval
 
@@ -300,6 +306,7 @@ At request time, code and text tasks now:
 
 This gives the assistant a basic cross-session memory for:
 - previously successful verification patterns on coding tasks
+- concrete command patterns such as build/test invocations
 - prior rewrite/edit patterns on text tasks
 - reusing deliverable structure instead of starting from a blank prompt every time
 
@@ -401,6 +408,7 @@ Guidance injection now includes the prior evaluator summary so the next run can 
 - stronger verification language for code tasks
 - stronger rewrite/quality-check patterns for text tasks
 - prior outputs that were both relevant and better formed
+- explicit verification commands and risk summaries when they were captured
 
 This is a small but important shift:
 - memory retrieval is no longer similarity-only

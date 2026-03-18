@@ -1200,6 +1200,45 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
     if joined.is_empty() { None } else { Some(joined) }
 }
 
+fn extract_bullets(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn extract_command_like_lines(section: &str) -> Vec<String> {
+    extract_bullets(section)
+        .into_iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cargo ")
+                || lower.contains("pytest")
+                || lower.contains("npm ")
+                || lower.contains("pnpm ")
+                || lower.contains("yarn ")
+                || lower.contains("python ")
+                || lower.contains("uv ")
+                || lower.contains("just ")
+                || lower.contains("make ")
+                || lower.contains("cmd /c")
+                || lower.contains("powershell")
+                || lower.contains("build")
+                || lower.contains("test")
+        })
+        .take(5)
+        .collect()
+}
+
 fn structured_quality_score(intent: &AssistantIntent, answer: &str) -> usize {
     match intent {
         AssistantIntent::Investigation => {
@@ -1266,19 +1305,25 @@ fn build_investigation_note(
     timestamp: i64,
 ) -> InvestigationNote {
     let open_questions = extract_open_questions(final_text);
+    let findings_summary = extract_section(final_text, "Findings")
+        .unwrap_or_else(|| compact_text(final_text, 180));
+    let evidence_summary = extract_section(final_text, "Evidence")
+        .unwrap_or_else(|| {
+            if state.tests.trim().is_empty() {
+                final_text.to_string()
+            } else {
+                state.tests.clone()
+            }
+        });
+    let evidence_points = extract_bullets(&evidence_summary);
     InvestigationNote {
         id: timestamp as u64,
         query: state.raw_query.clone(),
         goal: state.goal.clone(),
         summary: compact_text(final_text, 280),
-        evidence_summary: compact_text(
-            if state.tests.trim().is_empty() {
-                final_text
-            } else {
-                state.tests.as_str()
-            },
-            180,
-        ),
+        findings_summary: compact_text(&findings_summary, 180),
+        evidence_summary: compact_text(&evidence_summary, 180),
+        evidence_points,
         open_questions,
         plan_steps: state.plan_steps.clone(),
         constraints: state.constraints.clone(),
@@ -1292,9 +1337,15 @@ fn build_investigation_memory_guidance(notes: &[InvestigationNote]) -> String {
     let mut lines = vec!["Investigation memory: reuse prior evidence when relevant.".to_string()];
     for note in notes {
         lines.push(format!(
-            "- Prior query: {}\n  Summary: {}\n  Evidence: {}",
-            note.query, note.summary, note.evidence_summary
+            "- Prior query: {}\n  Summary: {}\n  Findings: {}\n  Evidence: {}",
+            note.query, note.summary, note.findings_summary, note.evidence_summary
         ));
+        if !note.evidence_points.is_empty() {
+            lines.push(format!(
+                "  Evidence points: {}",
+                note.evidence_points.join(" | ")
+            ));
+        }
         if !note.open_questions.is_empty() {
             lines.push(format!(
                 "  Open questions: {}",
@@ -1313,22 +1364,30 @@ fn build_workflow_memory_note(
 ) -> WorkflowMemoryNote {
     let structured_section_score = structured_section_score(&state.intent, final_text);
     let structured_quality_score = structured_quality_score(&state.intent, final_text);
+    let implementation_summary = extract_section(final_text, "Implementation")
+        .unwrap_or_else(|| compact_text(final_text, 180));
+    let verification_section = extract_section(final_text, "Verification")
+        .unwrap_or_else(|| {
+            if state.tests.trim().is_empty() {
+                final_text.to_string()
+            } else {
+                state.tests.clone()
+            }
+        });
+    let risk_summary = extract_section(final_text, "Risks")
+        .unwrap_or_else(|| join_or_default(&state.assumptions, "unknown code-path constraints may remain"));
     WorkflowMemoryNote {
         id: timestamp as u64,
         intent: state.intent.clone(),
         query: state.raw_query.clone(),
         goal: state.goal.clone(),
         summary: compact_text(final_text, 280),
+        implementation_summary: compact_text(&implementation_summary, 180),
         deliverables: state.deliverables.clone(),
         verification_checks: state.verification_checks.clone(),
-        verification_summary: compact_text(
-            if state.tests.trim().is_empty() {
-                final_text
-            } else {
-                state.tests.as_str()
-            },
-            180,
-        ),
+        verification_commands: extract_command_like_lines(&verification_section),
+        verification_summary: compact_text(&verification_section, 180),
+        risk_summary: compact_text(&risk_summary, 180),
         evaluator_summary: workflow_evaluator_summary(&state.intent, final_text),
         structured_section_score,
         structured_quality_score,
@@ -1343,11 +1402,13 @@ fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
     let mut lines = vec!["Workflow memory: reuse prior verified patterns when relevant.".to_string()];
     for note in notes {
         lines.push(format!(
-            "- Prior {:?} query: {}\n  Summary: {}\n  Verification: {}\n  Evaluator: {}",
+            "- Prior {:?} query: {}\n  Summary: {}\n  Implementation: {}\n  Verification: {}\n  Risks: {}\n  Evaluator: {}",
             note.intent,
             note.query,
             note.summary,
+            note.implementation_summary,
             note.verification_summary,
+            note.risk_summary,
             note.evaluator_summary
         ));
         if !note.deliverables.is_empty() {
@@ -1357,6 +1418,12 @@ fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
             lines.push(format!(
                 "  Verification checks: {}",
                 note.verification_checks.join(" | ")
+            ));
+        }
+        if !note.verification_commands.is_empty() {
+            lines.push(format!(
+                "  Verification commands: {}",
+                note.verification_commands.join(" | ")
             ));
         }
     }
@@ -1875,15 +1942,17 @@ mod proxy_utility_tests {
 
         let note = build_investigation_note(
             &state,
-            "Summary of drift.\nWhat is the next integration target?",
+            "Goal:\ninvestigate architecture drift\n\nFindings:\n- Runtime path is narrower than docs.\n\nEvidence:\n- Compared main.rs startup path with documented modules.\n- Placeholder handlers remain in node_loop.rs.\n\nOpen Questions:\n- What is the next integration target?",
             vec![0.1, 0.2, 0.3],
             99,
         );
 
         assert_eq!(note.id, 99);
         assert_eq!(note.goal, "investigate architecture drift");
+        assert!(note.findings_summary.contains("Runtime path is narrower"));
+        assert_eq!(note.evidence_points.len(), 2);
         assert_eq!(note.open_questions.len(), 1);
-        assert!(note.evidence_summary.contains("remaining uncertainties"));
+        assert!(note.evidence_summary.contains("Compared main.rs"));
     }
 
     #[test]
@@ -1893,7 +1962,9 @@ mod proxy_utility_tests {
             query: "investigate architecture drift".to_string(),
             goal: "find drift".to_string(),
             summary: "Runtime path is narrower than docs.".to_string(),
+            findings_summary: "The executable path is smaller than the documented architecture.".to_string(),
             evidence_summary: "Compared main.rs against docs.".to_string(),
+            evidence_points: vec!["main.rs starts a narrower path".to_string()],
             open_questions: vec!["Which module should be integrated next?".to_string()],
             plan_steps: vec![],
             constraints: vec![],
@@ -1904,6 +1975,7 @@ mod proxy_utility_tests {
 
         assert!(guidance.contains("Investigation memory"));
         assert!(guidance.contains("Prior query"));
+        assert!(guidance.contains("Evidence points"));
         assert!(guidance.contains("Open questions"));
     }
 
@@ -1924,11 +1996,19 @@ mod proxy_utility_tests {
             expected_output: None,
         };
 
-        let note = build_workflow_memory_note(&state, "Patched the parser and built successfully.", vec![0.1, 0.2], 7);
+        let note = build_workflow_memory_note(
+            &state,
+            "Goal:\nfix parser bug\n\nPlan:\n- inspect parser\n- patch bug\n\nDeliverables:\n- change plan\n- verification summary\n\nImplementation:\nPatched the parser empty-token branch.\n\nVerification:\n- cargo build\n- cargo test --lib\n\nRisks:\n- malformed-token coverage may still be incomplete",
+            vec![0.1, 0.2],
+            7,
+        );
         assert_eq!(note.intent, AssistantIntent::CodeTask);
         assert_eq!(note.query, "fix parser bug");
+        assert!(note.implementation_summary.contains("empty-token"));
         assert!(note.verification_summary.contains("cargo build"));
-        assert_eq!(note.structured_quality_score, 0);
+        assert_eq!(note.verification_commands.len(), 2);
+        assert!(note.risk_summary.contains("malformed-token"));
+        assert_eq!(note.structured_quality_score, 3);
         assert!(note.evaluator_summary.contains("sections="));
     }
 
@@ -1940,9 +2020,12 @@ mod proxy_utility_tests {
             query: "rewrite this paragraph".to_string(),
             goal: "rewrite this paragraph".to_string(),
             summary: "Produced a shorter rewrite.".to_string(),
+            implementation_summary: "Shortened the paragraph while preserving meaning.".to_string(),
             deliverables: vec!["rewritten text".to_string()],
             verification_checks: vec!["preserve core meaning".to_string()],
+            verification_commands: vec!["check tone consistency".to_string()],
             verification_summary: "Checked meaning preservation.".to_string(),
+            risk_summary: "Nuance could still be compressed too far.".to_string(),
             evaluator_summary: "sections=5 quality=3".to_string(),
             structured_section_score: 5,
             structured_quality_score: 3,
@@ -1953,7 +2036,9 @@ mod proxy_utility_tests {
         }]);
 
         assert!(guidance.contains("Workflow memory"));
+        assert!(guidance.contains("Implementation"));
         assert!(guidance.contains("Verification checks"));
+        assert!(guidance.contains("Verification commands"));
         assert!(guidance.contains("TextTask"));
         assert!(guidance.contains("Evaluator"));
     }
