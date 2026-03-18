@@ -2,7 +2,7 @@
 // Pure Rust Redb database and state persistence for PC weights
 
 use crate::openai_proxy::calibration::CalibrationStore;
-use crate::types::{CognitiveDictionary, InvestigationNote};
+use crate::types::{CognitiveDictionary, InvestigationNote, WorkflowMemoryNote};
 use candle_core::Error as CandleError;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ const COGNITIVE_DICTIONARY: TableDefinition<u64, &[u8]> =
     TableDefinition::new("cognitive_dictionary");
 const CALIBRATION_STORE: TableDefinition<u64, &[u8]> = TableDefinition::new("calibration_store");
 const INVESTIGATION_NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("investigation_notes");
+const WORKFLOW_MEMORY_NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("workflow_memory_notes");
 
 /// Database manager for PC persistence using pure Rust Redb
 pub struct PCPersistence {
@@ -103,6 +104,7 @@ impl PCPersistence {
             let _ = write_txn.open_table(COGNITIVE_DICTIONARY);
             let _ = write_txn.open_table(CALIBRATION_STORE);
             let _ = write_txn.open_table(INVESTIGATION_NOTES);
+            let _ = write_txn.open_table(WORKFLOW_MEMORY_NOTES);
         }
         write_txn
             .commit()
@@ -616,6 +618,57 @@ impl PCPersistence {
         notes.sort_by_key(|note| std::cmp::Reverse(note.updated_at));
         Ok(notes)
     }
+
+    pub async fn save_workflow_memory_note(
+        &self,
+        note: &WorkflowMemoryNote,
+    ) -> Result<(), PersistenceError> {
+        let serialized = bincode::serialize(note)
+            .map_err(|e| PersistenceError::SerializationError(e.to_string()))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(WORKFLOW_MEMORY_NOTES)
+                .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+            table
+                .insert(note.id, serialized.as_slice())
+                .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn load_workflow_memory_notes(
+        &self,
+    ) -> Result<Vec<WorkflowMemoryNote>, PersistenceError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        let table = match read_txn.open_table(WORKFLOW_MEMORY_NOTES) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut notes = Vec::new();
+        for result in table
+            .iter()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?
+        {
+            let (_, data) = result.map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+            let note: WorkflowMemoryNote = bincode::deserialize(data.value())
+                .map_err(|e| PersistenceError::SerializationError(e.to_string()))?;
+            notes.push(note);
+        }
+
+        notes.sort_by_key(|note| std::cmp::Reverse(note.updated_at));
+        Ok(notes)
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +789,35 @@ mod persistence_integrity_tests {
 
         persistence.save_investigation_note(&note).await.unwrap();
         let loaded = persistence.load_investigation_notes().await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], note);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_memory_note_storage() {
+        let db_path = temp_db_path();
+        let persistence = PCPersistence::new(&db_path).await.unwrap();
+
+        let note = WorkflowMemoryNote {
+            id: 9,
+            intent: crate::types::AssistantIntent::CodeTask,
+            query: "fix parser bug".into(),
+            goal: "fix parser bug".into(),
+            summary: "Adjusted parser edge-case handling.".into(),
+            deliverables: vec!["change plan".into(), "verification summary".into()],
+            verification_checks: vec!["run cargo build".into()],
+            verification_summary: "cargo build passed".into(),
+            constraints: vec!["preserve behavior".into()],
+            assumptions: vec!["parser has existing tests".into()],
+            embedding: vec![0.2, 0.3, 0.4],
+            updated_at: 77,
+        };
+
+        persistence.save_workflow_memory_note(&note).await.unwrap();
+        let loaded = persistence.load_workflow_memory_notes().await.unwrap();
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0], note);

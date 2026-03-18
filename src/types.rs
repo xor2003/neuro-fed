@@ -366,6 +366,22 @@ pub struct InvestigationNote {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowMemoryNote {
+    pub id: u64,
+    pub intent: AssistantIntent,
+    pub query: String,
+    pub goal: String,
+    pub summary: String,
+    pub deliverables: Vec<String>,
+    pub verification_checks: Vec<String>,
+    pub verification_summary: String,
+    pub constraints: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub embedding: Vec<f32>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitiveDictionary {
     pub id_to_op: HashMap<u32, ThoughtOp>,

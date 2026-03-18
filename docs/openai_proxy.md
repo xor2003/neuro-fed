@@ -279,6 +279,30 @@ Text-task contract currently emphasizes:
 
 This is still not a full executor, but it moves code/text handling from prompt flavoring into a stable state contract that later execution loops can build on directly.
 
+### 13. Workflow Memory For Code And Text Tasks
+
+The proxy now stores reusable workflow memory for successful `code_task` and `text_task` requests.
+
+Each workflow-memory note keeps:
+- task intent
+- query and goal
+- compact outcome summary
+- deliverables
+- verification checks
+- verification summary
+- constraints and assumptions
+- semantic embedding for retrieval
+
+At request time, code and text tasks now:
+1. embed the new request
+2. retrieve similar prior workflow notes of the same intent
+3. inject those prior verified patterns into the guidance path
+
+This gives the assistant a basic cross-session memory for:
+- previously successful verification patterns on coding tasks
+- prior rewrite/edit patterns on text tasks
+- reusing deliverable structure instead of starting from a blank prompt every time
+
 **Configuration**:
 ```toml
 [backend_config]

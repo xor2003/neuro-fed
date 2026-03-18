@@ -31,7 +31,7 @@ use crate::semantic_cache::SemanticCache;
 use crate::sleep_phase::SleepManager;
 use crate::types::{
     AssistantIntent, CognitiveDictionary, Episode, InvestigationNote, ReasoningTask,
-    StructuredState, StudyState,
+    StructuredState, StudyState, WorkflowMemoryNote,
 };
 use candle_core::Tensor;
 
@@ -62,6 +62,7 @@ pub struct OpenAiProxy {
 
     episodic_memory: Arc<RwLock<VecDeque<Episode>>>,
     investigation_notes: Arc<RwLock<Vec<InvestigationNote>>>,
+    workflow_memory_notes: Arc<RwLock<Vec<WorkflowMemoryNote>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
     pub study_state: Arc<RwLock<StudyState>>,
     pub ui_state: Arc<RwLock<UiState>>,
@@ -77,6 +78,18 @@ impl OpenAiProxy {
             .await
             .map_err(|e| ProxyError::CacheError(format!("Failed to load investigation notes: {}", e)))?;
         *self.investigation_notes.write().await = notes;
+        Ok(())
+    }
+
+    pub async fn load_workflow_memory_notes(&self) -> Result<(), ProxyError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let notes = persistence
+            .load_workflow_memory_notes()
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Failed to load workflow memory notes: {}", e)))?;
+        *self.workflow_memory_notes.write().await = notes;
         Ok(())
     }
 
@@ -109,6 +122,7 @@ impl OpenAiProxy {
             persistence,
             episodic_memory,
             investigation_notes: Arc::new(RwLock::new(Vec::new())),
+            workflow_memory_notes: Arc::new(RwLock::new(Vec::new())),
             calibration,
             study_state,
             ui_state,
@@ -214,6 +228,66 @@ impl OpenAiProxy {
         Ok(())
     }
 
+    async fn retrieve_workflow_memory_notes(
+        &self,
+        intent: &AssistantIntent,
+        raw_query: &str,
+    ) -> Vec<WorkflowMemoryNote> {
+        let query_embedding = match self.local_engine.read().await.process_text(raw_query).await {
+            Ok(tensor) => match tensor.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                Ok(values) => values,
+                Err(_) => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+
+        let mut ranked = self
+            .workflow_memory_notes
+            .read()
+            .await
+            .iter()
+            .filter(|note| &note.intent == intent)
+            .filter_map(|note| {
+                let score = cosine_similarity(&query_embedding, &note.embedding)?;
+                Some((score, note.clone()))
+            })
+            .filter(|(score, _)| *score >= 0.72)
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ranked.into_iter().take(3).map(|(_, note)| note).collect()
+    }
+
+    async fn persist_workflow_memory_note(
+        &self,
+        state: &StructuredState,
+        final_text: &str,
+    ) -> Result<(), ProxyError> {
+        let embedding = self
+            .local_engine
+            .read()
+            .await
+            .process_text(&state.raw_query)
+            .await
+            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to embed workflow memory note: {}", e)))?
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten workflow memory embedding: {}", e)))?;
+
+        let timestamp = Utc::now().timestamp();
+        let note = build_workflow_memory_note(state, final_text, embedding, timestamp);
+        self.workflow_memory_notes.write().await.push(note.clone());
+
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .save_workflow_memory_note(&note)
+                .await
+                .map_err(|e| ProxyError::CacheError(format!("Failed to save workflow memory note: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
     /// Main handler with iterative reasoning, calibration, and verification
     pub async fn handle_chat_completion(
         &self,
@@ -250,6 +324,19 @@ impl OpenAiProxy {
         } else {
             Vec::new()
         };
+        let related_workflow_notes =
+            if matches!(state.intent, AssistantIntent::CodeTask | AssistantIntent::TextTask) {
+                let notes = self
+                    .retrieve_workflow_memory_notes(&state.intent, &state.raw_query)
+                    .await;
+                if !notes.is_empty() {
+                    self.ui_push_step(format!("Workflow memory hits: {}", notes.len()))
+                        .await;
+                }
+                notes
+            } else {
+                Vec::new()
+            };
         self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
             .await;
         self.ui_push_step("PC reasoning: embed + infer").await;
@@ -392,6 +479,9 @@ impl OpenAiProxy {
             guidance_parts.push(build_investigation_memory_guidance(
                 &related_investigation_notes,
             ));
+        }
+        if !related_workflow_notes.is_empty() {
+            guidance_parts.push(build_workflow_memory_guidance(&related_workflow_notes));
         }
         if !guidance_parts.is_empty() {
             req.messages.insert(0, Message {
@@ -553,6 +643,11 @@ impl OpenAiProxy {
         if success && matches!(state.intent, AssistantIntent::Investigation) {
             if let Err(err) = self.persist_investigation_note(&state, &final_text).await {
                 tracing::warn!("Failed to persist investigation note: {}", err);
+            }
+        }
+        if success && matches!(state.intent, AssistantIntent::CodeTask | AssistantIntent::TextTask) {
+            if let Err(err) = self.persist_workflow_memory_note(&state, &final_text).await {
+                tracing::warn!("Failed to persist workflow memory note: {}", err);
             }
         }
 
@@ -1109,6 +1204,55 @@ fn build_investigation_memory_guidance(notes: &[InvestigationNote]) -> String {
     lines.join("\n")
 }
 
+fn build_workflow_memory_note(
+    state: &StructuredState,
+    final_text: &str,
+    embedding: Vec<f32>,
+    timestamp: i64,
+) -> WorkflowMemoryNote {
+    WorkflowMemoryNote {
+        id: timestamp as u64,
+        intent: state.intent.clone(),
+        query: state.raw_query.clone(),
+        goal: state.goal.clone(),
+        summary: compact_text(final_text, 280),
+        deliverables: state.deliverables.clone(),
+        verification_checks: state.verification_checks.clone(),
+        verification_summary: compact_text(
+            if state.tests.trim().is_empty() {
+                final_text
+            } else {
+                state.tests.as_str()
+            },
+            180,
+        ),
+        constraints: state.constraints.clone(),
+        assumptions: state.assumptions.clone(),
+        embedding,
+        updated_at: timestamp,
+    }
+}
+
+fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
+    let mut lines = vec!["Workflow memory: reuse prior verified patterns when relevant.".to_string()];
+    for note in notes {
+        lines.push(format!(
+            "- Prior {:?} query: {}\n  Summary: {}\n  Verification: {}",
+            note.intent, note.query, note.summary, note.verification_summary
+        ));
+        if !note.deliverables.is_empty() {
+            lines.push(format!("  Deliverables: {}", note.deliverables.join(" | ")));
+        }
+        if !note.verification_checks.is_empty() {
+            lines.push(format!(
+                "  Verification checks: {}",
+                note.verification_checks.join(" | ")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 fn join_or_default(items: &[String], fallback: &str) -> String {
     if items.is_empty() {
         fallback.to_string()
@@ -1524,6 +1668,51 @@ mod proxy_utility_tests {
         assert!(guidance.contains("Investigation memory"));
         assert!(guidance.contains("Prior query"));
         assert!(guidance.contains("Open questions"));
+    }
+
+    #[test]
+    fn test_build_workflow_memory_note_for_code_task() {
+        let state = StructuredState {
+            intent: AssistantIntent::CodeTask,
+            goal: "fix parser bug".to_string(),
+            plan_steps: vec!["inspect parser".to_string(), "patch bug".to_string()],
+            deliverables: vec!["change plan".to_string(), "verification summary".to_string()],
+            verification_checks: vec!["run cargo build".to_string()],
+            entities: HashMap::new(),
+            constraints: vec!["preserve behavior".to_string()],
+            assumptions: vec!["tests exist".to_string()],
+            tests: "cargo build".to_string(),
+            raw_query: "fix parser bug".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let note = build_workflow_memory_note(&state, "Patched the parser and built successfully.", vec![0.1, 0.2], 7);
+        assert_eq!(note.intent, AssistantIntent::CodeTask);
+        assert_eq!(note.query, "fix parser bug");
+        assert!(note.verification_summary.contains("cargo build"));
+    }
+
+    #[test]
+    fn test_build_workflow_memory_guidance_lists_prior_checks() {
+        let guidance = build_workflow_memory_guidance(&[WorkflowMemoryNote {
+            id: 1,
+            intent: AssistantIntent::TextTask,
+            query: "rewrite this paragraph".to_string(),
+            goal: "rewrite this paragraph".to_string(),
+            summary: "Produced a shorter rewrite.".to_string(),
+            deliverables: vec!["rewritten text".to_string()],
+            verification_checks: vec!["preserve core meaning".to_string()],
+            verification_summary: "Checked meaning preservation.".to_string(),
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 1,
+        }]);
+
+        assert!(guidance.contains("Workflow memory"));
+        assert!(guidance.contains("Verification checks"));
+        assert!(guidance.contains("TextTask"));
     }
 }
 #[cfg(test)]
