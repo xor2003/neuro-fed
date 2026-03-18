@@ -384,6 +384,29 @@ This makes the learning data more useful for future consolidation and dataset ge
 - evaluator quality signals
 - reasoning/trajectory information
 
+### 18. Evaluator-Aware Workflow Memory
+
+Workflow memory for `code_task` and `text_task` requests now stores evaluator metadata directly instead of treating every retrieved prior note as equally useful.
+
+Each stored workflow-memory note now also keeps:
+- `structured_section_score`
+- `structured_quality_score`
+- compact `evaluator_summary`
+
+Retrieval ranking now prefers notes that are both:
+- semantically similar to the new request
+- structurally stronger according to the current evaluator heuristics
+
+Guidance injection now includes the prior evaluator summary so the next run can explicitly reuse:
+- stronger verification language for code tasks
+- stronger rewrite/quality-check patterns for text tasks
+- prior outputs that were both relevant and better formed
+
+This is a small but important shift:
+- memory retrieval is no longer similarity-only
+- successful assistant structure feeds back into future planning
+- the system starts preferring higher-quality prior work during reuse, not just nearest-neighbor history
+
 **Configuration**:
 ```toml
 [backend_config]

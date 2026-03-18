@@ -249,7 +249,9 @@ impl OpenAiProxy {
             .filter(|note| &note.intent == intent)
             .filter_map(|note| {
                 let score = cosine_similarity(&query_embedding, &note.embedding)?;
-                Some((score, note.clone()))
+                let quality_bonus = (note.structured_quality_score as f32 * 0.05)
+                    + (note.structured_section_score as f32 * 0.02);
+                Some((score + quality_bonus, note.clone()))
             })
             .filter(|(score, _)| *score >= 0.72)
             .collect::<Vec<_>>();
@@ -1151,6 +1153,103 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     trimmed.chars().take(max_chars).collect::<String>() + "..."
 }
 
+fn expected_sections_for_intent(intent: &AssistantIntent) -> &'static [&'static str] {
+    match intent {
+        AssistantIntent::Investigation => {
+            &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"]
+        }
+        AssistantIntent::CodeTask => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Implementation:",
+            "Verification:",
+            "Risks:",
+        ],
+        AssistantIntent::TextTask => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Rewritten Text:",
+            "Quality Check:",
+        ],
+        _ => &[],
+    }
+}
+
+fn structured_section_score(intent: &AssistantIntent, answer: &str) -> usize {
+    expected_sections_for_intent(intent)
+        .iter()
+        .filter(|section| answer.contains(**section))
+        .count()
+}
+
+fn extract_section(answer: &str, heading: &str) -> Option<String> {
+    let marker = format!("{}:", heading);
+    let start = answer.find(&marker)?;
+    let after = &answer[start + marker.len()..];
+    let mut section = Vec::new();
+    for line in after.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.ends_with(':') && !trimmed.starts_with('-') && !trimmed.is_empty() {
+            break;
+        }
+        section.push(trimmed);
+    }
+    let joined = section.join("\n").trim().to_string();
+    if joined.is_empty() { None } else { Some(joined) }
+}
+
+fn structured_quality_score(intent: &AssistantIntent, answer: &str) -> usize {
+    match intent {
+        AssistantIntent::Investigation => {
+            let findings = extract_section(answer, "Findings")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let evidence = extract_section(answer, "Evidence")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let open_questions = extract_section(answer, "Open Questions")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            findings + evidence + open_questions
+        }
+        AssistantIntent::CodeTask => {
+            let implementation = extract_section(answer, "Implementation")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let verification = extract_section(answer, "Verification")
+                .map(|s| s.to_lowercase().contains("build") || s.to_lowercase().contains("test"))
+                .unwrap_or(false) as usize;
+            let risks = extract_section(answer, "Risks")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            implementation + verification + risks
+        }
+        AssistantIntent::TextTask => {
+            let rewritten = extract_section(answer, "Rewritten Text")
+                .map(|s| s.len() > 10)
+                .unwrap_or(false) as usize;
+            let quality = extract_section(answer, "Quality Check")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let plan = extract_section(answer, "Plan")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            rewritten + quality + plan
+        }
+        _ => 0,
+    }
+}
+
+fn workflow_evaluator_summary(intent: &AssistantIntent, answer: &str) -> String {
+    format!(
+        "sections={} quality={}",
+        structured_section_score(intent, answer),
+        structured_quality_score(intent, answer)
+    )
+}
+
 fn extract_open_questions(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -1212,6 +1311,8 @@ fn build_workflow_memory_note(
     embedding: Vec<f32>,
     timestamp: i64,
 ) -> WorkflowMemoryNote {
+    let structured_section_score = structured_section_score(&state.intent, final_text);
+    let structured_quality_score = structured_quality_score(&state.intent, final_text);
     WorkflowMemoryNote {
         id: timestamp as u64,
         intent: state.intent.clone(),
@@ -1228,6 +1329,9 @@ fn build_workflow_memory_note(
             },
             180,
         ),
+        evaluator_summary: workflow_evaluator_summary(&state.intent, final_text),
+        structured_section_score,
+        structured_quality_score,
         constraints: state.constraints.clone(),
         assumptions: state.assumptions.clone(),
         embedding,
@@ -1239,8 +1343,12 @@ fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
     let mut lines = vec!["Workflow memory: reuse prior verified patterns when relevant.".to_string()];
     for note in notes {
         lines.push(format!(
-            "- Prior {:?} query: {}\n  Summary: {}\n  Verification: {}",
-            note.intent, note.query, note.summary, note.verification_summary
+            "- Prior {:?} query: {}\n  Summary: {}\n  Verification: {}\n  Evaluator: {}",
+            note.intent,
+            note.query,
+            note.summary,
+            note.verification_summary,
+            note.evaluator_summary
         ));
         if !note.deliverables.is_empty() {
             lines.push(format!("  Deliverables: {}", note.deliverables.join(" | ")));
@@ -1820,6 +1928,8 @@ mod proxy_utility_tests {
         assert_eq!(note.intent, AssistantIntent::CodeTask);
         assert_eq!(note.query, "fix parser bug");
         assert!(note.verification_summary.contains("cargo build"));
+        assert_eq!(note.structured_quality_score, 0);
+        assert!(note.evaluator_summary.contains("sections="));
     }
 
     #[test]
@@ -1833,6 +1943,9 @@ mod proxy_utility_tests {
             deliverables: vec!["rewritten text".to_string()],
             verification_checks: vec!["preserve core meaning".to_string()],
             verification_summary: "Checked meaning preservation.".to_string(),
+            evaluator_summary: "sections=5 quality=3".to_string(),
+            structured_section_score: 5,
+            structured_quality_score: 3,
             constraints: vec![],
             assumptions: vec![],
             embedding: vec![0.1, 0.2],
@@ -1842,6 +1955,7 @@ mod proxy_utility_tests {
         assert!(guidance.contains("Workflow memory"));
         assert!(guidance.contains("Verification checks"));
         assert!(guidance.contains("TextTask"));
+        assert!(guidance.contains("Evaluator"));
     }
 
     #[test]
