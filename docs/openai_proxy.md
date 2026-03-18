@@ -345,6 +345,7 @@ Current structured response shapes:
   - `Findings`
   - `Evidence`
   - `Open Questions`
+  - `Relevant Evidence` when prior investigation memory is retrieved
 - code task:
   - `Goal`
   - `Plan`
@@ -352,12 +353,14 @@ Current structured response shapes:
   - `Implementation`
   - `Verification`
   - `Risks`
+  - `Reusable Workflow` when prior workflow memory is retrieved
 - text task:
   - `Goal`
   - `Plan`
   - `Deliverables`
   - `Rewritten Text`
   - `Quality Check`
+  - `Reusable Workflow` when prior workflow memory is retrieved
 
 This matters for the learning loop because replay and memory no longer see only a flat answer string.
 They now see a stable output structure that can be:
@@ -365,6 +368,10 @@ They now see a stable output structure that can be:
 - mined for evidence and open questions
 - reused as workflow memory
 - extended later into more explicit evaluator logic
+
+Retrieved memory artifacts are now surfaced in the user-facing structured output, not only in hidden prompt guidance:
+- investigation answers can expose prior evidence bullets under `Relevant Evidence`
+- code and text answers can expose prior reusable commands and implementation patterns under `Reusable Workflow`
 
 ### 15. Structured Benchmark Scoring
 

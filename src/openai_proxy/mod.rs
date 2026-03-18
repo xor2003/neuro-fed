@@ -605,7 +605,12 @@ impl OpenAiProxy {
             );
         }
 
-        final_text = structure_assistant_output(&state, &final_text);
+        final_text = structure_assistant_output(
+            &state,
+            &final_text,
+            &related_investigation_notes,
+            &related_workflow_notes,
+        );
 
         let _verification_result: Result<String, String> = Ok("Verification skipped".to_string());
         let success = !final_text.starts_with("No response");
@@ -1477,7 +1482,61 @@ fn bulletize(items: &[String], fallback: &str) -> String {
     }
 }
 
-fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String {
+fn render_retrieved_investigation_artifacts(notes: &[InvestigationNote]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for note in notes.iter().take(2) {
+        if !note.evidence_points.is_empty() {
+            items.extend(
+                note.evidence_points
+                    .iter()
+                    .take(3)
+                    .map(|point| format!("{}: {}", note.query, point)),
+            );
+        } else if !note.evidence_summary.trim().is_empty() {
+            items.push(format!("{}: {}", note.query, note.evidence_summary));
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.into_iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+fn render_retrieved_workflow_artifacts(notes: &[WorkflowMemoryNote]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for note in notes.iter().take(2) {
+        if !note.verification_commands.is_empty() {
+            items.extend(
+                note.verification_commands
+                    .iter()
+                    .take(3)
+                    .map(|command| format!("{}: {}", note.query, command)),
+            );
+        }
+        if !note.implementation_summary.trim().is_empty() {
+            items.push(format!("{}: {}", note.query, note.implementation_summary));
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.into_iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+fn structure_assistant_output(
+    state: &StructuredState,
+    raw_text: &str,
+    related_investigation_notes: &[InvestigationNote],
+    related_workflow_notes: &[WorkflowMemoryNote],
+) -> String {
     let text = normalize_line_breaks(raw_text);
     if text.is_empty() {
         return text;
@@ -1486,10 +1545,18 @@ fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String
     match state.intent {
         AssistantIntent::Chat | AssistantIntent::Reasoning => text,
         AssistantIntent::Investigation => {
+            let retrieved = render_retrieved_investigation_artifacts(related_investigation_notes);
             if has_heading(&text, "Findings") && has_heading(&text, "Evidence") {
-                return text;
+                if has_heading(&text, "Relevant Evidence") || retrieved.is_none() {
+                    return text;
+                }
+                return format!(
+                    "{}\n\n{}",
+                    text,
+                    format_section("Relevant Evidence", retrieved.unwrap())
+                );
             }
-            [
+            let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
                 format_section("Plan", bulletize(&state.plan_steps, "collect evidence and synthesize findings")),
                 format_section("Findings", text.clone()),
@@ -1516,14 +1583,25 @@ fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String
                         }
                     },
                 ),
-            ]
-            .join("\n\n")
+            ];
+            if let Some(retrieved) = retrieved {
+                sections.push(format_section("Relevant Evidence", retrieved));
+            }
+            sections.join("\n\n")
         }
         AssistantIntent::CodeTask => {
+            let retrieved = render_retrieved_workflow_artifacts(related_workflow_notes);
             if has_heading(&text, "Implementation") && has_heading(&text, "Verification") {
-                return text;
+                if has_heading(&text, "Reusable Workflow") || retrieved.is_none() {
+                    return text;
+                }
+                return format!(
+                    "{}\n\n{}",
+                    text,
+                    format_section("Reusable Workflow", retrieved.unwrap())
+                );
             }
-            [
+            let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
                 format_section("Plan", bulletize(&state.plan_steps, "inspect, implement, verify")),
                 format_section("Deliverables", bulletize(&state.deliverables, "implementation summary")),
@@ -1550,14 +1628,25 @@ fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String
                     "Risks",
                     bulletize(&state.assumptions, "unknown code-path constraints may remain"),
                 ),
-            ]
-            .join("\n\n")
+            ];
+            if let Some(retrieved) = retrieved {
+                sections.push(format_section("Reusable Workflow", retrieved));
+            }
+            sections.join("\n\n")
         }
         AssistantIntent::TextTask => {
+            let retrieved = render_retrieved_workflow_artifacts(related_workflow_notes);
             if has_heading(&text, "Rewritten Text") && has_heading(&text, "Quality Check") {
-                return text;
+                if has_heading(&text, "Reusable Workflow") || retrieved.is_none() {
+                    return text;
+                }
+                return format!(
+                    "{}\n\n{}",
+                    text,
+                    format_section("Reusable Workflow", retrieved.unwrap())
+                );
             }
-            [
+            let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
                 format_section("Plan", bulletize(&state.plan_steps, "rewrite while preserving meaning")),
                 format_section("Deliverables", bulletize(&state.deliverables, "rewritten text")),
@@ -1574,8 +1663,11 @@ fn structure_assistant_output(state: &StructuredState, raw_text: &str) -> String
                         )
                     },
                 ),
-            ]
-            .join("\n\n")
+            ];
+            if let Some(retrieved) = retrieved {
+                sections.push(format_section("Reusable Workflow", retrieved));
+            }
+            sections.join("\n\n")
         }
     }
 }
@@ -2177,10 +2269,35 @@ mod proxy_utility_tests {
             expected_output: None,
         };
 
-        let rendered = structure_assistant_output(&state, "Patched the parser branch.");
+        let rendered = structure_assistant_output(
+            &state,
+            "Patched the parser branch.",
+            &[],
+            &[WorkflowMemoryNote {
+                id: 1,
+                intent: AssistantIntent::CodeTask,
+                query: "fix parser".to_string(),
+                goal: "fix parser".to_string(),
+                summary: "Patched parser and verified.".to_string(),
+                implementation_summary: "Patched the empty-token branch.".to_string(),
+                deliverables: vec!["implementation summary".to_string()],
+                verification_checks: vec!["run cargo build".to_string()],
+                verification_commands: vec!["cargo build".to_string()],
+                verification_summary: "cargo build passed".to_string(),
+                risk_summary: "Edge cases may remain.".to_string(),
+                evaluator_summary: "sections=6 quality=3".to_string(),
+                structured_section_score: 6,
+                structured_quality_score: 3,
+                constraints: vec![],
+                assumptions: vec![],
+                embedding: vec![0.1, 0.2],
+                updated_at: 1,
+            }],
+        );
         assert!(rendered.contains("Implementation:"));
         assert!(rendered.contains("Verification:"));
         assert!(rendered.contains("Risks:"));
+        assert!(rendered.contains("Reusable Workflow:"));
     }
 
     #[test]
@@ -2200,10 +2317,79 @@ mod proxy_utility_tests {
             expected_output: None,
         };
 
-        let rendered = structure_assistant_output(&state, "Shorter rewritten paragraph.");
+        let rendered = structure_assistant_output(
+            &state,
+            "Shorter rewritten paragraph.",
+            &[],
+            &[WorkflowMemoryNote {
+                id: 1,
+                intent: AssistantIntent::TextTask,
+                query: "rewrite paragraph".to_string(),
+                goal: "rewrite paragraph".to_string(),
+                summary: "Produced a concise rewrite.".to_string(),
+                implementation_summary: "Shortened the paragraph while preserving meaning.".to_string(),
+                deliverables: vec!["rewritten text".to_string()],
+                verification_checks: vec!["preserve core meaning".to_string()],
+                verification_commands: vec!["check tone consistency".to_string()],
+                verification_summary: "Checked meaning preservation.".to_string(),
+                risk_summary: "Nuance could be compressed too far.".to_string(),
+                evaluator_summary: "sections=5 quality=3".to_string(),
+                structured_section_score: 5,
+                structured_quality_score: 3,
+                constraints: vec![],
+                assumptions: vec![],
+                embedding: vec![0.1, 0.2],
+                updated_at: 1,
+            }],
+        );
         assert!(rendered.contains("Rewritten Text:"));
         assert!(rendered.contains("Quality Check:"));
         assert!(rendered.contains("Goal:"));
+        assert!(rendered.contains("Reusable Workflow:"));
+    }
+
+    #[test]
+    fn test_structure_assistant_output_for_investigation_includes_retrieved_evidence() {
+        let state = StructuredState {
+            intent: AssistantIntent::Investigation,
+            goal: "investigate architecture drift".to_string(),
+            plan_steps: vec!["inspect runtime".to_string(), "compare docs".to_string()],
+            deliverables: vec!["findings summary".to_string()],
+            verification_checks: vec!["separate findings from assumptions".to_string()],
+            entities: HashMap::new(),
+            constraints: vec!["Collect evidence before concluding".to_string()],
+            assumptions: vec!["Some modules may be placeholders".to_string()],
+            tests: "Return findings, evidence summary, and remaining uncertainties".to_string(),
+            raw_query: "investigate architecture drift".to_string(),
+            reasoning_task: None,
+            expected_output: None,
+        };
+
+        let rendered = structure_assistant_output(
+            &state,
+            "Runtime path is narrower than docs.",
+            &[InvestigationNote {
+                id: 1,
+                query: "investigate architecture drift".to_string(),
+                goal: "find drift".to_string(),
+                summary: "Runtime path is narrower than docs.".to_string(),
+                findings_summary: "The executable path is smaller than the documented architecture.".to_string(),
+                evidence_summary: "Compared main.rs against docs.".to_string(),
+                evidence_points: vec![
+                    "main.rs starts a narrower path".to_string(),
+                    "node_loop handlers remain placeholders".to_string(),
+                ],
+                open_questions: vec!["Which module should be integrated next?".to_string()],
+                plan_steps: vec![],
+                constraints: vec![],
+                assumptions: vec![],
+                embedding: vec![0.1, 0.2],
+                updated_at: 1,
+            }],
+            &[],
+        );
+        assert!(rendered.contains("Relevant Evidence:"));
+        assert!(rendered.contains("main.rs starts a narrower path"));
     }
 }
 #[cfg(test)]
