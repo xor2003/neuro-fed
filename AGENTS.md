@@ -250,8 +250,15 @@ Use `scripts/query_learning_dataset.py` to inspect and filter the merged JSONL:
 .venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --contains "toxicity|abuse" --output data/cleaned.jsonl
 .venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --preset alpaca --output data/alpaca_filtered.jsonl
 .venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --preset openassistant --min-score 0.6 --output data/oa_filtered.jsonl
+.venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --preset reasoning --output data/reasoning_preset.jsonl --stats
 .venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --max-chars 2500 --output data/merged_filtered.jsonl --stats
 ```
+
+For reasoning training, the merged dataset is not sufficient by itself. Use the dedicated preparation step:
+```bash
+.venv/bin/python scripts/prepare_reasoning_dataset.py --input data/merged_learning.jsonl --output data/reasoning_ready.jsonl
+```
+This keeps reasoning/code/agent rows and only retains assistant rows that look reasoning-relevant, while attaching `reasoning_score` metadata and synthesizing minimal thought traces when safe.
 
 ### Dataset Fetch (Required Sources)
 Use `scripts/fetch_datasets.py` to download and convert the required datasets into raw JSONL:
@@ -276,6 +283,7 @@ Notes:
 .venv/bin/python scripts/fetch_datasets.py --datasets alpaca,dolly,openassistant,gsm8k,strategyqa,hotpotqa,codesearchnet,humaneval --limit 5000 --streaming
 .venv/bin/python scripts/fetch_datasets.py --datasets toolbench,webarena --limit 200 --streaming
 .venv/bin/python scripts/generate_learning_dataset.py --input data/raw/alpaca.jsonl,data/raw/dolly.jsonl,data/raw/openassistant.jsonl,data/raw/gsm8k.jsonl,data/raw/strategyqa.jsonl,data/raw/hotpotqa.jsonl,data/raw/codesearchnet.jsonl,data/raw/humaneval.jsonl,data/raw/toolbench.jsonl,data/raw/webarena.jsonl --output data/merged_learning.jsonl
+.venv/bin/python scripts/prepare_reasoning_dataset.py --input data/merged_learning.jsonl --output data/reasoning_ready.jsonl
 .venv/bin/python scripts/query_learning_dataset.py --input data/merged_learning.jsonl --max-chars 2500 --output data/merged_filtered.jsonl --stats
 .venv/bin/python scripts/augment_reasoning_dataset.py --input data/merged_filtered.jsonl --output data/merged_augmented.jsonl
 ```

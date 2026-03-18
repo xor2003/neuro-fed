@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--contains", help="Regex to match any field")
     parser.add_argument("--max-chars", type=int, help="Max combined char length")
     parser.add_argument("--min-score", type=float, help="Min metadata.score if present")
-    parser.add_argument("--preset", choices=["alpaca", "dolly", "openassistant"])
+    parser.add_argument("--preset", choices=["alpaca", "dolly", "openassistant", "reasoning"])
     parser.add_argument("--sample", type=int, default=0, help="Sample N rows")
     parser.add_argument("--output", help="Write filtered rows to JSONL")
     parser.add_argument("--stats", action="store_true", help="Print dataset stats")
@@ -86,6 +86,41 @@ def main():
                 r"\bhate\b",
             ]
             max_chars = max_chars or 2500
+        elif args.preset == "reasoning":
+            max_chars = max_chars or 3500
+
+            def reasoning_row(row):
+                source_type = row.get("metadata", {}).get("source_type")
+                if source_type == "reasoning":
+                    return True
+                if source_type == "code":
+                    return bool((row.get("tests") or "").strip()) or bool((row.get("code") or "").strip())
+                if source_type == "agent":
+                    return bool((row.get("action") or "").strip()) and bool((row.get("observation") or "").strip())
+                if source_type == "assistant":
+                    if row.get("thought"):
+                        return True
+                    user = (row.get("user") or "").lower()
+                    return any(
+                        cue in user
+                        for cue in (
+                            "why",
+                            "how",
+                            "explain",
+                            "reason",
+                            "analyze",
+                            "analyse",
+                            "compare",
+                            "derive",
+                            "prove",
+                            "step by step",
+                            "investigate",
+                            "plan",
+                        )
+                    )
+                return False
+
+            rows = [r for r in rows if reasoning_row(r)]
 
         if banned_patterns:
             pattern = re.compile("|".join(banned_patterns), re.IGNORECASE)
