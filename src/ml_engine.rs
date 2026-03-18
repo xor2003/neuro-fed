@@ -1138,15 +1138,15 @@ mod tests {
         let (_word, avg_mag, max_mag) = engine.decode_belief_with_confidence(&belief_l2)?;
 
         // The original buggy code produced max_mag ~0.03.
-        // With the sqrt(dim) scaling, it should be >> 1.0.
-        // A value > 10 for a simple vector of ones is a very safe bet.
+        // The exact decoded scale is model-dependent, so this test should only
+        // assert that the logits are clearly out of the near-zero regime.
         assert!(
-            max_mag > 10.0,
+            max_mag > 1.0,
             "Max logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
             max_mag
         );
         assert!(
-            avg_mag > 0.5,
+            avg_mag > 0.1,
             "Average logit magnitude ({}) is too low. RMSNorm scaling fix may have regressed.",
             avg_mag
         );

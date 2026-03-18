@@ -3,7 +3,10 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
+
+from validate_reasoning_dataset import report as validate_report
 
 
 ARITH_RE = re.compile(r"\b(\d+)\s*([\+\-\*])\s*(\d+)\b")
@@ -137,6 +140,12 @@ def main():
     parser.add_argument("--input", required=True, help="Input normalized JSONL")
     parser.add_argument("--output", required=True, help="Output reasoning-focused JSONL")
     parser.add_argument("--min-score", type=int, default=3, help="Minimum reasoning score to keep")
+    parser.add_argument("--validate", action="store_true", help="Run dataset validation on the produced output")
+    parser.add_argument(
+        "--require-validation-ok",
+        action="store_true",
+        help="Exit non-zero if validation still reports weak reasoning coverage",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -178,6 +187,11 @@ def main():
     print(f"Wrote {written} reasoning-focused rows to {output_path}")
     for key in sorted(kept_by_type):
         print(f"{key}: {kept_by_type[key]}")
+    if args.validate or args.require_validation_ok:
+        metrics = validate_report(output_path, args.min_score, apply_prepare=False)
+        if args.require_validation_ok and not metrics["assessment"]["ok"]:
+            print("Validation gate failed.", file=sys.stderr)
+            sys.exit(2)
 
 
 if __name__ == "__main__":

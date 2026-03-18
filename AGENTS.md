@@ -256,7 +256,7 @@ Use `scripts/query_learning_dataset.py` to inspect and filter the merged JSONL:
 
 For reasoning training, the merged dataset is not sufficient by itself. Use the dedicated preparation step:
 ```bash
-.venv/bin/python scripts/prepare_reasoning_dataset.py --input data/merged_learning.jsonl --output data/reasoning_ready.jsonl
+.venv/bin/python scripts/prepare_reasoning_dataset.py --input data/merged_learning.jsonl --output data/reasoning_ready.jsonl --validate --require-validation-ok
 ```
 This keeps reasoning/code/agent rows and only retains assistant rows that look reasoning-relevant, while attaching `reasoning_score` metadata and synthesizing minimal thought traces when safe.
 
@@ -267,7 +267,8 @@ If you want an OpenAI-compatible remote LLM to preprocess rows further, use:
   --output data/reasoning_ready_llm.jsonl \
   --base-url http://YOUR_OPENAI_COMPATIBLE_HOST/v1 \
   --api-key YOUR_KEY \
-  --model YOUR_MODEL
+  --model YOUR_MODEL \
+  --validate --require-validation-ok
 ```
 Recommended flow:
 1. run `prepare_reasoning_dataset.py` first for cheap local filtering
@@ -279,7 +280,7 @@ If you want the local non-LLM path only:
 .venv/bin/python scripts/llm_prepare_reasoning_dataset.py \
   --input data/merged_learning.jsonl \
   --output data/reasoning_ready_dryrun.jsonl \
-  --dry-run
+  --dry-run --validate
 ```
 
 Validate dataset quality before training:

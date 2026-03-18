@@ -25,7 +25,7 @@ def pct(part, total):
     return round((part * 100.0) / total, 2)
 
 
-def report(path: Path, score_threshold: int, apply_prepare: bool):
+def collect_metrics(path: Path, score_threshold: int, apply_prepare: bool):
     total = 0
     source_types = Counter()
     thought_rows = 0
@@ -88,33 +88,77 @@ def report(path: Path, score_threshold: int, apply_prepare: bool):
         if combined_len > 3500:
             long_rows += 1
 
-    print(f"Dataset: {path}")
-    print(f"Total rows: {total}")
-    for key in sorted(source_types):
-        print(f"source_type.{key}: {source_types[key]} ({pct(source_types[key], total)}%)")
-    print(f"thought_rows: {thought_rows} ({pct(thought_rows, total)}%)")
-    print(
-        f"reasoning_ready_rows(score>={score_threshold}): {reasoning_ready_rows} ({pct(reasoning_ready_rows, total)}%)"
-    )
-    print(f"code_rows_with_tests: {code_with_tests} ({pct(code_with_tests, total)}%)")
-    print(f"generic_assistant_rows: {generic_assistant_rows} ({pct(generic_assistant_rows, total)}%)")
-    print(f"oversized_rows_gt_3500_chars: {long_rows} ({pct(long_rows, total)}%)")
-    for bucket in range(0, 11):
-        print(f"reasoning_score.{bucket}: {score_hist[bucket]}")
+    metrics = {
+        "path": str(path),
+        "total_rows": total,
+        "source_types": dict(source_types),
+        "thought_rows": thought_rows,
+        "reasoning_ready_rows": reasoning_ready_rows,
+        "code_with_tests": code_with_tests,
+        "generic_assistant_rows": generic_assistant_rows,
+        "oversized_rows": long_rows,
+        "score_hist": {str(bucket): score_hist[bucket] for bucket in range(0, 11)},
+        "score_threshold": score_threshold,
+    }
+    metrics["thought_rows_pct"] = pct(thought_rows, total)
+    metrics["reasoning_ready_rows_pct"] = pct(reasoning_ready_rows, total)
+    metrics["code_with_tests_pct"] = pct(code_with_tests, total)
+    metrics["generic_assistant_rows_pct"] = pct(generic_assistant_rows, total)
+    metrics["oversized_rows_pct"] = pct(long_rows, total)
+    metrics["assessment"] = assess_metrics(metrics)
+    return metrics
 
-    print("Assessment:")
+
+def assess_metrics(metrics):
+    total = metrics["total_rows"]
+    reasoning_ready_rows = metrics["reasoning_ready_rows"]
+    generic_assistant_rows = metrics["generic_assistant_rows"]
+    code_with_tests = metrics["code_with_tests"]
+    issues = []
+    passes = []
     if reasoning_ready_rows < max(100, total * 0.4):
-        print("- reasoning coverage is weak for a reasoning-focused training run")
+        issues.append("reasoning coverage is weak for a reasoning-focused training run")
     else:
-        print("- reasoning coverage is substantial enough for a focused run")
+        passes.append("reasoning coverage is substantial enough for a focused run")
     if generic_assistant_rows > total * 0.25:
-        print("- too much generic assistant data remains; filter harder before training")
+        issues.append("too much generic assistant data remains; filter harder before training")
     else:
-        print("- generic assistant contamination is controlled")
+        passes.append("generic assistant contamination is controlled")
     if code_with_tests < max(25, total * 0.05):
-        print("- code verification signal is still thin")
+        issues.append("code verification signal is still thin")
     else:
-        print("- code verification signal is present")
+        passes.append("code verification signal is present")
+    return {"ok": not issues, "issues": issues, "passes": passes}
+
+
+def print_report(metrics):
+    print(f"Dataset: {metrics['path']}")
+    print(f"Total rows: {metrics['total_rows']}")
+    for key in sorted(metrics["source_types"]):
+        count = metrics["source_types"][key]
+        print(f"source_type.{key}: {count} ({pct(count, metrics['total_rows'])}%)")
+    print(f"thought_rows: {metrics['thought_rows']} ({metrics['thought_rows_pct']}%)")
+    print(
+        f"reasoning_ready_rows(score>={metrics['score_threshold']}): {metrics['reasoning_ready_rows']} ({metrics['reasoning_ready_rows_pct']}%)"
+    )
+    print(f"code_rows_with_tests: {metrics['code_with_tests']} ({metrics['code_with_tests_pct']}%)")
+    print(
+        f"generic_assistant_rows: {metrics['generic_assistant_rows']} ({metrics['generic_assistant_rows_pct']}%)"
+    )
+    print(f"oversized_rows_gt_3500_chars: {metrics['oversized_rows']} ({metrics['oversized_rows_pct']}%)")
+    for bucket in range(0, 11):
+        print(f"reasoning_score.{bucket}: {metrics['score_hist'][str(bucket)]}")
+    print("Assessment:")
+    for item in metrics["assessment"]["passes"]:
+        print(f"- {item}")
+    for item in metrics["assessment"]["issues"]:
+        print(f"- {item}")
+
+
+def report(path: Path, score_threshold: int, apply_prepare: bool):
+    metrics = collect_metrics(path, score_threshold, apply_prepare)
+    print_report(metrics)
+    return metrics
 
 
 def main():

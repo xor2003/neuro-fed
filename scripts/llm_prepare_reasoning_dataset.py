@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from prepare_reasoning_dataset import prepare_row, reasoning_score, stable_id
+from validate_reasoning_dataset import report as validate_report
 
 
 SYSTEM_PROMPT = """You are preparing training data for a reasoning-focused local assistant.
@@ -156,6 +157,12 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
     parser.add_argument("--sleep-ms", type=int, default=0, help="Sleep between requests")
     parser.add_argument("--dry-run", action="store_true", help="Do not call the LLM; keep heuristic-prepared rows only")
+    parser.add_argument("--validate", action="store_true", help="Run dataset validation on the produced output")
+    parser.add_argument(
+        "--require-validation-ok",
+        action="store_true",
+        help="Exit non-zero if validation still reports weak reasoning coverage",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -244,6 +251,11 @@ def main():
     write_jsonl(output_path, written)
     print(f"Wrote {len(written)} rows to {output_path}")
     print(f"kept={kept} sent={sent} skipped_existing={skipped_existing} failed={failed}")
+    if args.validate or args.require_validation_ok:
+        metrics = validate_report(output_path, args.min_heuristic_score, apply_prepare=False)
+        if args.require_validation_ok and not metrics["assessment"]["ok"]:
+            print("Validation gate failed.", file=sys.stderr)
+            sys.exit(2)
 
 
 if __name__ == "__main__":
