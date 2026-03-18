@@ -369,6 +369,21 @@ Current heuristic examples:
 
 These are still shallow evaluators, but they matter because they begin turning structured assistant behavior into something the system can measure and improve iteratively instead of merely storing.
 
+### 17. Evaluator Signals In Replay Data
+
+Replay and export rows now preserve evaluator signals explicitly instead of only recomputing them later from raw answer text.
+
+Current effect:
+- sleep logs write structured section and structured quality scores
+- `learning_feedback.csv` exports those signals alongside task id, intent, loss, and trajectory
+- the benchmark still recomputes scores when explicit values are absent, so older logs remain usable
+
+This makes the learning data more useful for future consolidation and dataset generation because successful assistant episodes now carry:
+- intent
+- section coverage
+- evaluator quality signals
+- reasoning/trajectory information
+
 **Configuration**:
 ```toml
 [backend_config]

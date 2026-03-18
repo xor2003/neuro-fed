@@ -165,6 +165,8 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
         let mut trajectory = None;
         let mut intent = None;
         let mut answer = None;
+        let mut explicit_section_score = None;
+        let mut explicit_quality_score = None;
         for line in block.lines() {
             if line.starts_with("Question:") {
                 if let Some(json) = line.splitn(2, ':').nth(1) {
@@ -217,6 +219,18 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
                     .map(str::trim)
                     .map(str::to_string);
             }
+            if line.trim_start().starts_with("Structured section score:") {
+                explicit_section_score = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+            }
+            if line.trim_start().starts_with("Structured quality score:") {
+                explicit_quality_score = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+            }
             if line.trim_start().starts_with("Input Question:") && task_id.is_none() {
                 if let Some(raw) = line.splitn(2, ':').nth(1) {
                     let cleaned = raw.trim();
@@ -228,14 +242,18 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
         }
         if let (Some(task_id), Some(loss)) = (task_id, loss) {
             let intent_label = intent.unwrap_or_else(|| "Unknown".to_string());
-            let section_score = answer
-                .as_deref()
-                .map(|value| structured_section_score(&intent_label, value))
-                .unwrap_or(0);
-            let quality_score = answer
-                .as_deref()
-                .map(|value| structured_quality_score(&intent_label, value))
-                .unwrap_or(0);
+            let section_score = explicit_section_score.unwrap_or_else(|| {
+                answer
+                    .as_deref()
+                    .map(|value| structured_section_score(&intent_label, value))
+                    .unwrap_or(0)
+            });
+            let quality_score = explicit_quality_score.unwrap_or_else(|| {
+                answer
+                    .as_deref()
+                    .map(|value| structured_quality_score(&intent_label, value))
+                    .unwrap_or(0)
+            });
             results.push(LearningRecord {
                 task_id,
                 intent: intent_label,

@@ -10,6 +10,93 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task;
 
+fn expected_sections_for_intent(intent: &str) -> &'static [&'static str] {
+    match intent {
+        "Investigation" => &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"],
+        "CodeTask" => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Implementation:",
+            "Verification:",
+            "Risks:",
+        ],
+        "TextTask" => &[
+            "Goal:",
+            "Plan:",
+            "Deliverables:",
+            "Rewritten Text:",
+            "Quality Check:",
+        ],
+        _ => &[],
+    }
+}
+
+fn structured_section_score(intent: &str, answer: &str) -> usize {
+    expected_sections_for_intent(intent)
+        .iter()
+        .filter(|section| answer.contains(**section))
+        .count()
+}
+
+fn extract_section(answer: &str, heading: &str) -> Option<String> {
+    let marker = format!("{}:", heading);
+    let start = answer.find(&marker)?;
+    let after = &answer[start + marker.len()..];
+    let mut section = Vec::new();
+    for line in after.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.ends_with(':') && !trimmed.starts_with('-') && !trimmed.is_empty() {
+            break;
+        }
+        section.push(trimmed);
+    }
+    let joined = section.join("\n").trim().to_string();
+    if joined.is_empty() { None } else { Some(joined) }
+}
+
+fn structured_quality_score(intent: &str, answer: &str) -> usize {
+    match intent {
+        "Investigation" => {
+            let findings = extract_section(answer, "Findings")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let evidence = extract_section(answer, "Evidence")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let open_questions = extract_section(answer, "Open Questions")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            findings + evidence + open_questions
+        }
+        "CodeTask" => {
+            let implementation = extract_section(answer, "Implementation")
+                .map(|s| s.len() > 20)
+                .unwrap_or(false) as usize;
+            let verification = extract_section(answer, "Verification")
+                .map(|s| s.to_lowercase().contains("build") || s.to_lowercase().contains("test"))
+                .unwrap_or(false) as usize;
+            let risks = extract_section(answer, "Risks")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            implementation + verification + risks
+        }
+        "TextTask" => {
+            let rewritten = extract_section(answer, "Rewritten Text")
+                .map(|s| s.len() > 10)
+                .unwrap_or(false) as usize;
+            let quality = extract_section(answer, "Quality Check")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            let plan = extract_section(answer, "Plan")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false) as usize;
+            rewritten + quality + plan
+        }
+        _ => 0,
+    }
+}
+
 pub struct SleepManager {
     pc_hierarchy: Arc<RwLock<PredictiveCoding>>,
     decoder: Arc<RwLock<ThoughtDecoder>>,
@@ -141,13 +228,17 @@ impl SleepManager {
                         .collect::<Vec<_>>()
                         .join(" -> ")
                 };
+                let intent_label = ep
+                    .assistant_intent
+                    .as_ref()
+                    .map(|intent| format!("{:?}", intent))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let section_score = structured_section_score(&intent_label, &ep.generated_code);
+                let quality_score = structured_quality_score(&intent_label, &ep.generated_code);
                 detail_logs.push(format!(
-                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nDeliverables: {}\nVerification checks: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
+                    "Input Question: {}\nIntent: {}\nGoal: {}\nPlan: {}\nDeliverables: {}\nVerification checks: {}\nConstraints: {}\nAssumptions: {}\nTests: {}\nAnswer: {}\nStructured section score: {}\nStructured quality score: {}\nTrajectory: {}\nThought sequence: {:?}\nConfidence: {}\nNovelty: {}\nReasoning loss: {:.4}\nState loss: {:.2}\nText loss: {:.2}\nCombined loss: {:.4}{}\nLearning rate: {:.4}",
                     ep.raw_query,
-                    ep.assistant_intent
-                        .as_ref()
-                        .map(|intent| format!("{:?}", intent))
-                        .unwrap_or_else(|| "Unknown".to_string()),
+                    intent_label,
                     ep.goal.clone().unwrap_or_else(|| ep.raw_query.clone()),
                     if ep.plan_steps.is_empty() {
                         "none".to_string()
@@ -176,6 +267,8 @@ impl SleepManager {
                     },
                     ep.tests.clone().unwrap_or_else(|| "none".to_string()),
                     ep.generated_code,
+                    section_score,
+                    quality_score,
                     trajectory,
                     ep.thought_sequence,
                     ep.confidence,
@@ -216,6 +309,17 @@ impl SleepManager {
         self.episodic_memory.write().await.clear();
         tracing::info!("☀️ Waking up. Episodic memory cleared.");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod evaluator_tests {
+    use super::*;
+
+    #[test]
+    fn test_structured_quality_score_for_investigation() {
+        let answer = "Goal:\ncheck drift\n\nFindings:\nRuntime and docs differ.\n\nEvidence:\nCompared main path and docs in detail.\n\nOpen Questions:\n- Which module should integrate next?";
+        assert_eq!(structured_quality_score("Investigation", answer), 3);
     }
 }
 
