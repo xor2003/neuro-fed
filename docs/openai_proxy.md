@@ -248,6 +248,12 @@ For later investigation requests, the proxy:
 2. retrieves the most similar stored investigation notes
 3. injects those prior findings back into the investigation guidance path
 
+Investigation retrieval is no longer similarity-only.
+It now prefers notes that also contain:
+- stronger findings summaries
+- more extracted evidence points
+- non-empty open questions when uncertainty was preserved
+
 This gives the assistant a basic evidence memory:
 - repeated investigations can reuse prior findings
 - repeated investigations can reuse concrete evidence bullets instead of only prose summaries
@@ -304,11 +310,23 @@ At request time, code and text tasks now:
 2. retrieve similar prior workflow notes of the same intent
 3. inject those prior verified patterns into the guidance path
 
+Workflow retrieval is also quality-aware.
+It now prefers notes that combine semantic similarity with:
+- stronger structured/evaluator scores
+- explicit verification commands
+- non-empty implementation summaries
+- non-empty risk summaries
+
 This gives the assistant a basic cross-session memory for:
 - previously successful verification patterns on coding tasks
 - concrete command patterns such as build/test invocations
 - prior rewrite/edit patterns on text tasks
 - reusing deliverable structure instead of starting from a blank prompt every time
+
+This changes memory reuse in an important way:
+- near-duplicate but weak prior answers are less likely to dominate retrieval
+- evidence-rich investigations are more likely to be reused
+- command-backed code workflows are more likely to be reused
 
 ### 14. Structured Assistant Outputs
 

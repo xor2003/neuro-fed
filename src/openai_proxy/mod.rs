@@ -188,8 +188,8 @@ impl OpenAiProxy {
             .await
             .iter()
             .filter_map(|note| {
-                let score = cosine_similarity(&query_embedding, &note.embedding)?;
-                Some((score, note.clone()))
+                let similarity = cosine_similarity(&query_embedding, &note.embedding)?;
+                Some((investigation_note_rank_score(similarity, note), note.clone()))
             })
             .filter(|(score, _)| *score >= 0.72)
             .collect::<Vec<_>>();
@@ -248,10 +248,8 @@ impl OpenAiProxy {
             .iter()
             .filter(|note| &note.intent == intent)
             .filter_map(|note| {
-                let score = cosine_similarity(&query_embedding, &note.embedding)?;
-                let quality_bonus = (note.structured_quality_score as f32 * 0.05)
-                    + (note.structured_section_score as f32 * 0.02);
-                Some((score + quality_bonus, note.clone()))
+                let similarity = cosine_similarity(&query_embedding, &note.embedding)?;
+                Some((workflow_memory_rank_score(similarity, note), note.clone()))
             })
             .filter(|(score, _)| *score >= 0.72)
             .collect::<Vec<_>>();
@@ -1153,6 +1151,31 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     trimmed.chars().take(max_chars).collect::<String>() + "..."
 }
 
+fn investigation_note_rank_score(similarity: f32, note: &InvestigationNote) -> f32 {
+    let findings_bonus = if note.findings_summary.trim().is_empty() {
+        0.0
+    } else {
+        0.03
+    };
+    let evidence_bonus = (note.evidence_points.len().min(4) as f32 * 0.03)
+        + if note.evidence_summary.len() > 40 { 0.02 } else { 0.0 };
+    let open_question_bonus = if note.open_questions.is_empty() { 0.0 } else { 0.01 };
+    similarity + findings_bonus + evidence_bonus + open_question_bonus
+}
+
+fn workflow_memory_rank_score(similarity: f32, note: &WorkflowMemoryNote) -> f32 {
+    let quality_bonus = (note.structured_quality_score as f32 * 0.05)
+        + (note.structured_section_score as f32 * 0.02);
+    let command_bonus = note.verification_commands.len().min(4) as f32 * 0.03;
+    let implementation_bonus = if note.implementation_summary.trim().is_empty() {
+        0.0
+    } else {
+        0.02
+    };
+    let risk_bonus = if note.risk_summary.trim().is_empty() { 0.0 } else { 0.01 };
+    similarity + quality_bonus + command_bonus + implementation_bonus + risk_bonus
+}
+
 fn expected_sections_for_intent(intent: &AssistantIntent) -> &'static [&'static str] {
     match intent {
         AssistantIntent::Investigation => {
@@ -2041,6 +2064,96 @@ mod proxy_utility_tests {
         assert!(guidance.contains("Verification commands"));
         assert!(guidance.contains("TextTask"));
         assert!(guidance.contains("Evaluator"));
+    }
+
+    #[test]
+    fn test_investigation_note_rank_score_prefers_evidence_rich_notes() {
+        let sparse = InvestigationNote {
+            id: 1,
+            query: "investigate drift".to_string(),
+            goal: "find drift".to_string(),
+            summary: "Short note.".to_string(),
+            findings_summary: "".to_string(),
+            evidence_summary: "brief".to_string(),
+            evidence_points: vec![],
+            open_questions: vec![],
+            plan_steps: vec![],
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 1,
+        };
+        let rich = InvestigationNote {
+            id: 2,
+            query: "investigate drift".to_string(),
+            goal: "find drift".to_string(),
+            summary: "Rich note.".to_string(),
+            findings_summary: "Runtime path is narrower than docs.".to_string(),
+            evidence_summary: "Compared main.rs startup path, proxy path, and documented architecture in detail.".to_string(),
+            evidence_points: vec![
+                "main.rs starts only the narrow runtime path".to_string(),
+                "node_loop handlers remain placeholders".to_string(),
+            ],
+            open_questions: vec!["Which module should integrate next?".to_string()],
+            plan_steps: vec![],
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 2,
+        };
+
+        assert!(
+            investigation_note_rank_score(0.8, &rich)
+                > investigation_note_rank_score(0.8, &sparse)
+        );
+    }
+
+    #[test]
+    fn test_workflow_memory_rank_score_prefers_verification_backed_notes() {
+        let weak = WorkflowMemoryNote {
+            id: 1,
+            intent: AssistantIntent::CodeTask,
+            query: "fix parser".to_string(),
+            goal: "fix parser".to_string(),
+            summary: "Changed parser.".to_string(),
+            implementation_summary: "".to_string(),
+            deliverables: vec![],
+            verification_checks: vec![],
+            verification_commands: vec![],
+            verification_summary: "verified".to_string(),
+            risk_summary: "".to_string(),
+            evaluator_summary: "sections=1 quality=0".to_string(),
+            structured_section_score: 1,
+            structured_quality_score: 0,
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 1,
+        };
+        let strong = WorkflowMemoryNote {
+            id: 2,
+            intent: AssistantIntent::CodeTask,
+            query: "fix parser".to_string(),
+            goal: "fix parser".to_string(),
+            summary: "Patched parser and verified.".to_string(),
+            implementation_summary: "Patched the empty-token branch.".to_string(),
+            deliverables: vec!["change summary".to_string()],
+            verification_checks: vec!["run cargo build".to_string()],
+            verification_commands: vec!["cargo build".to_string(), "cargo test --lib".to_string()],
+            verification_summary: "cargo build and cargo test --lib passed".to_string(),
+            risk_summary: "Malformed-token edge cases may remain.".to_string(),
+            evaluator_summary: "sections=6 quality=3".to_string(),
+            structured_section_score: 6,
+            structured_quality_score: 3,
+            constraints: vec![],
+            assumptions: vec![],
+            embedding: vec![0.1, 0.2],
+            updated_at: 2,
+        };
+
+        assert!(
+            workflow_memory_rank_score(0.8, &strong) > workflow_memory_rank_score(0.8, &weak)
+        );
     }
 
     #[test]
