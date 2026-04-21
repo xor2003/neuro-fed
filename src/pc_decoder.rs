@@ -97,7 +97,13 @@ impl ThoughtDecoder {
         beam_width: usize,
         constraints: &ThoughtConstraints,
     ) -> Result<Vec<u32>, PCError> {
-        self.decode_sequence_with_rules(anchor_belief, max_steps, beam_width, None, Some(constraints))
+        self.decode_sequence_with_rules(
+            anchor_belief,
+            max_steps,
+            beam_width,
+            None,
+            Some(constraints),
+        )
     }
 
     fn decode_sequence_with_rules(
@@ -146,8 +152,14 @@ impl ThoughtDecoder {
             .map(|c| c.eof_token_id)
             .unwrap_or(DEFAULT_EOF_TOKEN_ID);
 
-        let mut beams =
-            vec![(0.0f32, 0.0f32, Vec::<u32>::new(), anchor_2d.clone(), false, 0u64)];
+        let mut beams = vec![(
+            0.0f32,
+            0.0f32,
+            Vec::<u32>::new(),
+            anchor_2d.clone(),
+            false,
+            0u64,
+        )];
 
         for _step in 1..=max_steps {
             let mut new_beams = Vec::new();
@@ -262,7 +274,10 @@ impl ThoughtDecoder {
 
         let seq = beams[0].2.clone();
         if let Some(constraints) = constraints {
-            if seq.iter().filter(|id| **id != constraints.eof_token_id).count()
+            if seq
+                .iter()
+                .filter(|id| **id != constraints.eof_token_id)
+                .count()
                 < constraints.min_non_eof
             {
                 return Err(PCError(
@@ -272,9 +287,7 @@ impl ThoughtDecoder {
 
             for required in constraints.required_ops.iter() {
                 if !seq.contains(required) {
-                    return Err(PCError(
-                        "Decoded sequence missing required op".to_string(),
-                    ));
+                    return Err(PCError("Decoded sequence missing required op".to_string()));
                 }
             }
         }

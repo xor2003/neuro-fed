@@ -1,33 +1,33 @@
 use anyhow::{Context, Result};
+use candle_core::Device;
 use clap::Parser;
 use csv::Writer;
 use neuro_fed_node::config::NodeConfig;
 use neuro_fed_node::ml_engine::MLEngine;
-use neuro_fed_node::openai_proxy::{investigation_note_rank_score, workflow_memory_rank_score};
+use neuro_fed_node::openai_proxy::OpenAiProxy;
 use neuro_fed_node::openai_proxy::calibration::CalibrationStore;
 use neuro_fed_node::openai_proxy::components::ProxyConfig;
 use neuro_fed_node::openai_proxy::types::{Message, OpenAiRequest};
-use neuro_fed_node::openai_proxy::OpenAiProxy;
-use serde_json::Value;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use neuro_fed_node::openai_proxy::{investigation_note_rank_score, workflow_memory_rank_score};
+use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::reasoning_state::{
     execute_plan, recommended_ops, render_output, state_error, text_error,
 };
-use neuro_fed_node::pc_decoder::ThoughtDecoder;
 use neuro_fed_node::sleep_phase::SleepManager;
 use neuro_fed_node::types::{
     AssistantIntent, CognitiveDictionary, Episode, InvestigationNote, ReasoningTask, StudyState,
     ThoughtOp, WorkflowMemoryNote,
 };
 use neuro_fed_node::{PCConfig, PredictiveCoding};
-use candle_core::Device;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use sha2::{Digest, Sha256};
 
 /// Collect learning loss/trajectory summaries for specified datasets without running the entire node.
 #[derive(Parser)]
@@ -68,7 +68,13 @@ struct Args {
 
 fn expected_sections_for_intent(intent: &str) -> &'static [&'static str] {
     match intent {
-        "Investigation" => &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"],
+        "Investigation" => &[
+            "Goal:",
+            "Plan:",
+            "Findings:",
+            "Evidence:",
+            "Open Questions:",
+        ],
         "CodeTask" => &[
             "Goal:",
             "Plan:",
@@ -110,7 +116,11 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
         section.push(trimmed);
     }
     let joined = section.join("\n").trim().to_string();
-    if joined.is_empty() { None } else { Some(joined) }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn extract_bullets(section: &str) -> Vec<String> {
@@ -626,9 +636,9 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
         let engine = Arc::new(RwLock::new(MLEngine::mock()?));
         let embedding_dim = engine.read().await.embedding_dim();
         let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
-        let pc_hierarchy = Arc::new(RwLock::new(
-            PredictiveCoding::new(config.pc_config.clone())?,
-        ));
+        let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(
+            config.pc_config.clone(),
+        )?));
         let dict_len = dict.read().await.len();
         let vocab_capacity = config.pc_config.thought_vocab_capacity.max(dict_len);
         let thought_decoder = Arc::new(RwLock::new(ThoughtDecoder::new(
@@ -676,11 +686,15 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
 
             match response {
                 Ok(resp) => {
-                    let actual_output = resp.choices.first()
+                    let actual_output = resp
+                        .choices
+                        .first()
                         .and_then(|choice| choice.message.content.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let source = resp.neurofed_source.unwrap_or_else(|| "unknown".to_string());
+                    let source = resp
+                        .neurofed_source
+                        .unwrap_or_else(|| "unknown".to_string());
                     let fallback_used = (source != "reasoning_state").to_string();
                     let success = actual_output == expected && source == "reasoning_state";
                     wtr.write_record(&[
@@ -753,11 +767,16 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
 
             match response {
                 Ok(resp) => {
-                    let actual_output = resp.choices.first()
+                    let actual_output = resp
+                        .choices
+                        .first()
                         .and_then(|choice| choice.message.content.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let section_hits = sections.iter().filter(|section| actual_output.contains(**section)).count();
+                    let section_hits = sections
+                        .iter()
+                        .filter(|section| actual_output.contains(**section))
+                        .count();
                     let success = section_hits == sections.len();
                     wtr.write_record(&[
                         case_id,
@@ -769,7 +788,11 @@ fn run_reasoning_checks(output: &PathBuf) -> Result<()> {
                         "0",
                         &(sections.len() - section_hits).to_string(),
                         "false",
-                        if success { "" } else { "missing structured sections" },
+                        if success {
+                            ""
+                        } else {
+                            "missing structured sections"
+                        },
                     ])?;
                     if !success {
                         proxy_failures.push(case_id.to_string());
@@ -914,9 +937,7 @@ fn default_raw_query_for_task(task: &ReasoningTask) -> String {
             ..
         } => format!("sympy {} {}", operation, expression),
         ReasoningTask::Z3Solve {
-            var,
-            constraints,
-            ..
+            var, constraints, ..
         } => format!("solve {} with {}", var, constraints.join(", ")),
     }
 }
@@ -930,9 +951,8 @@ fn parse_reasoning_jsonl(paths: &[String]) -> Result<Vec<ReasoningEpisodeSpec>> 
             if line.is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(line).with_context(|| {
-                format!("parsing jsonl {} line {}", path, line_idx + 1)
-            })?;
+            let value: Value = serde_json::from_str(line)
+                .with_context(|| format!("parsing jsonl {} line {}", path, line_idx + 1))?;
             let task_type = value.get("task").and_then(|v| v.as_str()).unwrap_or("");
             let task = match task_type {
                 "multiply" => {
@@ -1145,7 +1165,9 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
                     | ReasoningTask::Max { .. }
                     | ReasoningTask::SortList { .. }
                     | ReasoningTask::SympyEval { .. }
-                    | ReasoningTask::Z3Solve { .. } => neuro_fed_node::types::AssistantIntent::Reasoning,
+                    | ReasoningTask::Z3Solve { .. } => {
+                        neuro_fed_node::types::AssistantIntent::Reasoning
+                    }
                 }),
                 goal: Some(spec.raw_query.clone()),
                 plan_steps: spec.ops.iter().map(ToString::to_string).collect(),
@@ -1161,12 +1183,7 @@ fn run_reasoning_replay(specs: Option<Vec<ReasoningEpisodeSpec>>) -> Result<()> 
         drop(dict_guard);
 
         let episodic_memory = Arc::new(RwLock::new(episodes));
-        let sleep_mgr = SleepManager::new(
-            pc_hierarchy,
-            decoder,
-            dict,
-            episodic_memory.clone(),
-        );
+        let sleep_mgr = SleepManager::new(pc_hierarchy, decoder, dict, episodic_memory.clone());
         sleep_mgr
             .process_sleep_cycle()
             .await

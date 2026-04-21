@@ -7,17 +7,14 @@ pub fn sympy_eval(operation: &str, expression: &str) -> Result<String, PCError> 
     let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
 
     let script = match op.as_str() {
-        "simplify" => format!(
-            "import sympy as sp; print(sp.simplify(\"{}\"))",
-            expr
-        ),
+        "simplify" => format!("import sympy as sp; print(sp.simplify(\"{}\"))", expr),
         "expand" => format!("import sympy as sp; print(sp.expand(\"{}\"))", expr),
         "factor" => format!("import sympy as sp; print(sp.factor(\"{}\"))", expr),
         _ => {
             return Err(PCError(format!(
                 "Unsupported sympy operation: {}",
                 operation
-            )))
+            )));
         }
     };
 
@@ -50,17 +47,19 @@ pub fn z3_solve_int(var: &str, constraints: &[&str]) -> Result<i64, PCError> {
             if parts.len() != 2 {
                 return Err(PCError(format!("Unsupported constraint: {}", trimmed)));
             }
-            let rhs: i64 = parts[1].trim().parse().map_err(|_| {
-                PCError(format!("Invalid modulo RHS in constraint: {}", trimmed))
-            })?;
+            let rhs: i64 = parts[1]
+                .trim()
+                .parse()
+                .map_err(|_| PCError(format!("Invalid modulo RHS in constraint: {}", trimmed)))?;
             let left = parts[0].trim();
             let mod_parts: Vec<&str> = left.split('%').collect();
             if mod_parts.len() != 2 {
                 return Err(PCError(format!("Unsupported constraint: {}", trimmed)));
             }
-            let modulus: i64 = mod_parts[1].trim().parse().map_err(|_| {
-                PCError(format!("Invalid modulus in constraint: {}", trimmed))
-            })?;
+            let modulus: i64 = mod_parts[1]
+                .trim()
+                .parse()
+                .map_err(|_| PCError(format!("Invalid modulus in constraint: {}", trimmed)))?;
             let modulo = symbol.modulo(&z3::ast::Int::from_i64(&ctx, modulus));
             solver.assert(&modulo._eq(&z3::ast::Int::from_i64(&ctx, rhs)));
             continue;
@@ -88,7 +87,9 @@ pub fn z3_solve_int(var: &str, constraints: &[&str]) -> Result<i64, PCError> {
     if solver.check() != z3::SatResult::Sat {
         return Err(PCError("Z3 solver returned unsat".to_string()));
     }
-    let model = solver.get_model().ok_or_else(|| PCError("No model".to_string()))?;
+    let model = solver
+        .get_model()
+        .ok_or_else(|| PCError("No model".to_string()))?;
     let value = model
         .eval(&symbol, true)
         .and_then(|v| v.as_i64())

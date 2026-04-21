@@ -2,15 +2,17 @@
 // Model Manager component for automatic model download and selection
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
 use reqwest::Client;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
@@ -50,6 +52,7 @@ pub struct ModelInfo {
     pub max_memory_mb: u64,
     pub quantization: String,
     pub download_url: String,
+    pub fallback_download_urls: Vec<String>,
     pub local_path: String,
     pub tokenizer_url: Option<String>,
     pub tokenizer_local_path: Option<String>,
@@ -136,6 +139,23 @@ impl ModelManager {
     /// Get available models
     pub fn get_available_models(&self) -> Vec<ModelInfo> {
         self.models.values().cloned().collect()
+    }
+
+    fn find_model_by_local_path(&self, model_path: &str) -> Option<ModelInfo> {
+        self.models
+            .values()
+            .find(|model| model.local_path == model_path)
+            .cloned()
+    }
+
+    fn has_placeholder_model_path(&self) -> bool {
+        let requested = Path::new(&self.config.model_path);
+        requested == Path::new("models/gguf_model.gguf")
+            || requested
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("gguf_model.gguf"))
+                .unwrap_or(false)
     }
 
     /// Get recommended model based on available memory
@@ -227,34 +247,72 @@ impl ModelManager {
     async fn detect_memory_macos(&self) -> Result<u64, String> {
         use tokio::process::Command;
 
+        if let Ok(output) = Command::new("sysctl")
+            .arg("-n")
+            .arg("hw.memsize")
+            .output()
+            .await
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(bytes) = stdout.trim().parse::<u64>() {
+                let total_mb = bytes / 1024 / 1024;
+                if total_mb > 0 {
+                    // Use a conservative fraction of total unified memory for model selection.
+                    return Ok(((total_mb as f64) * 0.6) as u64);
+                }
+            }
+        }
+
         let output = match Command::new("vm_stat").output().await {
             Ok(output) => output,
             Err(e) => return Err(e.to_string()),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut pages_free = 0;
-        let mut pages_active = 0;
+        let mut page_size = 4096u64;
+        let mut pages_free = 0u64;
+        let mut pages_speculative = 0u64;
+        let mut pages_inactive = 0u64;
 
         for line in stdout.lines() {
-            if line.contains("free pages:") {
+            if line.contains("page size of") {
+                let digits: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(parsed) = digits.parse::<u64>() {
+                    page_size = parsed;
+                }
+            } else if line.contains("free pages:") {
                 if let Some(num) = line.split_whitespace().nth(1) {
                     if let Ok(val) = num.trim_matches('.').parse::<u64>() {
                         pages_free = val;
                     }
                 }
-            } else if line.contains("active pages:") {
+            } else if line.contains("speculative pages:") {
                 if let Some(num) = line.split_whitespace().nth(1) {
                     if let Ok(val) = num.trim_matches('.').parse::<u64>() {
-                        pages_active = val;
+                        pages_speculative = val;
+                    }
+                }
+            } else if line.contains("Pages inactive:") || line.contains("inactive pages:") {
+                if let Some(num) = line
+                    .split_whitespace()
+                    .nth(2)
+                    .or_else(|| line.split_whitespace().nth(1))
+                {
+                    if let Ok(val) = num.trim_matches('.').parse::<u64>() {
+                        pages_inactive = val;
                     }
                 }
             }
         }
 
-        // Convert pages to MB (assuming 4KB pages)
-        let total_pages = pages_free + pages_active;
-        Ok((total_pages * 4) / 1024) // Convert to MB
+        let available_pages = pages_free + pages_speculative + pages_inactive;
+        let available_bytes = available_pages.saturating_mul(page_size);
+        let available_mb = available_bytes / 1024 / 1024;
+        if available_mb > 0 {
+            Ok(available_mb)
+        } else {
+            Err("Failed to parse available macOS memory".to_string())
+        }
     }
 
     /// Detect memory on Windows
@@ -321,10 +379,47 @@ impl ModelManager {
     pub async fn is_model_downloaded(&self, model_name: &str) -> bool {
         if let Some(model) = self.models.get(model_name) {
             let path = Path::new(&model.local_path);
-            path.exists()
+            let tokenizer_ok = model
+                .tokenizer_local_path
+                .as_ref()
+                .map(|tokenizer_path| Path::new(tokenizer_path).exists())
+                .unwrap_or(true);
+            path.exists() && tokenizer_ok
         } else {
             false
         }
+    }
+
+    pub async fn ensure_startup_model(&self) -> Result<Option<ModelInfo>, ModelManagerError> {
+        let requested_path = Path::new(&self.config.model_path);
+        if requested_path.exists() {
+            return Ok(None);
+        }
+
+        if let Some(model) = self.find_model_by_local_path(&self.config.model_path) {
+            self.download_model(&model.name).await?;
+            return Ok(Some(model));
+        }
+
+        if self.has_placeholder_model_path() {
+            let model = self.get_recommended_model().await?;
+            self.download_model(&model.name).await?;
+            return Ok(Some(model));
+        }
+
+        if let Some(downloaded) = self
+            .models
+            .values()
+            .find(|model| Path::new(&model.local_path).exists())
+            .cloned()
+        {
+            return Ok(Some(downloaded));
+        }
+
+        Err(ModelManagerError::FileError(format!(
+            "Configured model path {} does not exist and does not match a managed model",
+            self.config.model_path
+        )))
     }
 
     /// Download a model with progress tracking
@@ -337,8 +432,7 @@ impl ModelManager {
             info!("Model {} already downloaded", model_name);
         } else {
             info!("Starting download for model: {}", model_name);
-            self.download_file(&model.download_url, Path::new(&model.local_path))
-                .await?;
+            self.download_model_payload(model).await?;
             info!("Model {} downloaded successfully", model_name);
         }
 
@@ -359,30 +453,122 @@ impl ModelManager {
         Ok(())
     }
 
+    async fn download_model_payload(&self, model: &ModelInfo) -> Result<(), ModelManagerError> {
+        let mut errors = Vec::new();
+        for url in std::iter::once(&model.download_url).chain(model.fallback_download_urls.iter()) {
+            match self
+                .download_with_retries(url, Path::new(&model.local_path), 3)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    warn!("Model download attempt failed for {}: {}", url, err);
+                    errors.push(format!("{} => {}", url, err));
+                }
+            }
+        }
+
+        Err(ModelManagerError::DownloadError(format!(
+            "All download URLs failed for {}: {}",
+            model.name,
+            errors.join(" | ")
+        )))
+    }
+
+    async fn download_with_retries(
+        &self,
+        url: &str,
+        file_path: &Path,
+        max_attempts: usize,
+    ) -> Result<(), ModelManagerError> {
+        let mut last_error = None;
+        for attempt in 1..=max_attempts.max(1) {
+            match self.download_file(url, file_path).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    last_error = Some(err.clone());
+                    if attempt < max_attempts {
+                        warn!(
+                            "Download attempt {}/{} failed for {}: {}. Retrying...",
+                            attempt, max_attempts, url, err
+                        );
+                        sleep(Duration::from_secs(attempt as u64)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            ModelManagerError::DownloadError(format!("Failed to download {}", url))
+        }))
+    }
+
     /// Helper function to download a file with progress tracking
     async fn download_file(&self, url: &str, file_path: &Path) -> Result<(), ModelManagerError> {
-        let dir_path = file_path.parent().unwrap();
+        let dir_path = file_path.parent().unwrap_or(Path::new(&self.download_dir));
 
         // Create directory if it doesn't exist
         if let Err(e) = async_fs::create_dir_all(dir_path).await {
             return Err(ModelManagerError::FileError(e.to_string()));
         }
 
-        let response = self
-            .client
-            .get(url)
+        let temp_path = temporary_download_path(file_path);
+        let existing_bytes = async_fs::metadata(&temp_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        let mut request = self.client.get(url);
+        if existing_bytes > 0 {
+            request = request.header(RANGE, format!("bytes={}-", existing_bytes));
+            info!(
+                "Resuming download for {} from byte {}",
+                file_path.display(),
+                existing_bytes
+            );
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| ModelManagerError::NetworkError(e.to_string()))?;
 
-        let total_size = response.content_length().unwrap_or(0);
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ModelManagerError::DownloadError(format!(
+                "HTTP status {} for url ({})",
+                status, url
+            )));
+        }
+
+        let supports_resume = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let must_restart = existing_bytes > 0 && !supports_resume;
+        let resumed_bytes = if must_restart { 0 } else { existing_bytes };
+        if must_restart {
+            warn!(
+                "Server did not honor resume request for {}. Restarting download from byte 0.",
+                url
+            );
+            let _ = async_fs::remove_file(&temp_path).await;
+        }
+
+        let total_size = total_bytes_from_headers(response.headers(), resumed_bytes);
         let mut stream = response.bytes_stream();
 
-        let mut file = async_fs::File::create(file_path)
-            .await
-            .map_err(|e| ModelManagerError::FileError(e.to_string()))?;
+        let mut file = if supports_resume && resumed_bytes > 0 {
+            async_fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| ModelManagerError::FileError(e.to_string()))?
+        } else {
+            async_fs::File::create(&temp_path)
+                .await
+                .map_err(|e| ModelManagerError::FileError(e.to_string()))?
+        };
 
-        let mut downloaded = 0u64;
+        let mut downloaded = resumed_bytes;
         let start_time = std::time::Instant::now();
 
         while let Some(chunk) = stream.next().await {
@@ -429,6 +615,10 @@ impl ModelManager {
         }
 
         file.sync_all()
+            .await
+            .map_err(|e| ModelManagerError::FileError(e.to_string()))?;
+
+        async_fs::rename(&temp_path, file_path)
             .await
             .map_err(|e| ModelManagerError::FileError(e.to_string()))?;
 
@@ -533,48 +723,46 @@ impl ModelManager {
         let mut models = HashMap::new();
 
         // TinyLlama 1.1B Chat (GGUF, Q2_K)
-        models.insert("tinyllama-1.1b-chat".to_string(), ModelInfo {
-            name: "tinyllama-1.1b-chat".to_string(),
-            version: "1.0".to_string(),
-            size_mb: 550, // Approximate size for Q2_K
-            min_memory_mb: 1024,
-            max_memory_mb: 2048,
-            quantization: "Q2_K".to_string(),
-            download_url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
-            local_path: "models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf".to_string(),
-            tokenizer_url: Some("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/raw/main/tokenizer.json".to_string()),
-            tokenizer_local_path: Some("models/tinyllama_tokenizer.json".to_string()),
-        });
-
-        /*
-        // Llama 3 8B Instruct (GGUF, Q4_K_M)
-        models.insert("llama-3-8b-instruct".to_string(), ModelInfo {
-            name: "llama-3-8b-instruct".to_string(),
-            version: "3.0".to_string(),
-            size_mb: 4600, // Approximate size for Q4_K_M
-            min_memory_mb: 8192,
-            max_memory_mb: 16384,
-            quantization: "Q4_K_M".to_string(),
-            download_url: "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf".to_string(),
-            local_path: "models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf".to_string(),
-            tokenizer_url: Some("https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct/raw/main/tokenizer.json".to_string()),
-            tokenizer_local_path: Some("models/llama3_tokenizer.json".to_string()),
-        });
+        models.insert(
+            "tinyllama-1.1b-chat".to_string(),
+            ModelInfo {
+                name: "tinyllama-1.1b-chat".to_string(),
+                version: "1.0".to_string(),
+                size_mb: 622, // Approximate size for Q4_K_M
+                min_memory_mb: 1024,
+                max_memory_mb: 2048,
+                quantization: "Q4_K_M".to_string(),
+                download_url: "https://huggingface.co/tensorblock/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf".to_string(),
+                fallback_download_urls: vec![
+                    "https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string(),
+                    "https://huggingface.co/tensorblock/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q2_K.gguf".to_string(),
+                ],
+                local_path: "models/tinyllama/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf".to_string(),
+                tokenizer_url: Some("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/raw/main/tokenizer.json".to_string()),
+                tokenizer_local_path: Some("models/tinyllama/tokenizer.json".to_string()),
+            },
+        );
 
         // Qwen2.5 1.5B Instruct (GGUF, Q4_K_M)
-        models.insert("qwen2.5-1.5b-instruct".to_string(), ModelInfo {
-            name: "qwen2.5-1.5b-instruct".to_string(),
-            version: "2.5".to_string(),
-            size_mb: 1100, // Approximate size for Q4_K_M
-            min_memory_mb: 2048,
-            max_memory_mb: 4096,
-            quantization: "Q4_K_M".to_string(),
-            download_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
-            local_path: "models/Qwen2.5-1.5B-Instruct.Q4_K_M.gguf".to_string(),
-            tokenizer_url: Some("https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/raw/main/tokenizer.json".to_string()),
-            tokenizer_local_path: Some("models/qwen_tokenizer.json".to_string()),
-        });
-        */
+        models.insert(
+            "qwen2.5-1.5b-instruct".to_string(),
+            ModelInfo {
+                name: "qwen2.5-1.5b-instruct".to_string(),
+                version: "2.5".to_string(),
+                size_mb: 1120, // Approximate size for Q4_K_M
+                min_memory_mb: 4096,
+                max_memory_mb: 32768,
+                quantization: "Q4_K_M".to_string(),
+                download_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
+                fallback_download_urls: vec![
+                    "https://huggingface.co/QuantFactory/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
+                    "https://huggingface.co/itlwas/Qwen2.5-1.5B-Instruct-Q4_K_M-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
+                ],
+                local_path: "models/qwen2.5/qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
+                tokenizer_url: Some("https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/raw/main/tokenizer.json".to_string()),
+                tokenizer_local_path: Some("models/qwen2.5/tokenizer.json".to_string()),
+            },
+        );
 
         // Add more models as needed
         models
@@ -594,17 +782,42 @@ impl ModelManager {
     }
 }
 
+fn temporary_download_path(file_path: &Path) -> PathBuf {
+    let mut os = file_path.as_os_str().to_os_string();
+    os.push(".part");
+    PathBuf::from(os)
+}
+
+fn total_bytes_from_headers(headers: &reqwest::header::HeaderMap, resumed_bytes: u64) -> u64 {
+    if let Some(content_range) = headers.get(CONTENT_RANGE)
+        && let Ok(content_range) = content_range.to_str()
+        && let Some((_range, total)) = content_range.split_once('/')
+        && let Ok(total) = total.parse::<u64>()
+    {
+        return total;
+    }
+
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|content_length| content_length + resumed_bytes)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_model_manager_creation() {
         let config = NodeConfig::default();
         let manager = ModelManager::new(config);
 
-        assert_eq!(manager.models.len(), 1);
+        assert_eq!(manager.models.len(), 2);
         assert!(manager.models.contains_key("tinyllama-1.1b-chat"));
+        assert!(manager.models.contains_key("qwen2.5-1.5b-instruct"));
     }
 
     #[tokio::test]
@@ -614,7 +827,7 @@ mod tests {
 
         let memory = manager.detect_available_memory().await;
         assert!(memory.is_ok());
-        assert!(memory.unwrap() > 0);
+        assert!(memory.unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -627,6 +840,29 @@ mod tests {
         let model = recommended.unwrap();
 
         assert!(model.name == "qwen2.5-1.5b-instruct" || model.name == "tinyllama-1.1b-chat");
+    }
+
+    #[test]
+    fn test_total_bytes_from_content_range() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes 100-199/1000".parse().unwrap());
+
+        assert_eq!(total_bytes_from_headers(&headers, 100), 1000);
+    }
+
+    #[test]
+    fn test_total_bytes_from_content_length_plus_existing_bytes() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "900".parse().unwrap());
+
+        assert_eq!(total_bytes_from_headers(&headers, 100), 1000);
+    }
+
+    #[test]
+    fn test_temporary_download_path_appends_part_suffix() {
+        let path = Path::new("models/qwen/model.gguf");
+        let temp = temporary_download_path(path);
+        assert_eq!(temp, PathBuf::from("models/qwen/model.gguf.part"));
     }
 
     #[tokio::test]
@@ -651,5 +887,51 @@ mod tests {
 
         let result = manager.load_model("qwen2.5-1.5b").await;
         assert!(result.is_err()); // Should fail due to missing file
+    }
+
+    #[tokio::test]
+    async fn test_ensure_startup_model_prefers_existing_configured_file() {
+        let dir = tempdir().unwrap();
+        let model_path = dir.path().join("existing.gguf");
+        std::fs::write(&model_path, b"stub").unwrap();
+
+        let mut config = NodeConfig::default();
+        config.model_path = model_path.to_string_lossy().to_string();
+
+        let manager = ModelManager::new(config);
+        let result = manager.ensure_startup_model().await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_startup_model_uses_downloaded_managed_model_when_placeholder_missing() {
+        let dir = tempdir().unwrap();
+        let model_dir = dir.path().join("models").join("qwen2.5");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let downloaded_model = model_dir.join("qwen2.5-1.5b-instruct-q4_k_m.gguf");
+        let downloaded_tokenizer = model_dir.join("tokenizer.json");
+        std::fs::write(&downloaded_model, b"stub").unwrap();
+        std::fs::write(&downloaded_tokenizer, b"{}").unwrap();
+
+        let mut config = NodeConfig::default();
+        config.model_path = dir
+            .path()
+            .join("models")
+            .join("gguf_model.gguf")
+            .to_string_lossy()
+            .to_string();
+
+        let mut manager = ModelManager::new(config);
+        if let Some(model) = manager.models.get_mut("qwen2.5-1.5b-instruct") {
+            model.local_path = downloaded_model.to_string_lossy().to_string();
+            model.tokenizer_local_path = Some(downloaded_tokenizer.to_string_lossy().to_string());
+        }
+
+        let resolved = manager.ensure_startup_model().await.unwrap().unwrap();
+        assert_eq!(resolved.name, "qwen2.5-1.5b-instruct");
+        assert_eq!(
+            resolved.local_path,
+            downloaded_model.to_string_lossy().to_string()
+        );
     }
 }

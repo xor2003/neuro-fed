@@ -34,18 +34,14 @@ impl StateEngine {
         match task {
             ReasoningTask::Multiply { a, b } => match op {
                 ThoughtOp::Initialize => {
-                    self.state
-                        .insert("a".to_string(), StateValue::Int(*a));
-                    self.state
-                        .insert("b".to_string(), StateValue::Int(*b));
-                    self.state
-                        .insert("result".to_string(), StateValue::Int(0));
+                    self.state.insert("a".to_string(), StateValue::Int(*a));
+                    self.state.insert("b".to_string(), StateValue::Int(*b));
+                    self.state.insert("result".to_string(), StateValue::Int(0));
                 }
                 ThoughtOp::Compute => {
-                    if let (Some(StateValue::Int(a)), Some(StateValue::Int(b))) = (
-                        self.state.get("a"),
-                        self.state.get("b"),
-                    ) {
+                    if let (Some(StateValue::Int(a)), Some(StateValue::Int(b))) =
+                        (self.state.get("a"), self.state.get("b"))
+                    {
                         self.state
                             .insert("result".to_string(), StateValue::Int(a * b));
                     } else {
@@ -76,18 +72,14 @@ impl StateEngine {
             },
             ReasoningTask::SumEven { values } => match op {
                 ThoughtOp::Initialize => {
-                    self.state.insert(
-                        "values".to_string(),
-                        StateValue::List(values.clone()),
-                    );
                     self.state
-                        .insert("sum".to_string(), StateValue::Int(0));
+                        .insert("values".to_string(), StateValue::List(values.clone()));
+                    self.state.insert("sum".to_string(), StateValue::Int(0));
                 }
                 ThoughtOp::Iterate => {
                     if let Some(StateValue::List(list)) = self.state.get("values") {
                         let sum = list.iter().filter(|v| *v % 2 == 0).sum::<i64>();
-                        self.state
-                            .insert("sum".to_string(), StateValue::Int(sum));
+                        self.state.insert("sum".to_string(), StateValue::Int(sum));
                     } else {
                         self.errors
                             .push("Iterate before Initialize in SumEven".to_string());
@@ -97,16 +89,13 @@ impl StateEngine {
             },
             ReasoningTask::Max { values } => match op {
                 ThoughtOp::Initialize => {
-                    self.state.insert(
-                        "values".to_string(),
-                        StateValue::List(values.clone()),
-                    );
+                    self.state
+                        .insert("values".to_string(), StateValue::List(values.clone()));
                 }
                 ThoughtOp::Iterate => {
                     if let Some(StateValue::List(list)) = self.state.get("values") {
                         if let Some(max) = list.iter().max() {
-                            self.state
-                                .insert("max".to_string(), StateValue::Int(*max));
+                            self.state.insert("max".to_string(), StateValue::Int(*max));
                         }
                     } else {
                         self.errors
@@ -115,59 +104,54 @@ impl StateEngine {
                 }
                 _ => {}
             },
-        ReasoningTask::SortList { values } => match op {
-            ThoughtOp::Initialize => {
-                self.state.insert(
-                    "values".to_string(),
-                    StateValue::List(values.clone()),
-                );
-            }
-            ThoughtOp::Aggregate => {
-                if let Some(StateValue::List(list)) = self.state.get("values") {
-                    let mut sorted = list.clone();
-                    sorted.sort();
+            ReasoningTask::SortList { values } => match op {
+                ThoughtOp::Initialize => {
                     self.state
-                        .insert("sorted".to_string(), StateValue::List(sorted));
-                } else {
-                    self.errors
-                        .push("Aggregate before Initialize in SortList".to_string());
+                        .insert("values".to_string(), StateValue::List(values.clone()));
                 }
-            }
-            _ => {}
-        },
-        ReasoningTask::SympyEval {
-            expression,
-            operation,
-            ..
-        } => match op {
-            ThoughtOp::SympyEval => match sympy_eval(operation, expression) {
-                Ok(result) => {
-                    self.state
-                        .insert("result".to_string(), StateValue::Str(result));
-                }
-                Err(e) => self.errors.push(format!("SympyEval error: {}", e)),
-            },
-            _ => {}
-        },
-        ReasoningTask::Z3Solve {
-            var,
-            constraints,
-            ..
-        } => match op {
-            ThoughtOp::Z3Solve => {
-                let refs: Vec<&str> = constraints.iter().map(String::as_str).collect();
-                match z3_solve_int(var, &refs) {
-                    Ok(value) => {
+                ThoughtOp::Aggregate => {
+                    if let Some(StateValue::List(list)) = self.state.get("values") {
+                        let mut sorted = list.clone();
+                        sorted.sort();
                         self.state
-                            .insert(var.to_string(), StateValue::Int(value));
+                            .insert("sorted".to_string(), StateValue::List(sorted));
+                    } else {
+                        self.errors
+                            .push("Aggregate before Initialize in SortList".to_string());
                     }
-                    Err(e) => self.errors.push(format!("Z3Solve error: {}", e)),
                 }
-            }
-            _ => {}
-        },
+                _ => {}
+            },
+            ReasoningTask::SympyEval {
+                expression,
+                operation,
+                ..
+            } => match op {
+                ThoughtOp::SympyEval => match sympy_eval(operation, expression) {
+                    Ok(result) => {
+                        self.state
+                            .insert("result".to_string(), StateValue::Str(result));
+                    }
+                    Err(e) => self.errors.push(format!("SympyEval error: {}", e)),
+                },
+                _ => {}
+            },
+            ReasoningTask::Z3Solve {
+                var, constraints, ..
+            } => match op {
+                ThoughtOp::Z3Solve => {
+                    let refs: Vec<&str> = constraints.iter().map(String::as_str).collect();
+                    match z3_solve_int(var, &refs) {
+                        Ok(value) => {
+                            self.state.insert(var.to_string(), StateValue::Int(value));
+                        }
+                        Err(e) => self.errors.push(format!("Z3Solve error: {}", e)),
+                    }
+                }
+                _ => {}
+            },
+        }
     }
-}
 }
 
 pub fn required_ops(task: &ReasoningTask) -> Vec<ThoughtOp> {
@@ -310,10 +294,7 @@ fn expected_state(task: &ReasoningTask) -> HashMap<String, StateValue> {
                 "expression".to_string(),
                 StateValue::Str(expression.clone()),
             );
-            state.insert(
-                "operation".to_string(),
-                StateValue::Str(operation.clone()),
-            );
+            state.insert("operation".to_string(), StateValue::Str(operation.clone()));
             if let Some(value) = expected {
                 state.insert("result".to_string(), StateValue::Str(value.clone()));
             }
@@ -359,9 +340,7 @@ pub fn execute_plan(task: &ReasoningTask, ops: &[ThoughtOp]) -> ReasoningOutcome
                 "State mismatch for {}: expected {:?}, got {:?}",
                 key, expected_value, actual
             )),
-            None => engine
-                .errors
-                .push(format!("Missing state key {}", key)),
+            None => engine.errors.push(format!("Missing state key {}", key)),
         }
     }
 

@@ -100,6 +100,50 @@ export GPU_DEVICE_ID=0
 export GPU_MEMORY_FRACTION=0.8
 ```
 
+### Release CPU Targeting
+- Release builds do not automatically target the host micro-architecture unless Rust is told to do so.
+- Repo default:
+  - `.cargo/config.toml` now targets `x86-64-v3` for common x86_64 release targets.
+  - `.cargo/config.toml` uses `target-cpu=native` for common `aarch64` local targets.
+- This matches the project goal of `x86_64_v3` as the primary deployment baseline while still letting Apple Silicon and ARM Linux builds use local CPU features.
+- Verify what Rust is using before diagnosing runtime performance:
+  ```bash
+  rustc -vV
+  cargo build --release -vv
+  ```
+- If you intentionally need a more portable binary than the repo default, override it explicitly:
+  ```bash
+  RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+  ```
+- If you intentionally want the exact local machine instead of the repo baseline:
+  ```bash
+  RUSTFLAGS="-C target-cpu=native" cargo build --release
+  ```
+- Apple Silicon Metal builds also require the Cargo feature:
+  ```bash
+  cargo build --release --features metal
+  ```
+- Runtime support is not enough by itself:
+  - the binary must be built with `--features metal`
+  - the runtime must pass a real Metal device into `MLEngine`
+  - falling back to `Device::Cpu` inside model loading is a bug
+
+### First-Run Model UX
+- Startup must not assume the configured GGUF already exists on the machine.
+- If `config.model_path` is missing and the path is the default placeholder or a known managed model path, resolve a managed model automatically and download all required assets before creating `MLEngine`.
+- Required first-run assets include:
+  - the GGUF model file
+  - a matching sibling `tokenizer.json`
+- Prefer storing managed assets in a model-specific subdirectory such as `models/<model-name>/...` so the runtime can derive tokenizer paths reliably.
+- Downloads must fail cleanly:
+  - check HTTP status codes
+  - avoid leaving partial files in place on interrupted or failed downloads
+  - log progress clearly enough that users understand the node is preparing itself
+- Apple Silicon priority:
+  - keep the local first-run path friendly for `aarch64-apple-darwin`
+  - prefer configurations that work out of the box on Metal-capable Macs without manual model setup
+- Do not regress back to a startup path that only emits “model file missing” when the node could have prepared itself automatically.
+
 ## Development Workflow
 
 ### Code Structure
@@ -197,6 +241,41 @@ Selection rule:
   - retrieval memory
   - replay/benchmark coverage
   - autonomous software-development usefulness
+
+### Agent Token Efficiency Rules
+Apply these rules for coding-agent work, benchmarks, dataset preparation, and workflow-memory generation. Do not push generic token-saving changes into the runtime proxy unless the current task explicitly asks for proxy/runtime behavior changes.
+
+1. Prefer narrow retrieval over prompt stuffing.
+   - Read only the files, symbols, tests, and logs needed for the current step.
+   - Use `rg`, targeted `sed -n`, and semantic retrieval instead of dumping whole files.
+   - Keep retrieved context to the smallest slice that still preserves correctness.
+2. Keep outputs structurally concise.
+   - Preserve required sections such as `Goal`, `Plan`, `Implementation`, `Verification`, `Risks`, `Evidence`, and `Open Questions`.
+   - Keep section bodies short, factual, and non-redundant.
+   - Prefer bullets and short verification commands over paragraphs of narration.
+3. Compress observations before they reach a stronger model or durable memory.
+   - Summarize logs, traces, benchmark output, and dataset rows before storing or replaying them.
+   - Store findings, evidence points, verification commands, and risk summaries rather than raw transcripts when full fidelity is not required.
+4. Reuse external state instead of replaying full history.
+   - Prefer persistent workflow notes, investigation notes, benchmark summaries, and compact replay rows over full conversational transcripts.
+   - When adding memory fields, store the minimum structure needed for future retrieval and verification.
+5. Avoid verbose tool and command output.
+   - When wrapping CLI tools or scripts, return only the lines needed for diagnosis or verification.
+   - Strip progress noise, repeated headers, HTML, and irrelevant logs before passing data onward.
+6. Use structured serialization when practical.
+   - Prefer compact JSONL rows with short stable keys for datasets and replays.
+   - Do not introduce larger nested payloads when a flat record or summarized artifact is enough.
+7. Budget benchmark and replay context explicitly.
+   - Keep replay examples short and canonical.
+   - Prefer representative minimal cases over large redundant batches when validating a change.
+   - Expand context only after a smaller eval fails to explain the issue.
+8. Cache and reuse stable prefixes outside the model where possible.
+   - Reuse stable workflow contracts, evaluation rubrics, and canonical reasoning plans from code or persisted state instead of restating them in full each turn.
+9. Route simple preprocessing away from the expensive path.
+   - Use rules, scripts, or smaller local preprocessing steps for filtering, deduplication, and summarization before invoking a more expensive reasoning step.
+10. Measure token pressure any time the agent stack changes.
+   - Track prompt size, output size, replay row size, and memory artifact size when modifying agent workflows.
+   - Prefer the smallest change that improves cost or latency without weakening reasoning quality, verification quality, or benchmark results.
 
 ### Reasoning Replay JSONL Format
 To exercise reasoning → state → output paths via `learning_benchmark --reasoning-replay`, provide JSONL with fields:

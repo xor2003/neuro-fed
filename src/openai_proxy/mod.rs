@@ -76,10 +76,9 @@ impl OpenAiProxy {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let notes = persistence
-            .load_investigation_notes()
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to load investigation notes: {}", e)))?;
+        let notes = persistence.load_investigation_notes().await.map_err(|e| {
+            ProxyError::CacheError(format!("Failed to load investigation notes: {}", e))
+        })?;
         *self.investigation_notes.write().await = notes;
         Ok(())
     }
@@ -91,7 +90,9 @@ impl OpenAiProxy {
         let notes = persistence
             .load_workflow_memory_notes()
             .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to load workflow memory notes: {}", e)))?;
+            .map_err(|e| {
+                ProxyError::CacheError(format!("Failed to load workflow memory notes: {}", e))
+            })?;
         *self.workflow_memory_notes.write().await = notes;
         Ok(())
     }
@@ -208,7 +209,10 @@ impl OpenAiProxy {
             .iter()
             .filter_map(|note| {
                 let similarity = cosine_similarity(&query_embedding, &note.embedding)?;
-                Some((investigation_note_rank_score(similarity, note), note.clone()))
+                Some((
+                    investigation_note_rank_score(similarity, note),
+                    note.clone(),
+                ))
             })
             .filter(|(score, _)| *score >= 0.72)
             .collect::<Vec<_>>();
@@ -228,10 +232,17 @@ impl OpenAiProxy {
             .await
             .process_text(&state.raw_query)
             .await
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to embed investigation note: {}", e)))?
+            .map_err(|e| {
+                ProxyError::EmbeddingError(format!("Failed to embed investigation note: {}", e))
+            })?
             .flatten_all()
             .and_then(|t| t.to_vec1::<f32>())
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten investigation note embedding: {}", e)))?;
+            .map_err(|e| {
+                ProxyError::EmbeddingError(format!(
+                    "Failed to flatten investigation note embedding: {}",
+                    e
+                ))
+            })?;
 
         let timestamp = Utc::now().timestamp();
         let note = build_investigation_note(state, final_text, embedding, timestamp);
@@ -241,7 +252,9 @@ impl OpenAiProxy {
             persistence
                 .save_investigation_note(&note)
                 .await
-                .map_err(|e| ProxyError::CacheError(format!("Failed to save investigation note: {}", e)))?;
+                .map_err(|e| {
+                    ProxyError::CacheError(format!("Failed to save investigation note: {}", e))
+                })?;
         }
 
         Ok(())
@@ -288,10 +301,17 @@ impl OpenAiProxy {
             .await
             .process_text(&state.raw_query)
             .await
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to embed workflow memory note: {}", e)))?
+            .map_err(|e| {
+                ProxyError::EmbeddingError(format!("Failed to embed workflow memory note: {}", e))
+            })?
             .flatten_all()
             .and_then(|t| t.to_vec1::<f32>())
-            .map_err(|e| ProxyError::EmbeddingError(format!("Failed to flatten workflow memory embedding: {}", e)))?;
+            .map_err(|e| {
+                ProxyError::EmbeddingError(format!(
+                    "Failed to flatten workflow memory embedding: {}",
+                    e
+                ))
+            })?;
 
         let timestamp = Utc::now().timestamp();
         let note = build_workflow_memory_note(state, final_text, embedding, timestamp);
@@ -301,7 +321,9 @@ impl OpenAiProxy {
             persistence
                 .save_workflow_memory_note(&note)
                 .await
-                .map_err(|e| ProxyError::CacheError(format!("Failed to save workflow memory note: {}", e)))?;
+                .map_err(|e| {
+                    ProxyError::CacheError(format!("Failed to save workflow memory note: {}", e))
+                })?;
         }
 
         Ok(())
@@ -333,7 +355,8 @@ impl OpenAiProxy {
         }
         self.ui_reset("Answering...").await;
         let state = self.extract_structured_state(&req).await;
-        let related_investigation_notes = if matches!(state.intent, AssistantIntent::Investigation) {
+        let related_investigation_notes = if matches!(state.intent, AssistantIntent::Investigation)
+        {
             let notes = self.retrieve_investigation_notes(&state.raw_query).await;
             if !notes.is_empty() {
                 self.ui_push_step(format!("Investigation memory hits: {}", notes.len()))
@@ -343,19 +366,21 @@ impl OpenAiProxy {
         } else {
             Vec::new()
         };
-        let related_workflow_notes =
-            if matches!(state.intent, AssistantIntent::CodeTask | AssistantIntent::TextTask) {
-                let notes = self
-                    .retrieve_workflow_memory_notes(&state.intent, &state.raw_query)
+        let related_workflow_notes = if matches!(
+            state.intent,
+            AssistantIntent::CodeTask | AssistantIntent::TextTask
+        ) {
+            let notes = self
+                .retrieve_workflow_memory_notes(&state.intent, &state.raw_query)
+                .await;
+            if !notes.is_empty() {
+                self.ui_push_step(format!("Workflow memory hits: {}", notes.len()))
                     .await;
-                if !notes.is_empty() {
-                    self.ui_push_step(format!("Workflow memory hits: {}", notes.len()))
-                        .await;
-                }
-                notes
-            } else {
-                Vec::new()
-            };
+            }
+            notes
+        } else {
+            Vec::new()
+        };
         self.ui_set_intent(&state.intent).await;
         self.ui_set_memory_hits(
             related_investigation_notes.len(),
@@ -469,7 +494,8 @@ impl OpenAiProxy {
                             let msg = format!("Thought Decoder failed: {}", e);
                             pc_error = Some(msg.clone());
                             tracing::error!("❌ {}", msg);
-                            self.ui_push_step("Thought decoder failed".to_string()).await;
+                            self.ui_push_step("Thought decoder failed".to_string())
+                                .await;
                             if self.proxy_config.require_thought_ops {
                                 self.ui_set_status("error").await;
                                 return Err(ProxyError::PCError(format!(
@@ -509,14 +535,17 @@ impl OpenAiProxy {
             guidance_parts.push(build_workflow_memory_guidance(&related_workflow_notes));
         }
         if !guidance_parts.is_empty() {
-            req.messages.insert(0, Message {
-                role: "system".to_string(),
-                content: serde_json::json!(format!(
-                    "You are a NeuroFed executor.\n{}",
-                    guidance_parts.join("\n\n")
-                )),
-                name: None,
-            });
+            req.messages.insert(
+                0,
+                Message {
+                    role: "system".to_string(),
+                    content: serde_json::json!(format!(
+                        "You are a NeuroFed executor.\n{}",
+                        guidance_parts.join("\n\n")
+                    )),
+                    name: None,
+                },
+            );
 
             tracing::info!("Injected assistant guidance into prompt");
         }
@@ -677,7 +706,12 @@ impl OpenAiProxy {
                 tracing::warn!("Failed to persist investigation note: {}", err);
             }
         }
-        if success && matches!(state.intent, AssistantIntent::CodeTask | AssistantIntent::TextTask) {
+        if success
+            && matches!(
+                state.intent,
+                AssistantIntent::CodeTask | AssistantIntent::TextTask
+            )
+        {
             if let Err(err) = self.persist_workflow_memory_note(&state, &final_text).await {
                 tracing::warn!("Failed to persist workflow memory note: {}", err);
             }
@@ -879,11 +913,7 @@ impl OpenAiProxy {
             ));
         }
         Ok(render_local_intent_response(
-            state,
-            None,
-            pc_summary,
-            None,
-            None,
+            state, None, pc_summary, None, None,
         ))
     }
 
@@ -1127,7 +1157,10 @@ fn workflow_contract_for_intent(
                 "open questions".to_string(),
             ],
             vec![
-                format!("answer must stay anchored to the investigation target: {}", raw_query),
+                format!(
+                    "answer must stay anchored to the investigation target: {}",
+                    raw_query
+                ),
                 "findings and assumptions must be separated".to_string(),
             ],
         ),
@@ -1188,8 +1221,16 @@ pub fn investigation_note_rank_score(similarity: f32, note: &InvestigationNote) 
         0.03
     };
     let evidence_bonus = (note.evidence_points.len().min(4) as f32 * 0.03)
-        + if note.evidence_summary.len() > 40 { 0.02 } else { 0.0 };
-    let open_question_bonus = if note.open_questions.is_empty() { 0.0 } else { 0.01 };
+        + if note.evidence_summary.len() > 40 {
+            0.02
+        } else {
+            0.0
+        };
+    let open_question_bonus = if note.open_questions.is_empty() {
+        0.0
+    } else {
+        0.01
+    };
     similarity + findings_bonus + evidence_bonus + open_question_bonus
 }
 
@@ -1202,15 +1243,23 @@ pub fn workflow_memory_rank_score(similarity: f32, note: &WorkflowMemoryNote) ->
     } else {
         0.02
     };
-    let risk_bonus = if note.risk_summary.trim().is_empty() { 0.0 } else { 0.01 };
+    let risk_bonus = if note.risk_summary.trim().is_empty() {
+        0.0
+    } else {
+        0.01
+    };
     similarity + quality_bonus + command_bonus + implementation_bonus + risk_bonus
 }
 
 fn expected_sections_for_intent(intent: &AssistantIntent) -> &'static [&'static str] {
     match intent {
-        AssistantIntent::Investigation => {
-            &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"]
-        }
+        AssistantIntent::Investigation => &[
+            "Goal:",
+            "Plan:",
+            "Findings:",
+            "Evidence:",
+            "Open Questions:",
+        ],
         AssistantIntent::CodeTask => &[
             "Goal:",
             "Plan:",
@@ -1250,7 +1299,11 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
         section.push(trimmed);
     }
     let joined = section.join("\n").trim().to_string();
-    if joined.is_empty() { None } else { Some(joined) }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn extract_bullets(section: &str) -> Vec<String> {
@@ -1358,16 +1411,15 @@ fn build_investigation_note(
     timestamp: i64,
 ) -> InvestigationNote {
     let open_questions = extract_open_questions(final_text);
-    let findings_summary = extract_section(final_text, "Findings")
-        .unwrap_or_else(|| compact_text(final_text, 180));
-    let evidence_summary = extract_section(final_text, "Evidence")
-        .unwrap_or_else(|| {
-            if state.tests.trim().is_empty() {
-                final_text.to_string()
-            } else {
-                state.tests.clone()
-            }
-        });
+    let findings_summary =
+        extract_section(final_text, "Findings").unwrap_or_else(|| compact_text(final_text, 180));
+    let evidence_summary = extract_section(final_text, "Evidence").unwrap_or_else(|| {
+        if state.tests.trim().is_empty() {
+            final_text.to_string()
+        } else {
+            state.tests.clone()
+        }
+    });
     let evidence_points = extract_bullets(&evidence_summary);
     InvestigationNote {
         id: timestamp as u64,
@@ -1419,16 +1471,19 @@ fn build_workflow_memory_note(
     let structured_quality_score = structured_quality_score(&state.intent, final_text);
     let implementation_summary = extract_section(final_text, "Implementation")
         .unwrap_or_else(|| compact_text(final_text, 180));
-    let verification_section = extract_section(final_text, "Verification")
-        .unwrap_or_else(|| {
-            if state.tests.trim().is_empty() {
-                final_text.to_string()
-            } else {
-                state.tests.clone()
-            }
-        });
-    let risk_summary = extract_section(final_text, "Risks")
-        .unwrap_or_else(|| join_or_default(&state.assumptions, "unknown code-path constraints may remain"));
+    let verification_section = extract_section(final_text, "Verification").unwrap_or_else(|| {
+        if state.tests.trim().is_empty() {
+            final_text.to_string()
+        } else {
+            state.tests.clone()
+        }
+    });
+    let risk_summary = extract_section(final_text, "Risks").unwrap_or_else(|| {
+        join_or_default(
+            &state.assumptions,
+            "unknown code-path constraints may remain",
+        )
+    });
     WorkflowMemoryNote {
         id: timestamp as u64,
         intent: state.intent.clone(),
@@ -1452,7 +1507,8 @@ fn build_workflow_memory_note(
 }
 
 fn build_workflow_memory_guidance(notes: &[WorkflowMemoryNote]) -> String {
-    let mut lines = vec!["Workflow memory: reuse prior verified patterns when relevant.".to_string()];
+    let mut lines =
+        vec!["Workflow memory: reuse prior verified patterns when relevant.".to_string()];
     for note in notes {
         lines.push(format!(
             "- Prior {:?} query: {}\n  Summary: {}\n  Implementation: {}\n  Verification: {}\n  Risks: {}\n  Evaluator: {}",
@@ -1489,7 +1545,8 @@ fn normalize_line_breaks(text: &str) -> String {
 
 fn has_heading(text: &str, heading: &str) -> bool {
     let prefix = format!("{}:", heading);
-    text.lines().any(|line| line.trim_start().starts_with(&prefix))
+    text.lines()
+        .any(|line| line.trim_start().starts_with(&prefix))
 }
 
 fn format_section(heading: &str, body: String) -> String {
@@ -1500,7 +1557,8 @@ fn bulletize(items: &[String], fallback: &str) -> String {
     if items.is_empty() {
         format!("- {}", fallback)
     } else {
-        items.iter()
+        items
+            .iter()
             .map(|item| format!("- {}", item))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1527,7 +1585,13 @@ fn render_retrieved_investigation_artifacts(notes: &[InvestigationNote]) -> Opti
     if items.is_empty() {
         None
     } else {
-        Some(items.into_iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"))
+        Some(
+            items
+                .into_iter()
+                .map(|item| format!("- {}", item))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 
@@ -1552,7 +1616,13 @@ fn render_retrieved_workflow_artifacts(notes: &[WorkflowMemoryNote]) -> Option<S
     if items.is_empty() {
         None
     } else {
-        Some(items.into_iter().map(|item| format!("- {}", item)).collect::<Vec<_>>().join("\n"))
+        Some(
+            items
+                .into_iter()
+                .map(|item| format!("- {}", item))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 
@@ -1583,7 +1653,13 @@ fn structure_assistant_output(
             }
             let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
-                format_section("Plan", bulletize(&state.plan_steps, "collect evidence and synthesize findings")),
+                format_section(
+                    "Plan",
+                    bulletize(
+                        &state.plan_steps,
+                        "collect evidence and synthesize findings",
+                    ),
+                ),
                 format_section("Findings", text.clone()),
                 format_section(
                     "Evidence",
@@ -1593,21 +1669,18 @@ fn structure_assistant_output(
                         state.tests.clone()
                     },
                 ),
-                format_section(
-                    "Open Questions",
-                    {
-                        let questions = extract_open_questions(&text);
-                        if questions.is_empty() {
-                            "- none".to_string()
-                        } else {
-                            questions
-                                .iter()
-                                .map(|item| format!("- {}", item))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
-                    },
-                ),
+                format_section("Open Questions", {
+                    let questions = extract_open_questions(&text);
+                    if questions.is_empty() {
+                        "- none".to_string()
+                    } else {
+                        questions
+                            .iter()
+                            .map(|item| format!("- {}", item))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }),
             ];
             if let Some(retrieved) = retrieved {
                 sections.push(format_section("Relevant Evidence", retrieved));
@@ -1628,8 +1701,14 @@ fn structure_assistant_output(
             }
             let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
-                format_section("Plan", bulletize(&state.plan_steps, "inspect, implement, verify")),
-                format_section("Deliverables", bulletize(&state.deliverables, "implementation summary")),
+                format_section(
+                    "Plan",
+                    bulletize(&state.plan_steps, "inspect, implement, verify"),
+                ),
+                format_section(
+                    "Deliverables",
+                    bulletize(&state.deliverables, "implementation summary"),
+                ),
                 format_section("Implementation", text.clone()),
                 format_section(
                     "Verification",
@@ -1651,7 +1730,10 @@ fn structure_assistant_output(
                 ),
                 format_section(
                     "Risks",
-                    bulletize(&state.assumptions, "unknown code-path constraints may remain"),
+                    bulletize(
+                        &state.assumptions,
+                        "unknown code-path constraints may remain",
+                    ),
                 ),
             ];
             if let Some(retrieved) = retrieved {
@@ -1673,18 +1755,30 @@ fn structure_assistant_output(
             }
             let mut sections = vec![
                 format_section("Goal", state.goal.clone()),
-                format_section("Plan", bulletize(&state.plan_steps, "rewrite while preserving meaning")),
-                format_section("Deliverables", bulletize(&state.deliverables, "rewritten text")),
+                format_section(
+                    "Plan",
+                    bulletize(&state.plan_steps, "rewrite while preserving meaning"),
+                ),
+                format_section(
+                    "Deliverables",
+                    bulletize(&state.deliverables, "rewritten text"),
+                ),
                 format_section("Rewritten Text", text.clone()),
                 format_section(
                     "Quality Check",
                     if state.tests.trim().is_empty() {
-                        bulletize(&state.verification_checks, "preserve meaning and requested tone")
+                        bulletize(
+                            &state.verification_checks,
+                            "preserve meaning and requested tone",
+                        )
                     } else {
                         format!(
                             "{}\n{}",
                             state.tests,
-                            bulletize(&state.verification_checks, "preserve meaning and requested tone")
+                            bulletize(
+                                &state.verification_checks,
+                                "preserve meaning and requested tone"
+                            )
                         )
                     },
                 ),
@@ -1730,11 +1824,23 @@ fn render_local_intent_response(
         AssistantIntent::Investigation => format!(
             "Investigation Plan:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Evidence needed: {}\n- Assumptions: {}\n- Verification: {}\n- Open questions: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
-            join_or_default(&state.plan_steps, "restate the question; collect evidence; synthesize findings"),
-            join_or_default(&state.deliverables, "findings summary; evidence summary; open questions"),
+            join_or_default(
+                &state.plan_steps,
+                "restate the question; collect evidence; synthesize findings"
+            ),
+            join_or_default(
+                &state.deliverables,
+                "findings summary; evidence summary; open questions"
+            ),
             join_or_default(&state.constraints, "collect evidence before concluding"),
-            join_or_default(&state.assumptions, "the available local context is incomplete"),
-            join_or_default(&state.verification_checks, "separate findings from assumptions"),
+            join_or_default(
+                &state.assumptions,
+                "the available local context is incomplete"
+            ),
+            join_or_default(
+                &state.verification_checks,
+                "separate findings from assumptions"
+            ),
             if state.tests.trim().is_empty() {
                 "document uncertainty and list missing evidence".to_string()
             } else {
@@ -1747,16 +1853,31 @@ fn render_local_intent_response(
         AssistantIntent::CodeTask => format!(
             "Code Task Workflow:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Constraints: {}\n- Assumptions: {}\n- Verification target: {}\n- Verification checks: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
-            join_or_default(&state.plan_steps, "inspect code path; implement smallest coherent change; verify behavior"),
-            join_or_default(&state.deliverables, "change plan; implementation summary; verification summary"),
-            join_or_default(&state.constraints, "preserve existing behavior until validated"),
-            join_or_default(&state.assumptions, "the repository needs inspection before editing"),
+            join_or_default(
+                &state.plan_steps,
+                "inspect code path; implement smallest coherent change; verify behavior"
+            ),
+            join_or_default(
+                &state.deliverables,
+                "change plan; implementation summary; verification summary"
+            ),
+            join_or_default(
+                &state.constraints,
+                "preserve existing behavior until validated"
+            ),
+            join_or_default(
+                &state.assumptions,
+                "the repository needs inspection before editing"
+            ),
             if state.tests.trim().is_empty() {
                 "run build/tests for the touched path".to_string()
             } else {
                 state.tests.clone()
             },
-            join_or_default(&state.verification_checks, "state concrete verification or explain why it could not run"),
+            join_or_default(
+                &state.verification_checks,
+                "state concrete verification or explain why it could not run"
+            ),
             decoded_hint,
             guidance_line,
             signal_line
@@ -1764,16 +1885,28 @@ fn render_local_intent_response(
         AssistantIntent::TextTask => format!(
             "Text Task Workflow:\n- Goal: {}\n- Steps: {}\n- Deliverables: {}\n- Constraints: {}\n- Assumptions: {}\n- Quality target: {}\n- Verification checks: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query,
-            join_or_default(&state.plan_steps, "identify target tone; rewrite; check fidelity and clarity"),
+            join_or_default(
+                &state.plan_steps,
+                "identify target tone; rewrite; check fidelity and clarity"
+            ),
             join_or_default(&state.deliverables, "rewritten text; style/tone summary"),
-            join_or_default(&state.constraints, "preserve meaning while improving the writing"),
-            join_or_default(&state.assumptions, "the user wants a direct rewrite or edit"),
+            join_or_default(
+                &state.constraints,
+                "preserve meaning while improving the writing"
+            ),
+            join_or_default(
+                &state.assumptions,
+                "the user wants a direct rewrite or edit"
+            ),
             if state.tests.trim().is_empty() {
                 "check clarity, consistency, and tone".to_string()
             } else {
                 state.tests.clone()
             },
-            join_or_default(&state.verification_checks, "preserve meaning and match requested style"),
+            join_or_default(
+                &state.verification_checks,
+                "preserve meaning and match requested style"
+            ),
             decoded_hint,
             guidance_line,
             signal_line
@@ -1820,7 +1953,9 @@ fn scaffold_state_for_intent(
     raw_query: &str,
 ) -> (Vec<String>, Vec<String>, String) {
     match intent {
-        AssistantIntent::Chat | AssistantIntent::Reasoning => (Vec::new(), Vec::new(), String::new()),
+        AssistantIntent::Chat | AssistantIntent::Reasoning => {
+            (Vec::new(), Vec::new(), String::new())
+        }
         AssistantIntent::Investigation => (
             vec![
                 "Collect evidence before concluding".to_string(),
@@ -1920,10 +2055,7 @@ mod proxy_utility_tests {
 
     #[test]
     fn test_detect_intent_for_assistant_modes() {
-        assert_eq!(
-            detect_intent("17 * 23", true),
-            AssistantIntent::Reasoning
-        );
+        assert_eq!(detect_intent("17 * 23", true), AssistantIntent::Reasoning);
         assert_eq!(
             detect_intent("investigate the architecture drift in this repo", false),
             AssistantIntent::Investigation
@@ -1945,7 +2077,11 @@ mod proxy_utility_tests {
             &AssistantIntent::CodeTask,
             "implement a parser and verify it",
         );
-        assert!(constraints.iter().any(|item| item.contains("Inspect the existing code path")));
+        assert!(
+            constraints
+                .iter()
+                .any(|item| item.contains("Inspect the existing code path"))
+        );
         assert!(!assumptions.is_empty());
         assert!(tests.contains("cargo build"));
 
@@ -1953,7 +2089,11 @@ mod proxy_utility_tests {
             &AssistantIntent::Investigation,
             "investigate architecture drift",
         );
-        assert!(constraints.iter().any(|item| item.contains("Collect evidence")));
+        assert!(
+            constraints
+                .iter()
+                .any(|item| item.contains("Collect evidence"))
+        );
         assert!(!assumptions.is_empty());
         assert!(tests.contains("evidence summary"));
     }
@@ -1964,8 +2104,10 @@ mod proxy_utility_tests {
         assert_eq!(code_steps.len(), 3);
         assert!(code_steps[0].contains("inspect"));
 
-        let investigation_steps =
-            build_plan_steps(&AssistantIntent::Investigation, "investigate architecture drift");
+        let investigation_steps = build_plan_steps(
+            &AssistantIntent::Investigation,
+            "investigate architecture drift",
+        );
         assert_eq!(investigation_steps.len(), 3);
         assert!(investigation_steps[0].contains("investigation target"));
     }
@@ -1974,13 +2116,29 @@ mod proxy_utility_tests {
     fn test_workflow_contract_for_code_and_text_tasks() {
         let (code_deliverables, code_checks) =
             workflow_contract_for_intent(&AssistantIntent::CodeTask, "fix parser bug");
-        assert!(code_deliverables.iter().any(|item| item.contains("verification")));
-        assert!(code_checks.iter().any(|item| item.contains("verification command")));
+        assert!(
+            code_deliverables
+                .iter()
+                .any(|item| item.contains("verification"))
+        );
+        assert!(
+            code_checks
+                .iter()
+                .any(|item| item.contains("verification command"))
+        );
 
         let (text_deliverables, text_checks) =
             workflow_contract_for_intent(&AssistantIntent::TextTask, "rewrite this paragraph");
-        assert!(text_deliverables.iter().any(|item| item.contains("rewritten text")));
-        assert!(text_checks.iter().any(|item| item.contains("preserve core meaning")));
+        assert!(
+            text_deliverables
+                .iter()
+                .any(|item| item.contains("rewritten text"))
+        );
+        assert!(
+            text_checks
+                .iter()
+                .any(|item| item.contains("preserve core meaning"))
+        );
     }
 
     #[test]
@@ -2102,7 +2260,8 @@ mod proxy_utility_tests {
             query: "investigate architecture drift".to_string(),
             goal: "find drift".to_string(),
             summary: "Runtime path is narrower than docs.".to_string(),
-            findings_summary: "The executable path is smaller than the documented architecture.".to_string(),
+            findings_summary: "The executable path is smaller than the documented architecture."
+                .to_string(),
             evidence_summary: "Compared main.rs against docs.".to_string(),
             evidence_points: vec!["main.rs starts a narrower path".to_string()],
             open_questions: vec!["Which module should be integrated next?".to_string()],
@@ -2125,7 +2284,10 @@ mod proxy_utility_tests {
             intent: AssistantIntent::CodeTask,
             goal: "fix parser bug".to_string(),
             plan_steps: vec!["inspect parser".to_string(), "patch bug".to_string()],
-            deliverables: vec!["change plan".to_string(), "verification summary".to_string()],
+            deliverables: vec![
+                "change plan".to_string(),
+                "verification summary".to_string(),
+            ],
             verification_checks: vec!["run cargo build".to_string()],
             entities: HashMap::new(),
             constraints: vec!["preserve behavior".to_string()],
@@ -2206,7 +2368,9 @@ mod proxy_utility_tests {
             goal: "find drift".to_string(),
             summary: "Rich note.".to_string(),
             findings_summary: "Runtime path is narrower than docs.".to_string(),
-            evidence_summary: "Compared main.rs startup path, proxy path, and documented architecture in detail.".to_string(),
+            evidence_summary:
+                "Compared main.rs startup path, proxy path, and documented architecture in detail."
+                    .to_string(),
             evidence_points: vec![
                 "main.rs starts only the narrow runtime path".to_string(),
                 "node_loop handlers remain placeholders".to_string(),
@@ -2220,8 +2384,7 @@ mod proxy_utility_tests {
         };
 
         assert!(
-            investigation_note_rank_score(0.8, &rich)
-                > investigation_note_rank_score(0.8, &sparse)
+            investigation_note_rank_score(0.8, &rich) > investigation_note_rank_score(0.8, &sparse)
         );
     }
 
@@ -2268,9 +2431,7 @@ mod proxy_utility_tests {
             updated_at: 2,
         };
 
-        assert!(
-            workflow_memory_rank_score(0.8, &strong) > workflow_memory_rank_score(0.8, &weak)
-        );
+        assert!(workflow_memory_rank_score(0.8, &strong) > workflow_memory_rank_score(0.8, &weak));
     }
 
     #[test]
@@ -2352,7 +2513,8 @@ mod proxy_utility_tests {
                 query: "rewrite paragraph".to_string(),
                 goal: "rewrite paragraph".to_string(),
                 summary: "Produced a concise rewrite.".to_string(),
-                implementation_summary: "Shortened the paragraph while preserving meaning.".to_string(),
+                implementation_summary: "Shortened the paragraph while preserving meaning."
+                    .to_string(),
                 deliverables: vec!["rewritten text".to_string()],
                 verification_checks: vec!["preserve core meaning".to_string()],
                 verification_commands: vec!["check tone consistency".to_string()],
@@ -2398,7 +2560,8 @@ mod proxy_utility_tests {
                 query: "investigate architecture drift".to_string(),
                 goal: "find drift".to_string(),
                 summary: "Runtime path is narrower than docs.".to_string(),
-                findings_summary: "The executable path is smaller than the documented architecture.".to_string(),
+                findings_summary:
+                    "The executable path is smaller than the documented architecture.".to_string(),
                 evidence_summary: "Compared main.rs against docs.".to_string(),
                 evidence_points: vec![
                     "main.rs starts a narrower path".to_string(),
@@ -2590,7 +2753,10 @@ mod reasoning_consistency_tests {
         assert_eq!(last.assistant_intent, Some(AssistantIntent::Reasoning));
         assert!(!last.plan_steps.is_empty());
         assert!(last.deliverables.is_empty());
-        assert_eq!(last.reasoning_task, Some(ReasoningTask::Multiply { a: 17, b: 23 }));
+        assert_eq!(
+            last.reasoning_task,
+            Some(ReasoningTask::Multiply { a: 17, b: 23 })
+        );
         assert_eq!(last.expected_output.as_deref(), Some("391"));
     }
 }

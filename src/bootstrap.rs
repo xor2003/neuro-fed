@@ -975,7 +975,11 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
     if let Ok(metadata) = std::fs::metadata(path) {
         if let Some(cache_path) = jsonl_cache_path(cache_dir, path, &metadata) {
             if let Err(e) = write_cached_lines(&cache_path, &lines) {
-                tracing::debug!("Failed to write JSONL cache {}: {}", cache_path.display(), e);
+                tracing::debug!(
+                    "Failed to write JSONL cache {}: {}",
+                    cache_path.display(),
+                    e
+                );
             }
         }
     }
@@ -983,9 +987,16 @@ fn extract_lines_from_jsonl(path: &Path) -> Vec<String> {
     lines
 }
 
-fn jsonl_cache_path(cache_dir: &Path, path: &Path, metadata: &std::fs::Metadata) -> Option<PathBuf> {
+fn jsonl_cache_path(
+    cache_dir: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<PathBuf> {
     let modified = metadata.modified().ok()?;
-    let modified = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let modified = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     let size = metadata.len();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.display().to_string().hash(&mut hasher);

@@ -254,11 +254,22 @@ impl std::fmt::Display for ThoughtOp {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ReasoningTask {
-    Multiply { a: i64, b: i64 },
-    ReverseString { input: String },
-    SumEven { values: Vec<i64> },
-    Max { values: Vec<i64> },
-    SortList { values: Vec<i64> },
+    Multiply {
+        a: i64,
+        b: i64,
+    },
+    ReverseString {
+        input: String,
+    },
+    SumEven {
+        values: Vec<i64>,
+    },
+    Max {
+        values: Vec<i64>,
+    },
+    SortList {
+        values: Vec<i64>,
+    },
     SympyEval {
         expression: String,
         operation: String,

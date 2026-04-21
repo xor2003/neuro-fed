@@ -332,14 +332,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_brain_size: 1024 * 1024 * 1024, // 1GB
     };
 
-    let _brain_manager = match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone())
-    {
-        Ok(bm) => Arc::new(bm),
-        Err(e) => {
-            println!("   Failed to create brain manager for federation: {}", e);
-            return Ok(());
-        }
-    };
+    let _brain_manager =
+        match BrainManager::new(brain_sharing_config2, nostr_federation_arc.clone()) {
+            Ok(bm) => Arc::new(bm),
+            Err(e) => {
+                println!("   Failed to create brain manager for federation: {}", e);
+                return Ok(());
+            }
+        };
 
     // Create FederationManager
     println!("   Creating FederationManager...");

@@ -113,8 +113,8 @@ impl PrecisionHyperNet {
         let sigmoid = one.broadcast_div(&denom)?; // (1, max_levels)
         let scaled = sigmoid.affine(1.9, 0.1)?; // [0.1, 2.0]
 
-        let target = Tensor::from_slice(target_scales, (1, levels), device)?
-            .broadcast_as(scaled.shape())?;
+        let target =
+            Tensor::from_slice(target_scales, (1, levels), device)?.broadcast_as(scaled.shape())?;
         let error = (&scaled - &target)?;
 
         // Backprop (manual, small MLP)
@@ -129,7 +129,8 @@ impl PrecisionHyperNet {
         // grad_w1 = surprise^T * (d_output * w2^T) * relu'
         let d_hidden = d_output.matmul(&self.weights2.t()?)?;
         let relu_mask = hidden.gt(0.0)?;
-        let d_hidden_relu = d_hidden.broadcast_mul(&relu_mask.to_dtype(candle_core::DType::F32)?)?;
+        let d_hidden_relu =
+            d_hidden.broadcast_mul(&relu_mask.to_dtype(candle_core::DType::F32)?)?;
         let grad_w1 = surprise_tensor.t()?.matmul(&d_hidden_relu)?;
 
         let lr = Tensor::from_slice(&[learning_rate], (1, 1), device)?;
@@ -1347,7 +1348,10 @@ mod state_reset_tests {
         );
         assert!(final_belief[0][0].is_finite());
         assert!(
-            stats.free_energy_history.iter().all(|value| value.is_finite()),
+            stats
+                .free_energy_history
+                .iter()
+                .all(|value| value.is_finite()),
             "Amortized inference should keep free-energy values finite"
         );
 
@@ -1426,10 +1430,8 @@ mod cognitive_convergence_tests {
 
         // Use a small, stable repeating sequence for the minimal PC path.
         let seq_data = vec![
-            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ];
         let seq_tensor = Tensor::from_vec(seq_data, (4, 8), &device)?;
 

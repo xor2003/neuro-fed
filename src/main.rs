@@ -1,6 +1,7 @@
 // src/main.rs
 use anyhow::Result;
 use candle_core::Device;
+use candle_core::utils::{cuda_is_available, metal_is_available};
 use neuro_fed_node::{
     bootstrap::BootstrapManager,
     brain_manager::BrainManager,
@@ -9,6 +10,7 @@ use neuro_fed_node::{
     federation_manager::{FederationManager, FederationManagerConfig, FederationStrategy},
     metrics,
     ml_engine::MLEngine,
+    model_manager::ModelManager,
     node_loop::NodeLoop,
     openai_proxy::calibration::CalibrationStore,
     openai_proxy::components::ProxyConfig,
@@ -40,13 +42,31 @@ use walkdir::WalkDir;
 fn select_device(config: &NodeConfig) -> Device {
     if config.ml_config.use_gpu {
         // 1. Try NVIDIA (CUDA)
-        if let Ok(dev) = Device::new_cuda(0) {
-            return dev;
+        if cuda_is_available() {
+            match Device::new_cuda(0) {
+                Ok(dev) => return dev,
+                Err(err) => tracing::warn!(
+                    "CUDA support compiled in, but device creation failed: {}",
+                    err
+                ),
+            }
+        } else {
+            tracing::info!("CUDA support not compiled into this binary.");
         }
 
         // 3. Try Apple Silicon (Metal)
-        if let Ok(dev) = Device::new_metal(0) {
-            return dev;
+        if metal_is_available() {
+            match Device::new_metal(0) {
+                Ok(dev) => return dev,
+                Err(err) => tracing::warn!(
+                    "Metal support compiled in, but device creation failed: {}",
+                    err
+                ),
+            }
+        } else {
+            tracing::warn!(
+                "Metal support is not compiled into this binary. Rebuild with `cargo build --release --features metal`."
+            );
         }
 
         tracing::warn!(
@@ -58,9 +78,32 @@ fn select_device(config: &NodeConfig) -> Device {
     }
 }
 
+fn selected_device_type(device: &Device, config: &NodeConfig) -> DeviceType {
+    let debug_name = format!("{:?}", device).to_lowercase();
+    if debug_name.contains("metal") {
+        DeviceType {
+            name: "metal".to_string(),
+            description: "Apple Metal".to_string(),
+            supported: true,
+        }
+    } else if debug_name.contains("cuda") {
+        DeviceType {
+            name: "cuda".to_string(),
+            description: "NVIDIA CUDA".to_string(),
+            supported: true,
+        }
+    } else {
+        DeviceType {
+            name: "cpu".to_string(),
+            description: format!("Device: {}", config.ml_config.device_type),
+            supported: false,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = NodeConfig::load_or_default();
+    let mut config = NodeConfig::load_or_default();
     let filter = tracing_subscriber::EnvFilter::new(config.log_level.clone());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     metrics::init_metrics();
@@ -122,16 +165,70 @@ async fn main() -> Result<()> {
         .await?,
     );
 
-    // 2. Динамический выбор устройства
     let device = select_device(&config);
-    tracing::info!("Using device: {:?}", device);
+    let device_type = selected_device_type(&device, &config);
+    tracing::info!(
+        "Compute backend selected: runtime_device={:?}, ml_engine_device_type={}, description={}, compiled_cuda={}, compiled_metal={}",
+        device,
+        device_type.name,
+        device_type.description,
+        cuda_is_available(),
+        metal_is_available()
+    );
+
+    if !std::path::Path::new(&config.model_path).exists() {
+        tracing::info!(
+            "Configured model path missing ({}). Resolving startup model...",
+            config.model_path
+        );
+        let mut model_manager = ModelManager::new(config.clone());
+        let last_progress = Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0u64)));
+        let last_progress_for_cb = last_progress.clone();
+        model_manager.set_progress_callback(move |progress| {
+            if progress.total_bytes == 0 {
+                return;
+            }
+            let mut guard = last_progress_for_cb.lock().unwrap();
+            let now = std::time::Instant::now();
+            let percent_bucket = progress.percentage.floor() as u64;
+            let should_log = percent_bucket >= guard.1.saturating_add(5)
+                || now.duration_since(guard.0) >= Duration::from_secs(10)
+                || progress.bytes_downloaded >= progress.total_bytes;
+            if should_log {
+                *guard = (now, percent_bucket);
+                tracing::info!(
+                    "Model download: {:.1}% ({} / {} MB, {:.1} KB/s, ETA {}s)",
+                    progress.percentage,
+                    progress.bytes_downloaded / 1024 / 1024,
+                    progress.total_bytes / 1024 / 1024,
+                    progress.speed_kbps,
+                    progress.eta_seconds
+                );
+            }
+        });
+
+        match model_manager.ensure_startup_model().await? {
+            Some(model) => {
+                tracing::info!(
+                    "Using managed startup model {} at {}",
+                    model.name,
+                    model.local_path
+                );
+                config.model_path = model.local_path;
+            }
+            None => {
+                tracing::info!(
+                    "Configured model already available at {}",
+                    config.model_path
+                );
+            }
+        }
+    }
+
+    // 2. Динамический выбор устройства
+    tracing::info!("Using device for PC tensors: {:?}", device);
 
     // 3. Инициализация основных AI-компонентов с tokio::sync::RwLock
-    let device_type = DeviceType {
-        name: config.ml_config.device_type.clone(),
-        description: format!("Device: {}", config.ml_config.device_type),
-        supported: config.ml_config.use_gpu,
-    };
     let ml_engine = Arc::new(RwLock::new(MLEngine::new(&config.model_path, device_type)?));
     let embedding_dim = ml_engine.read().await.embedding_dim();
 
@@ -212,7 +309,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new(pc_config.clone())?));
+    let pc_hierarchy = Arc::new(RwLock::new(PredictiveCoding::new_with_device(
+        pc_config.clone(),
+        device.clone(),
+    )?));
 
     // 🧬 KNOWLEDGE INJECTION: Opt-in only (unsafe shortcut otherwise)
     if (db_missing || !has_weights) && pc_config.enable_llm_weight_injection {
@@ -476,9 +576,7 @@ async fn main() -> Result<()> {
     } else {
         let listener = match tokio::net::TcpListener::bind("0.0.0.0:8080").await {
             Ok(listener) => {
-                tracing::info!(
-                    "🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080"
-                );
+                tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 0.0.0.0:8080");
                 listener
             }
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -486,9 +584,7 @@ async fn main() -> Result<()> {
                     "Permission denied binding 0.0.0.0:8080; falling back to 127.0.0.1:8080"
                 );
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-                tracing::info!(
-                    "🚀 NeuroFed API (OpenAI Compatible) listening on 127.0.0.1:8080"
-                );
+                tracing::info!("🚀 NeuroFed API (OpenAI Compatible) listening on 127.0.0.1:8080");
                 listener
             }
             Err(err) => return Err(err.into()),

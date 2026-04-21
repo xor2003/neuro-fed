@@ -70,8 +70,10 @@ const THOUGHT_DECODER: TableDefinition<u64, &[u8]> = TableDefinition::new("thoug
 const COGNITIVE_DICTIONARY: TableDefinition<u64, &[u8]> =
     TableDefinition::new("cognitive_dictionary");
 const CALIBRATION_STORE: TableDefinition<u64, &[u8]> = TableDefinition::new("calibration_store");
-const INVESTIGATION_NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("investigation_notes");
-const WORKFLOW_MEMORY_NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("workflow_memory_notes");
+const INVESTIGATION_NOTES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("investigation_notes");
+const WORKFLOW_MEMORY_NOTES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("workflow_memory_notes");
 
 /// Database manager for PC persistence using pure Rust Redb
 pub struct PCPersistence {
@@ -778,7 +780,8 @@ mod persistence_integrity_tests {
             query: "investigate architecture drift".into(),
             goal: "find runtime and doc drift".into(),
             summary: "Runtime path is narrower than docs imply.".into(),
-            findings_summary: "The executable path uses only a subset of documented modules.".into(),
+            findings_summary: "The executable path uses only a subset of documented modules."
+                .into(),
             evidence_summary: "Compared main startup path with documented modules.".into(),
             evidence_points: vec![
                 "main.rs starts only the narrow runtime path.".into(),

@@ -72,7 +72,11 @@ async fn ui_state(State(proxy): State<Arc<OpenAiProxy>>) -> Json<UiStatePayload>
     };
 
     Json(UiStatePayload {
-        status: if ui.status.is_empty() { "idle".to_string() } else { ui.status },
+        status: if ui.status.is_empty() {
+            "idle".to_string()
+        } else {
+            ui.status
+        },
         steps: ui.steps,
         last_updated: ui.last_updated,
         progress_percent: study.progress_percent,

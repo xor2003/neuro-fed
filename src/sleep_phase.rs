@@ -2,8 +2,8 @@
 // Offline Consolidation: Fast-to-Slow memory transfer and Chunk Discovery
 
 use crate::pc_hierarchy::PredictiveCoding;
-use crate::types::{CognitiveDictionary, Episode};
 use crate::reasoning_state::{state_error, text_error};
+use crate::types::{CognitiveDictionary, Episode};
 use crate::{learning_log::append_learning_detail, pc_decoder::ThoughtDecoder};
 use candle_core::{Device, Tensor};
 use std::sync::Arc;
@@ -12,7 +12,13 @@ use tokio::task;
 
 fn expected_sections_for_intent(intent: &str) -> &'static [&'static str] {
     match intent {
-        "Investigation" => &["Goal:", "Plan:", "Findings:", "Evidence:", "Open Questions:"],
+        "Investigation" => &[
+            "Goal:",
+            "Plan:",
+            "Findings:",
+            "Evidence:",
+            "Open Questions:",
+        ],
         "CodeTask" => &[
             "Goal:",
             "Plan:",
@@ -52,7 +58,11 @@ fn extract_section(answer: &str, heading: &str) -> Option<String> {
         section.push(trimmed);
     }
     let joined = section.join("\n").trim().to_string();
-    if joined.is_empty() { None } else { Some(joined) }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn extract_bullets(section: &str) -> Vec<String> {

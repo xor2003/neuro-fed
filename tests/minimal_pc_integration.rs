@@ -1,5 +1,5 @@
-use neuro_fed_node::{PCConfig, PredictiveCoding};
 use candle_core::{Device, Tensor};
+use neuro_fed_node::{PCConfig, PredictiveCoding};
 
 #[test]
 fn test_minimal_pc_energy_decreases() -> Result<(), Box<dyn std::error::Error>> {

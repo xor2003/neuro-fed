@@ -72,11 +72,10 @@ impl MLEngine {
                 .to_string()
         });
 
-        // Use the existing constructor with the local path and tokenizer path
-        // Device type is not used in current implementation; we pass a dummy.
+        // Let the engine pick the best available accelerator for managed startup.
         let device_type = DeviceType {
-            name: "cpu".to_string(),
-            description: "CPU".to_string(),
+            name: "auto".to_string(),
+            description: "Auto-detect accelerator".to_string(),
             supported: true,
         };
         Self::new_with_tokenizer(&recommended_model.local_path, &tokenizer_path, device_type)
@@ -86,9 +85,9 @@ impl MLEngine {
     pub fn new_with_tokenizer(
         model_path: &str,
         tokenizer_path: &str,
-        _device_type: DeviceType,
+        device_type: DeviceType,
     ) -> Result<Self, MLError> {
-        let device = Device::Cpu; // Keep it under 100MB RAM by staying on CPU/Mmap
+        let device = Self::resolve_device(&device_type)?;
 
         // 1. Load Tokenizer from specified path
         let tokenizer = if Path::new(tokenizer_path).exists() {
@@ -194,6 +193,33 @@ impl MLEngine {
             model_path: model_path.to_string(),
             is_mock: false,
         })
+    }
+
+    fn resolve_device(device_type: &DeviceType) -> Result<Device, MLError> {
+        match device_type.name.as_str() {
+            "cuda" => Device::new_cuda(0).map_err(|e| {
+                MLError::ModelLoadError(format!("Failed to create CUDA device: {}", e))
+            }),
+            "metal" => Device::new_metal(0).map_err(|e| {
+                MLError::ModelLoadError(format!("Failed to create Metal device: {}", e))
+            }),
+            "cpu" => Ok(Device::Cpu),
+            "auto" => {
+                if device_type.supported {
+                    if let Ok(dev) = Device::new_cuda(0) {
+                        return Ok(dev);
+                    }
+                    if let Ok(dev) = Device::new_metal(0) {
+                        return Ok(dev);
+                    }
+                }
+                Ok(Device::Cpu)
+            }
+            other => Err(MLError::ModelLoadError(format!(
+                "Unsupported device type: {}",
+                other
+            ))),
+        }
     }
 
     fn log_tensor_stats(name: &str, tensor: &candle_core::Tensor) {
@@ -1035,8 +1061,8 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     #[test]
-    fn test_safe_l2_normalization_avoids_broadcast_panic()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_safe_l2_normalization_avoids_broadcast_panic() -> Result<(), Box<dyn std::error::Error>>
+    {
         let device = Device::Cpu;
         let dim = 2048;
 

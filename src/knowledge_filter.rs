@@ -282,7 +282,9 @@ impl CodeVerifier {
                     .strip_suffix(')')
                     .ok_or_else(|| "SyntaxError: invalid print statement".to_string())?
                     .trim();
-                if (arg.starts_with('\'') && arg.ends_with('\'')) || (arg.starts_with('"') && arg.ends_with('"')) {
+                if (arg.starts_with('\'') && arg.ends_with('\''))
+                    || (arg.starts_with('"') && arg.ends_with('"'))
+                {
                     output.push(arg[1..arg.len() - 1].to_string());
                 } else {
                     output.push(eval_expr(arg, &vars, &funcs)?.to_string());
