@@ -139,6 +139,15 @@ impl<'a> RequestExecutor<'a> {
         &self,
         mut req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
+        let start_time = Instant::now();
+        {
+            let mut metrics = self.proxy.metrics.write().await;
+            metrics.total_requests += 1;
+            metrics.status_message = "Answering...".to_string();
+        }
+        self.proxy.ui_reset("Answering...").await;
+        self.proxy.ui_set_intent(&AssistantIntent::CodeTask).await;
+
         let raw_query = req
             .messages
             .last()
@@ -164,7 +173,7 @@ impl<'a> RequestExecutor<'a> {
                 contract.verification_command,
                 contract.residual_risk_focus
             );
-            return Ok(OpenAiResponse {
+            let response = OpenAiResponse {
                 id: format!("agent-{}", Utc::now().timestamp()),
                 object: "chat.completion".to_string(),
                 created: Utc::now().timestamp(),
@@ -181,7 +190,16 @@ impl<'a> RequestExecutor<'a> {
                 }],
                 usage: Usage::default(),
                 neurofed_source: Some("code_executor_single_pass".to_string()),
-            });
+            };
+            self.proxy
+                .update_metrics_success(start_time.elapsed(), &response)
+                .await;
+            {
+                let mut metrics = self.proxy.metrics.write().await;
+                metrics.status_message = "Idle".to_string();
+            }
+            self.proxy.ui_set_status("Idle").await;
+            return Ok(response);
         }
         req.messages.insert(
             0,
