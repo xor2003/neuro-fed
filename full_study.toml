@@ -1,0 +1,7 @@
+[bootstrap_config]
+document_paths = ["data/", "docs/", "human-eval/"]
+bootstrap_on_start = true
+
+[proxy_config]
+require_thought_ops = true
+min_thought_ops = 2

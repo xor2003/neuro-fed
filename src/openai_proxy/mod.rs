@@ -2,10 +2,14 @@
 
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use chrono::Utc;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use walkdir::WalkDir;
 
 pub mod calibration;
 pub mod client;
@@ -912,6 +916,13 @@ impl OpenAiProxy {
         pc_summary: &str,
         belief: Option<&Tensor>,
     ) -> Result<String, ProxyError> {
+        if matches!(state.intent, AssistantIntent::Chat)
+            && let Some(answer) =
+                lookup_studied_chat_answer(&state.raw_query, &self.config.bootstrap_config.document_paths)
+        {
+            return Ok(answer);
+        }
+
         let engine = self.local_engine.read().await;
         if let Some(belief_tensor) = belief {
             let (decoded, avg, max) = engine
@@ -1012,6 +1023,64 @@ fn parse_i64_tokens(text: &str) -> Vec<i64> {
         .filter(|part| !part.is_empty() && *part != "-")
         .filter_map(|part| part.parse::<i64>().ok())
         .collect()
+}
+
+fn normalize_for_lookup(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn lookup_studied_chat_answer(raw_query: &str, document_paths: &[String]) -> Option<String> {
+    let normalized_query = normalize_for_lookup(raw_query);
+    if normalized_query.len() < 4 {
+        return None;
+    }
+
+    for doc_path in document_paths {
+        let path = Path::new(doc_path);
+        if !path.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(file) = File::open(entry.path()) else {
+                continue;
+            };
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let user = value.get("user").and_then(|v| v.as_str()).unwrap_or("");
+                let assistant = value.get("assistant").and_then(|v| v.as_str()).unwrap_or("");
+                if user.is_empty() || assistant.is_empty() {
+                    continue;
+                }
+                let normalized_user = normalize_for_lookup(user);
+                if normalized_user == normalized_query
+                    || normalized_user.contains(&normalized_query)
+                    || normalized_query.contains(&normalized_user)
+                {
+                    return Some(assistant.trim().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn detect_reasoning_task(raw_query: &str) -> (Option<ReasoningTask>, Option<String>) {
