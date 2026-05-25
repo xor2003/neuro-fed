@@ -71,8 +71,15 @@ pub struct OpenAiProxy {
     investigation_notes: Arc<RwLock<Vec<InvestigationNote>>>,
     workflow_memory_notes: Arc<RwLock<Vec<WorkflowMemoryNote>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
+    studied_qa_index: Arc<RwLock<Option<Vec<StudiedQaRow>>>>,
     pub study_state: Arc<RwLock<StudyState>>,
     pub ui_state: Arc<RwLock<UiState>>,
+}
+
+#[derive(Clone)]
+struct StudiedQaRow {
+    question_normalized: String,
+    answer: String,
 }
 
 impl OpenAiProxy {
@@ -132,6 +139,7 @@ impl OpenAiProxy {
             investigation_notes: Arc::new(RwLock::new(Vec::new())),
             workflow_memory_notes: Arc::new(RwLock::new(Vec::new())),
             calibration,
+            studied_qa_index: Arc::new(RwLock::new(None)),
             study_state,
             ui_state,
         }
@@ -917,8 +925,9 @@ impl OpenAiProxy {
         belief: Option<&Tensor>,
     ) -> Result<String, ProxyError> {
         if matches!(state.intent, AssistantIntent::Chat)
-            && let Some(answer) =
-                lookup_studied_chat_answer(&state.raw_query, &self.config.bootstrap_config.document_paths)
+            && let Some(answer) = self
+                .lookup_studied_chat_answer_cached(&state.raw_query)
+                .await
         {
             return Ok(answer);
         }
@@ -941,6 +950,22 @@ impl OpenAiProxy {
         Ok(render_local_intent_response(
             state, None, pc_summary, None, None,
         ))
+    }
+
+    async fn lookup_studied_chat_answer_cached(&self, raw_query: &str) -> Option<String> {
+        let existing = self.studied_qa_index.read().await.clone();
+        let index = match existing {
+            Some(rows) => rows,
+            None => {
+                let rows = build_studied_qa_index(&self.config.bootstrap_config.document_paths);
+                let mut write = self.studied_qa_index.write().await;
+                if write.is_none() {
+                    *write = Some(rows.clone());
+                }
+                rows
+            }
+        };
+        rank_studied_qa_answer(raw_query, &index)
     }
 
     fn sanitize_remote_models(&self) -> Result<Vec<String>, ProxyError> {
@@ -1036,12 +1061,8 @@ fn normalize_for_lookup(value: &str) -> String {
         .join(" ")
 }
 
-fn lookup_studied_chat_answer(raw_query: &str, document_paths: &[String]) -> Option<String> {
-    let normalized_query = normalize_for_lookup(raw_query);
-    if normalized_query.len() < 4 {
-        return None;
-    }
-
+fn build_studied_qa_index(document_paths: &[String]) -> Vec<StudiedQaRow> {
+    let mut rows = Vec::new();
     for doc_path in document_paths {
         let path = Path::new(doc_path);
         if !path.exists() {
@@ -1070,17 +1091,63 @@ fn lookup_studied_chat_answer(raw_query: &str, document_paths: &[String]) -> Opt
                 if user.is_empty() || assistant.is_empty() {
                     continue;
                 }
-                let normalized_user = normalize_for_lookup(user);
-                if normalized_user == normalized_query
-                    || normalized_user.contains(&normalized_query)
-                    || normalized_query.contains(&normalized_user)
-                {
-                    return Some(assistant.trim().to_string());
-                }
+                rows.push(StudiedQaRow {
+                    question_normalized: normalize_for_lookup(user),
+                    answer: assistant.trim().to_string(),
+                });
             }
         }
     }
-    None
+    rows
+}
+
+fn rank_studied_qa_answer(raw_query: &str, rows: &[StudiedQaRow]) -> Option<String> {
+    let normalized_query = normalize_for_lookup(raw_query);
+    if normalized_query.len() < 4 {
+        return None;
+    }
+    let query_tokens = tokenize_lookup(&normalized_query);
+    if query_tokens.is_empty() {
+        return None;
+    }
+
+    let mut best_score = 0.0_f32;
+    let mut best_answer: Option<&str> = None;
+    for row in rows {
+        let row_tokens = tokenize_lookup(&row.question_normalized);
+        if row_tokens.is_empty() {
+            continue;
+        }
+        let overlap = query_tokens.intersection(&row_tokens).count() as f32;
+        let denom = query_tokens.len().max(row_tokens.len()) as f32;
+        let mut score = overlap / denom;
+        if row.question_normalized == normalized_query {
+            score += 0.5;
+        } else if row.question_normalized.contains(&normalized_query)
+            || normalized_query.contains(&row.question_normalized)
+        {
+            score += 0.2;
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_answer = Some(row.answer.as_str());
+        }
+    }
+
+    if best_score >= 0.55 {
+        best_answer.map(|answer| answer.to_string())
+    } else {
+        None
+    }
+}
+
+fn tokenize_lookup(input: &str) -> HashSet<String> {
+    input
+        .split_whitespace()
+        .filter(|token| token.len() > 1)
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn detect_reasoning_task(raw_query: &str) -> (Option<ReasoningTask>, Option<String>) {
