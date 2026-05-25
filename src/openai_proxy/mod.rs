@@ -88,6 +88,7 @@ struct CodeExecutionContract {
 #[derive(Clone)]
 struct CodeExecutorStep {
     description: String,
+    status: &'static str,
 }
 
 struct CodeExecutorPlan {
@@ -303,7 +304,15 @@ fn build_single_pass_code_executor_response(
         .steps
         .iter()
         .enumerate()
-        .map(|(idx, step)| format!("- Iteration {}/{}: {}", idx + 1, bounded_plan.steps.len(), step.description))
+        .map(|(idx, step)| {
+            format!(
+                "- Iteration {}/{} [{}]: {}",
+                idx + 1,
+                bounded_plan.steps.len(),
+                step.status,
+                step.description
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -321,12 +330,15 @@ fn build_bounded_code_executor_plan(contract: &CodeExecutionContract) -> CodeExe
     let mut steps = Vec::new();
     steps.push(CodeExecutorStep {
         description: format!("inspect touched area ({})", contract.touched_area_summary),
+        status: "completed",
     });
     steps.push(CodeExecutorStep {
         description: "apply minimal coherent change aligned with request".to_string(),
+        status: "pending",
     });
     steps.push(CodeExecutorStep {
         description: format!("run verification command ({})", contract.verification_command),
+        status: "pending",
     });
     CodeExecutorPlan {
         steps,
@@ -2625,6 +2637,9 @@ mod proxy_utility_tests {
         assert_eq!(plan.steps.len(), 3);
         assert!(plan.steps[0].description.contains("src/main.rs"));
         assert!(plan.steps[2].description.contains("cargo test --lib"));
+        assert_eq!(plan.steps[0].status, "completed");
+        assert_eq!(plan.steps[1].status, "pending");
+        assert_eq!(plan.steps[2].status, "pending");
         assert!(plan.stop_reason.contains("bounded executor cycle"));
     }
 
