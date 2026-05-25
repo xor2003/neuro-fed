@@ -131,12 +131,22 @@ impl<'a> RequestExecutor<'a> {
 
     async fn execute_code_task_phase(
         &self,
-        req: OpenAiRequest,
+        mut req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
         // Dedicated seam for the forthcoming code-task executor loop.
         self.proxy
             .ui_push_step("Code executor path".to_string())
             .await;
+        req.messages.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: serde_json::json!(
+                    "For code tasks, respond with explicit sections: Goal, Plan, Implementation, Verification, Risks."
+                ),
+                name: None,
+            },
+        );
         self.proxy.handle_chat_completion_impl(req).await
     }
 
