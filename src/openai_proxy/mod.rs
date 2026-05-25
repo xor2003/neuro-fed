@@ -366,6 +366,11 @@ fn build_single_pass_code_executor_response(
     } else {
         "verification not executed in this bounded cycle"
     };
+    let executor_ready_for_next_cycle = if verification_result == "passed" {
+        "false"
+    } else {
+        "true"
+    };
     let phase_state = CodeExecutorPhaseState {
         phase: CodeExecutorPhase::Execute.as_str(),
         phase_index: 2,
@@ -392,7 +397,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_cycle_id,
@@ -407,6 +412,7 @@ fn build_single_pass_code_executor_response(
         phase_state.remaining_iterations,
         executor_next_action,
         executor_blockers,
+        executor_ready_for_next_cycle,
         contract.verification_command,
         executor_artifact_path,
         contract.touched_area_summary,
@@ -2787,6 +2793,7 @@ mod proxy_utility_tests {
         assert!(response.contains("Remaining iteration budget: 0"));
         assert!(response.contains("executor_next_action=none"));
         assert!(response.contains("executor_blockers=none"));
+        assert!(response.contains("executor_ready_for_next_cycle=false"));
         assert!(response.contains("executor_recommended_command=cargo test --lib"));
         assert!(response.contains("executor_artifact_path=artifact://verification/stdout"));
         assert!(response.contains("cargo test --lib"));
@@ -2813,6 +2820,7 @@ mod proxy_utility_tests {
         assert!(response.contains("verification_result=pending"));
         assert!(response.contains("executor_next_action=run verification command and collect artifact"));
         assert!(response.contains("executor_blockers=verification not executed in this bounded cycle"));
+        assert!(response.contains("executor_ready_for_next_cycle=true"));
         assert!(response.contains(
             "executor_recommended_command=cargo clippy --all-targets -- -D warnings"
         ));
