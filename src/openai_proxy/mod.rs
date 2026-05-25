@@ -85,6 +85,16 @@ struct CodeExecutionContract {
     residual_risk_focus: String,
 }
 
+#[derive(Clone)]
+struct CodeExecutorStep {
+    description: String,
+}
+
+struct CodeExecutorPlan {
+    steps: Vec<CodeExecutorStep>,
+    stop_reason: String,
+}
+
 struct ExecutionContext {
     state: StructuredState,
     related_investigation_notes: Vec<InvestigationNote>,
@@ -288,13 +298,40 @@ fn build_single_pass_code_executor_response(
     raw_query: &str,
     contract: &CodeExecutionContract,
 ) -> String {
+    let bounded_plan = build_bounded_code_executor_plan(contract);
+    let plan_lines = bounded_plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| format!("- Iteration {}/{}: {}", idx + 1, bounded_plan.steps.len(), step.description))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n- Iteration 1/1: inspect touched area.\n- Apply minimal coherent change.\n- Validate with the selected command.\n\nImplementation:\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
+        plan_lines,
         contract.touched_area_summary,
         contract.verification_command,
-        contract.residual_risk_focus
+        contract.residual_risk_focus,
+        bounded_plan.stop_reason
     )
+}
+
+fn build_bounded_code_executor_plan(contract: &CodeExecutionContract) -> CodeExecutorPlan {
+    let mut steps = Vec::new();
+    steps.push(CodeExecutorStep {
+        description: format!("inspect touched area ({})", contract.touched_area_summary),
+    });
+    steps.push(CodeExecutorStep {
+        description: "apply minimal coherent change aligned with request".to_string(),
+    });
+    steps.push(CodeExecutorStep {
+        description: format!("run verification command ({})", contract.verification_command),
+    });
+    CodeExecutorPlan {
+        steps,
+        stop_reason: "stop after one bounded executor cycle; report residual risk instead of speculative extra changes".to_string(),
+    }
 }
 
 impl OpenAiProxy {
@@ -2570,10 +2607,25 @@ mod proxy_utility_tests {
         };
         let response = build_single_pass_code_executor_response("fix parser bug", &contract);
         assert!(response.contains("Goal:"));
-        assert!(response.contains("Iteration 1/1"));
+        assert!(response.contains("Iteration 1/3"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
+        assert!(response.contains("Stop Condition:"));
+    }
+
+    #[test]
+    fn test_build_bounded_code_executor_plan_has_explicit_stop_reason() {
+        let contract = CodeExecutionContract {
+            touched_area_summary: "focus on src/main.rs".to_string(),
+            verification_command: "cargo test --lib".to_string(),
+            residual_risk_focus: "startup regressions".to_string(),
+        };
+        let plan = build_bounded_code_executor_plan(&contract);
+        assert_eq!(plan.steps.len(), 3);
+        assert!(plan.steps[0].description.contains("src/main.rs"));
+        assert!(plan.steps[2].description.contains("cargo test --lib"));
+        assert!(plan.stop_reason.contains("bounded executor cycle"));
     }
 
     #[test]
