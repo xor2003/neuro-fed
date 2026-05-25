@@ -75,16 +75,57 @@ struct RequestExecutor<'a> {
     proxy: &'a OpenAiProxy,
 }
 
+struct PlannedRequest {
+    req: OpenAiRequest,
+}
+
 impl<'a> RequestExecutor<'a> {
     fn new(proxy: &'a OpenAiProxy) -> Self {
         Self { proxy }
     }
 
     async fn run(&self, req: OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
-        // Phase 1 (plan): derive structured state and execution context.
-        // Phase 2 (execute): run PC/reasoning and model fallback chain.
-        // Phase 3 (verify/finalize): package response, metrics, and memory writes.
-        self.proxy.handle_chat_completion_impl(req).await
+        let planned = self.plan_phase(req).await;
+        let response = self.execute_phase(planned).await?;
+        self.verify_phase(response).await
+    }
+
+    async fn plan_phase(&self, mut req: OpenAiRequest) -> PlannedRequest {
+        if req.max_tokens.is_none() {
+            req.max_tokens = Some(self.proxy.config.context_size);
+        }
+        if self.proxy.config.ml_config.max_batch_size > 0
+            && req.messages.len() > self.proxy.config.ml_config.max_batch_size
+        {
+            let start = req
+                .messages
+                .len()
+                .saturating_sub(self.proxy.config.ml_config.max_batch_size);
+            req.messages = req.messages[start..].to_vec();
+        }
+        PlannedRequest { req }
+    }
+
+    async fn execute_phase(&self, planned: PlannedRequest) -> Result<OpenAiResponse, ProxyError> {
+        self.proxy.handle_chat_completion_impl(planned.req).await
+    }
+
+    async fn verify_phase(
+        &self,
+        response: OpenAiResponse,
+    ) -> Result<OpenAiResponse, ProxyError> {
+        if response.object != "chat.completion" {
+            return Err(ProxyError::BackendError(format!(
+                "Invalid response object: {}",
+                response.object
+            )));
+        }
+        if response.choices.is_empty() {
+            return Err(ProxyError::BackendError(
+                "Response contains no choices".to_string(),
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -359,18 +400,6 @@ impl OpenAiProxy {
         req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
         let mut req = req;
-        if req.max_tokens.is_none() {
-            req.max_tokens = Some(self.config.context_size);
-        }
-        if self.config.ml_config.max_batch_size > 0
-            && req.messages.len() > self.config.ml_config.max_batch_size
-        {
-            let start = req
-                .messages
-                .len()
-                .saturating_sub(self.config.ml_config.max_batch_size);
-            req.messages = req.messages[start..].to_vec();
-        }
         let estimated_prompt_tokens = estimate_tokens_from_messages(&req.messages);
         {
             let mut metrics = self.metrics.write().await;
