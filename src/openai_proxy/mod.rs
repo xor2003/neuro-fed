@@ -89,6 +89,7 @@ struct CodeExecutorPhaseState {
     phase: &'static str,
     iteration: usize,
     max_iterations: usize,
+    remaining_iterations: usize,
 }
 
 #[derive(Clone)]
@@ -309,6 +310,7 @@ fn build_single_pass_code_executor_response(
         phase: "execute",
         iteration: 1,
         max_iterations: 1,
+        remaining_iterations: 0,
     };
     let mut bounded_plan = build_bounded_code_executor_plan(contract);
     advance_code_executor_plan(&mut bounded_plan, 2);
@@ -328,12 +330,13 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase: {} ({}/{})\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         phase_state.phase,
         phase_state.iteration,
         phase_state.max_iterations,
+        phase_state.remaining_iterations,
         contract.touched_area_summary,
         contract.verification_command,
         contract.residual_risk_focus,
@@ -2651,6 +2654,7 @@ mod proxy_utility_tests {
         assert!(response.contains("Iteration 3/3 [pending]"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
+        assert!(response.contains("Remaining iteration budget: 0"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
         assert!(response.contains("Stop Condition:"));
