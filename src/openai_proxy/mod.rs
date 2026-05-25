@@ -138,6 +138,83 @@ impl<'a> RequestExecutor<'a> {
 }
 
 impl OpenAiProxy {
+    async fn resolve_response_text(
+        &self,
+        req: &OpenAiRequest,
+        state: &StructuredState,
+        pc_thoughts_string: &str,
+        pc_surface_belief: Option<&Tensor>,
+        mut final_text: String,
+        mut last_source: &'static str,
+        pc_error: &Option<String>,
+    ) -> (String, String) {
+        let mut remote_error: Option<String> = None;
+        let mut local_error: Option<String> = None;
+
+        // Step 2: Remote LLM attempt
+        if final_text.trim().is_empty() {
+            self.ui_push_step("Remote LLM request".to_string()).await;
+            match self.forward_to_remote(req).await {
+                Ok(resp) => {
+                    if let Some(choice) = resp.choices.first() {
+                        let raw = choice.message.content.to_string();
+                        if !raw.trim().is_empty() {
+                            final_text = raw;
+                            last_source = "remote_llm";
+                        } else {
+                            remote_error = Some("Remote LLM returned empty response".to_string());
+                        }
+                    } else {
+                        remote_error = Some("Remote LLM returned no choices".to_string());
+                    }
+                }
+                Err(e) => {
+                    remote_error = Some(format!("Remote LLM failed: {}", e));
+                }
+            }
+        }
+
+        // Step 3: Local LLM attempt
+        if final_text.trim().is_empty() {
+            self.ui_push_step("Local LLM request".to_string()).await;
+            match self
+                .forward_to_local(state, pc_thoughts_string, pc_surface_belief)
+                .await
+            {
+                Ok(resp) => {
+                    if !resp.trim().is_empty() {
+                        final_text = resp;
+                        last_source = "local_llm";
+                    } else {
+                        local_error = Some("Local fallback produced empty response".to_string());
+                    }
+                }
+                Err(e) => {
+                    local_error = Some(format!("Local LLM failed: {}", e));
+                }
+            }
+        }
+
+        if final_text.trim().is_empty() {
+            let mut details = Vec::new();
+            if let Some(err) = pc_error {
+                details.push(format!("PC: {}", err));
+            }
+            if let Some(err) = remote_error {
+                details.push(format!("Remote LLM: {}", err));
+            }
+            if let Some(err) = local_error {
+                details.push(format!("Local fallback: {}", err));
+            }
+            final_text = format!(
+                "No response from PC, remote LLM, or local LLM. {}",
+                details.join(" | ")
+            );
+        }
+
+        (final_text, last_source.to_string())
+    }
+
     async fn try_execute_reasoning_task(
         &self,
         effective_reasoning_task: &Option<ReasoningTask>,
@@ -552,8 +629,6 @@ impl OpenAiProxy {
         let mut raw_confidence = 0.0;
         let mut last_source = "local_pc";
         let mut pc_error: Option<String> = None;
-        let mut remote_error: Option<String> = None;
-        let mut local_error: Option<String> = None;
         let mut pc_thoughts_string = String::new();
         let mut pc_surface_belief: Option<Tensor> = None;
         let mut effective_reasoning_task = state.reasoning_task.clone();
@@ -727,66 +802,27 @@ impl OpenAiProxy {
             last_source = "reasoning_state";
         }
 
-        // Step 2: Remote LLM attempt
-        if final_text.trim().is_empty() {
-            self.ui_push_step("Remote LLM request".to_string()).await;
-            match self.forward_to_remote(&req).await {
-                Ok(resp) => {
-                    if let Some(choice) = resp.choices.first() {
-                        let raw = choice.message.content.to_string();
-                        if !raw.trim().is_empty() {
-                            final_text = raw;
-                            last_source = "remote_llm";
-                        } else {
-                            remote_error = Some("Remote LLM returned empty response".to_string());
-                        }
-                    } else {
-                        remote_error = Some("Remote LLM returned no choices".to_string());
-                    }
-                }
-                Err(e) => {
-                    remote_error = Some(format!("Remote LLM failed: {}", e));
-                }
-            }
-        }
-
-        // Step 3: Local LLM attempt
-        if final_text.trim().is_empty() {
-            self.ui_push_step("Local LLM request".to_string()).await;
-            match self
-                .forward_to_local(&state, &pc_thoughts_string, pc_surface_belief.as_ref())
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.trim().is_empty() {
-                        final_text = resp;
-                        last_source = "local_llm";
-                    } else {
-                        local_error = Some("Local fallback produced empty response".to_string());
-                    }
-                }
-                Err(e) => {
-                    local_error = Some(format!("Local LLM failed: {}", e));
-                }
-            }
-        }
-
-        if final_text.trim().is_empty() {
-            let mut details = Vec::new();
-            if let Some(err) = pc_error {
-                details.push(format!("PC: {}", err));
-            }
-            if let Some(err) = remote_error {
-                details.push(format!("Remote LLM: {}", err));
-            }
-            if let Some(err) = local_error {
-                details.push(format!("Local fallback: {}", err));
-            }
-            final_text = format!(
-                "No response from PC, remote LLM, or local LLM. {}",
-                details.join(" | ")
-            );
-        }
+        let (resolved_text, resolved_source) = self
+            .resolve_response_text(
+                &req,
+                &state,
+                &pc_thoughts_string,
+                pc_surface_belief.as_ref(),
+                final_text,
+                last_source,
+                &pc_error,
+            )
+            .await;
+        final_text = resolved_text;
+        last_source = if resolved_source == "remote_llm" {
+            "remote_llm"
+        } else if resolved_source == "local_llm" {
+            "local_llm"
+        } else if resolved_source == "reasoning_state" {
+            "reasoning_state"
+        } else {
+            "local_pc"
+        };
 
         final_text = structure_assistant_output(
             &state,
