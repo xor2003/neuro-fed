@@ -166,13 +166,7 @@ impl<'a> RequestExecutor<'a> {
             ))
             .await;
         if self.proxy.config.proxy_config.require_thought_ops {
-            let single_pass = format!(
-                "Goal:\n{}\n\nPlan:\n- Inspect touched area.\n- Apply minimal coherent change.\n- Validate with the selected command.\n\nImplementation:\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}",
-                raw_query,
-                contract.touched_area_summary,
-                contract.verification_command,
-                contract.residual_risk_focus
-            );
+            let single_pass = build_single_pass_code_executor_response(&raw_query, &contract);
             let response = OpenAiResponse {
                 id: format!("agent-{}", Utc::now().timestamp()),
                 object: "chat.completion".to_string(),
@@ -288,6 +282,19 @@ fn select_verification_command(lower_query: &str) -> String {
     } else {
         "cargo test --lib".to_string()
     }
+}
+
+fn build_single_pass_code_executor_response(
+    raw_query: &str,
+    contract: &CodeExecutionContract,
+) -> String {
+    format!(
+        "Goal:\n{}\n\nPlan:\n- Iteration 1/1: inspect touched area.\n- Apply minimal coherent change.\n- Validate with the selected command.\n\nImplementation:\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}",
+        raw_query,
+        contract.touched_area_summary,
+        contract.verification_command,
+        contract.residual_risk_focus
+    )
 }
 
 impl OpenAiProxy {
@@ -2552,6 +2559,21 @@ mod proxy_utility_tests {
 
         let generic = extract_touched_area_summary("fix startup race condition");
         assert!(generic.contains("not explicitly specified"));
+    }
+
+    #[test]
+    fn test_build_single_pass_code_executor_response_contains_contract_sections() {
+        let contract = CodeExecutionContract {
+            touched_area_summary: "focus on src/openai_proxy/mod.rs".to_string(),
+            verification_command: "cargo test --lib".to_string(),
+            residual_risk_focus: "behavior regressions outside touched files".to_string(),
+        };
+        let response = build_single_pass_code_executor_response("fix parser bug", &contract);
+        assert!(response.contains("Goal:"));
+        assert!(response.contains("Iteration 1/1"));
+        assert!(response.contains("focus on src/openai_proxy/mod.rs"));
+        assert!(response.contains("cargo test --lib"));
+        assert!(response.contains("behavior regressions outside touched files"));
     }
 
     #[test]
