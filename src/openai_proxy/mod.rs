@@ -382,17 +382,24 @@ fn build_code_executor_phase_trace() -> String {
     .join(" -> ")
 }
 
-fn build_code_executor_phase_outcomes() -> String {
+fn build_code_executor_phase_outcomes_with_statuses(
+    verify_status: &'static str,
+    done_status: &'static str,
+) -> String {
     [
         (CodeExecutorPhase::Plan, "completed"),
         (CodeExecutorPhase::Execute, "completed"),
-        (CodeExecutorPhase::Verify, "pending"),
-        (CodeExecutorPhase::Done, "pending"),
+        (CodeExecutorPhase::Verify, verify_status),
+        (CodeExecutorPhase::Done, done_status),
     ]
     .iter()
     .map(|(phase, status)| format!("{}={}", phase.as_str(), status))
     .collect::<Vec<_>>()
     .join(", ")
+}
+
+fn build_code_executor_phase_outcomes() -> String {
+    build_code_executor_phase_outcomes_with_statuses("pending", "pending")
 }
 
 fn derive_code_executor_verification_result(phase_outcomes: &str) -> &'static str {
@@ -2741,12 +2748,30 @@ mod proxy_utility_tests {
     }
 
     #[test]
+    fn test_build_code_executor_phase_outcomes_with_statuses() {
+        assert_eq!(
+            build_code_executor_phase_outcomes_with_statuses("completed", "completed"),
+            "plan=completed, execute=completed, verify=completed, done=completed"
+        );
+    }
+
+    #[test]
     fn test_derive_code_executor_verification_result_pending() {
         assert_eq!(
             derive_code_executor_verification_result(
                 "plan=completed, execute=completed, verify=pending, done=pending"
             ),
             "pending"
+        );
+    }
+
+    #[test]
+    fn test_derive_code_executor_verification_result_passed() {
+        assert_eq!(
+            derive_code_executor_verification_result(
+                "plan=completed, execute=completed, verify=completed, done=completed"
+            ),
+            "passed"
         );
     }
 
