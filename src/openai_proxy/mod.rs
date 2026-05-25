@@ -405,8 +405,9 @@ fn build_single_pass_code_executor_response(
     let executor_plan_revision_reason = derive_executor_plan_revision_reason(verification_result);
     let executor_completed_steps = count_completed_executor_steps(&bounded_plan);
     let executor_total_steps = bounded_plan.steps.len();
+    let executor_pending_steps = list_pending_executor_steps(&bounded_plan);
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_plan_state={}\n- executor_execution_state={}\n- executor_plan_revision_reason={}\n- executor_reasoning_mode=deterministic_bounded\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- executor_completed_steps={}\n- executor_total_steps={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_plan_state={}\n- executor_execution_state={}\n- executor_plan_revision_reason={}\n- executor_reasoning_mode=deterministic_bounded\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- executor_completed_steps={}\n- executor_total_steps={}\n- executor_pending_steps={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_plan_state,
@@ -418,6 +419,7 @@ fn build_single_pass_code_executor_response(
         phase_state.phase_total,
         executor_completed_steps,
         executor_total_steps,
+        executor_pending_steps,
         phase_trace,
         phase_outcomes,
         phase_state.phase,
@@ -525,6 +527,20 @@ fn count_completed_executor_steps(plan: &CodeExecutorPlan) -> usize {
         .iter()
         .filter(|step| step.status == "completed")
         .count()
+}
+
+fn list_pending_executor_steps(plan: &CodeExecutorPlan) -> String {
+    let pending = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == "pending")
+        .map(|step| step.description.as_str())
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        "none".to_string()
+    } else {
+        pending.join(" | ")
+    }
 }
 
 impl OpenAiProxy {
@@ -2815,6 +2831,7 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_phase_total=4"));
         assert!(response.contains("executor_completed_steps=2"));
         assert!(response.contains("executor_total_steps=3"));
+        assert!(response.contains("executor_pending_steps=run verification command (cargo test --lib)"));
         assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains(
             "Executor phase outcomes: plan=completed, execute=completed, verify=completed, done=completed"
@@ -2868,6 +2885,9 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_phase_total=4"));
         assert!(response.contains("executor_completed_steps=2"));
         assert!(response.contains("executor_total_steps=3"));
+        assert!(response.contains(
+            "executor_pending_steps=run verification command (cargo clippy --all-targets -- -D warnings)"
+        ));
         assert!(response.contains("executor_reasoning_mode=deterministic_bounded"));
     }
 
@@ -2944,6 +2964,26 @@ mod proxy_utility_tests {
             derive_executor_plan_revision_reason("pending"),
             "verification_pending"
         );
+    }
+
+    #[test]
+    fn test_list_pending_executor_steps() {
+        let mut plan = CodeExecutorPlan {
+            steps: vec![
+                CodeExecutorStep {
+                    description: "inspect".to_string(),
+                    status: "completed",
+                },
+                CodeExecutorStep {
+                    description: "verify".to_string(),
+                    status: "pending",
+                },
+            ],
+            stop_reason: "stop".to_string(),
+        };
+        assert_eq!(list_pending_executor_steps(&plan), "verify");
+        plan.steps[1].status = "completed";
+        assert_eq!(list_pending_executor_steps(&plan), "none");
     }
 
     #[test]
