@@ -87,6 +87,8 @@ struct CodeExecutionContract {
 
 struct CodeExecutorPhaseState {
     phase: &'static str,
+    phase_index: usize,
+    phase_total: usize,
     iteration: usize,
     max_iterations: usize,
     remaining_iterations: usize,
@@ -366,6 +368,8 @@ fn build_single_pass_code_executor_response(
     };
     let phase_state = CodeExecutorPhaseState {
         phase: CodeExecutorPhase::Execute.as_str(),
+        phase_index: 2,
+        phase_total: 4,
         iteration: 1,
         max_iterations: 1,
         remaining_iterations: 0,
@@ -388,11 +392,13 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_cycle_id,
         executor_transition,
+        phase_state.phase_index,
+        phase_state.phase_total,
         phase_trace,
         phase_outcomes,
         phase_state.phase,
@@ -2766,6 +2772,8 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_contract_version=v1"));
         assert!(response.contains("executor_cycle_id=cycle-1"));
         assert!(response.contains("executor_transition=verify->done"));
+        assert!(response.contains("executor_phase_index=2"));
+        assert!(response.contains("executor_phase_total=4"));
         assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains(
             "Executor phase outcomes: plan=completed, execute=completed, verify=completed, done=completed"
@@ -2810,6 +2818,8 @@ mod proxy_utility_tests {
         ));
         assert!(response.contains("executor_artifact_path=pending"));
         assert!(response.contains("executor_transition=execute->verify"));
+        assert!(response.contains("executor_phase_index=2"));
+        assert!(response.contains("executor_phase_total=4"));
     }
 
     #[test]
