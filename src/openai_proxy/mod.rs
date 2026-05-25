@@ -92,6 +92,25 @@ struct CodeExecutorPhaseState {
     remaining_iterations: usize,
 }
 
+#[derive(Clone, Copy)]
+enum CodeExecutorPhase {
+    Plan,
+    Execute,
+    Verify,
+    Done,
+}
+
+impl CodeExecutorPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Execute => "execute",
+            Self::Verify => "verify",
+            Self::Done => "done",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CodeExecutorStep {
     description: String,
@@ -306,8 +325,9 @@ fn build_single_pass_code_executor_response(
     raw_query: &str,
     contract: &CodeExecutionContract,
 ) -> String {
+    let phase_trace = build_code_executor_phase_trace();
     let phase_state = CodeExecutorPhaseState {
-        phase: "execute",
+        phase: CodeExecutorPhase::Execute.as_str(),
         iteration: 1,
         max_iterations: 1,
         remaining_iterations: 0,
@@ -330,9 +350,10 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase trace: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
+        phase_trace,
         phase_state.phase,
         phase_state.iteration,
         phase_state.max_iterations,
@@ -342,6 +363,19 @@ fn build_single_pass_code_executor_response(
         contract.residual_risk_focus,
         bounded_plan.stop_reason
     )
+}
+
+fn build_code_executor_phase_trace() -> String {
+    [
+        CodeExecutorPhase::Plan,
+        CodeExecutorPhase::Execute,
+        CodeExecutorPhase::Verify,
+        CodeExecutorPhase::Done,
+    ]
+    .iter()
+    .map(|phase| phase.as_str())
+    .collect::<Vec<_>>()
+    .join(" -> ")
 }
 
 fn build_bounded_code_executor_plan(contract: &CodeExecutionContract) -> CodeExecutorPlan {
@@ -2652,12 +2686,21 @@ mod proxy_utility_tests {
         assert!(response.contains("Iteration 1/3"));
         assert!(response.contains("Iteration 2/3 [completed]"));
         assert!(response.contains("Iteration 3/3 [pending]"));
+        assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
         assert!(response.contains("Remaining iteration budget: 0"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
         assert!(response.contains("Stop Condition:"));
+    }
+
+    #[test]
+    fn test_build_code_executor_phase_trace_order() {
+        assert_eq!(
+            build_code_executor_phase_trace(),
+            "plan -> execute -> verify -> done"
+        );
     }
 
     #[test]
