@@ -2,14 +2,10 @@
 
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use chrono::Utc;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use walkdir::WalkDir;
 
 pub mod calibration;
 pub mod client;
@@ -71,15 +67,8 @@ pub struct OpenAiProxy {
     investigation_notes: Arc<RwLock<Vec<InvestigationNote>>>,
     workflow_memory_notes: Arc<RwLock<Vec<WorkflowMemoryNote>>>,
     calibration: Arc<RwLock<CalibrationStore>>,
-    studied_qa_index: Arc<RwLock<Option<Vec<StudiedQaRow>>>>,
     pub study_state: Arc<RwLock<StudyState>>,
     pub ui_state: Arc<RwLock<UiState>>,
-}
-
-#[derive(Clone)]
-struct StudiedQaRow {
-    question_normalized: String,
-    answer: String,
 }
 
 impl OpenAiProxy {
@@ -139,7 +128,6 @@ impl OpenAiProxy {
             investigation_notes: Arc::new(RwLock::new(Vec::new())),
             workflow_memory_notes: Arc::new(RwLock::new(Vec::new())),
             calibration,
-            studied_qa_index: Arc::new(RwLock::new(None)),
             study_state,
             ui_state,
         }
@@ -590,14 +578,28 @@ impl OpenAiProxy {
                 }
             }
 
-            let canonical_ops: Vec<_> = {
+            let canonical_ops: Vec<_> = if thought_trajectory.is_empty() {
+                recommended_ops(&task)
+            } else {
                 let dict = self.cognitive_dict.read().await;
                 thought_trajectory
                     .iter()
                     .map(|id| dict.get_op(*id))
                     .collect()
             };
-            let outcome = execute_plan(&task, &canonical_ops);
+            let mut outcome = execute_plan(&task, &canonical_ops);
+            if render_output(&task, &outcome).is_none() {
+                // Ensure reasoning tasks remain executable even when inferred ThoughtOps are noisy.
+                let fallback_ops = recommended_ops(&task);
+                outcome = execute_plan(&task, &fallback_ops);
+                if render_output(&task, &outcome).is_some() {
+                    pc_thoughts_string = fallback_ops
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                }
+            }
             if let Some(answer) = render_output(&task, &outcome) {
                 final_text = answer.clone();
                 last_source = "reasoning_state";
@@ -924,14 +926,6 @@ impl OpenAiProxy {
         pc_summary: &str,
         belief: Option<&Tensor>,
     ) -> Result<String, ProxyError> {
-        if matches!(state.intent, AssistantIntent::Chat)
-            && let Some(answer) = self
-                .lookup_studied_chat_answer_cached(&state.raw_query)
-                .await
-        {
-            return Ok(answer);
-        }
-
         let engine = self.local_engine.read().await;
         if let Some(belief_tensor) = belief {
             let (decoded, avg, max) = engine
@@ -950,22 +944,6 @@ impl OpenAiProxy {
         Ok(render_local_intent_response(
             state, None, pc_summary, None, None,
         ))
-    }
-
-    async fn lookup_studied_chat_answer_cached(&self, raw_query: &str) -> Option<String> {
-        let existing = self.studied_qa_index.read().await.clone();
-        let index = match existing {
-            Some(rows) => rows,
-            None => {
-                let rows = build_studied_qa_index(&self.config.bootstrap_config.document_paths);
-                let mut write = self.studied_qa_index.write().await;
-                if write.is_none() {
-                    *write = Some(rows.clone());
-                }
-                rows
-            }
-        };
-        rank_studied_qa_answer(raw_query, &index)
     }
 
     fn sanitize_remote_models(&self) -> Result<Vec<String>, ProxyError> {
@@ -1000,7 +978,10 @@ pub async fn handle_chat_completion_endpoint(
 ) -> impl IntoResponse {
     match proxy.handle_chat_completion(req).await {
         Ok(response) => Json::<OpenAiResponse>(response).into_response(),
-        Err(e) => Json::<OpenAiResponse>(OpenAiResponse::error(&e.to_string())).into_response(),
+        Err(e) => {
+            tracing::error!("chat_completion failed: {}", e);
+            Json::<OpenAiResponse>(OpenAiResponse::error(&e.to_string())).into_response()
+        }
     }
 }
 
@@ -1047,106 +1028,6 @@ fn parse_i64_tokens(text: &str) -> Vec<i64> {
     text.split(|c: char| !c.is_ascii_digit() && c != '-')
         .filter(|part| !part.is_empty() && *part != "-")
         .filter_map(|part| part.parse::<i64>().ok())
-        .collect()
-}
-
-fn normalize_for_lookup(value: &str) -> String {
-    value
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn build_studied_qa_index(document_paths: &[String]) -> Vec<StudiedQaRow> {
-    let mut rows = Vec::new();
-    for doc_path in document_paths {
-        let path = Path::new(doc_path);
-        if !path.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(file) = File::open(entry.path()) else {
-                continue;
-            };
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    continue;
-                };
-                let user = value.get("user").and_then(|v| v.as_str()).unwrap_or("");
-                let assistant = value.get("assistant").and_then(|v| v.as_str()).unwrap_or("");
-                if user.is_empty() || assistant.is_empty() {
-                    continue;
-                }
-                rows.push(StudiedQaRow {
-                    question_normalized: normalize_for_lookup(user),
-                    answer: assistant.trim().to_string(),
-                });
-            }
-        }
-    }
-    rows
-}
-
-fn rank_studied_qa_answer(raw_query: &str, rows: &[StudiedQaRow]) -> Option<String> {
-    let normalized_query = normalize_for_lookup(raw_query);
-    if normalized_query.len() < 4 {
-        return None;
-    }
-    let query_tokens = tokenize_lookup(&normalized_query);
-    if query_tokens.is_empty() {
-        return None;
-    }
-
-    let mut best_score = 0.0_f32;
-    let mut best_answer: Option<&str> = None;
-    for row in rows {
-        let row_tokens = tokenize_lookup(&row.question_normalized);
-        if row_tokens.is_empty() {
-            continue;
-        }
-        let overlap = query_tokens.intersection(&row_tokens).count() as f32;
-        let denom = query_tokens.len().max(row_tokens.len()) as f32;
-        let mut score = overlap / denom;
-        if row.question_normalized == normalized_query {
-            score += 0.5;
-        } else if row.question_normalized.contains(&normalized_query)
-            || normalized_query.contains(&row.question_normalized)
-        {
-            score += 0.2;
-        }
-
-        if score > best_score {
-            best_score = score;
-            best_answer = Some(row.answer.as_str());
-        }
-    }
-
-    if best_score >= 0.55 {
-        best_answer.map(|answer| answer.to_string())
-    } else {
-        None
-    }
-}
-
-fn tokenize_lookup(input: &str) -> HashSet<String> {
-    input
-        .split_whitespace()
-        .filter(|token| token.len() > 1)
-        .map(ToString::to_string)
         .collect()
 }
 
