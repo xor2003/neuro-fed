@@ -138,6 +138,81 @@ impl<'a> RequestExecutor<'a> {
 }
 
 impl OpenAiProxy {
+    async fn try_execute_reasoning_task(
+        &self,
+        effective_reasoning_task: &Option<ReasoningTask>,
+        thought_trajectory: &mut Vec<u32>,
+        pc_thoughts_string: &mut String,
+        raw_confidence: &mut f32,
+        effective_expected_output: &mut Option<String>,
+    ) -> Result<Option<String>, ProxyError> {
+        let Some(task) = effective_reasoning_task.clone() else {
+            if self.proxy_config.require_thought_ops && thought_trajectory.is_empty() {
+                self.ui_set_status("error").await;
+                return Err(ProxyError::PCError(
+                    "Reasoning required but no ThoughtOp sequence produced".to_string(),
+                ));
+            }
+            return Ok(None);
+        };
+
+        if thought_trajectory.is_empty() {
+            let canonical_ops = recommended_ops(&task);
+            let dict = self.cognitive_dict.read().await;
+            *thought_trajectory = canonical_ops
+                .iter()
+                .filter_map(|op| dict.op_to_id.get(op).copied())
+                .collect();
+            *pc_thoughts_string = canonical_ops
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            if !pc_thoughts_string.is_empty() {
+                self.ui_push_step(format!("ThoughtOps: {}", pc_thoughts_string))
+                    .await;
+            }
+        }
+
+        let canonical_ops: Vec<_> = if thought_trajectory.is_empty() {
+            recommended_ops(&task)
+        } else {
+            let dict = self.cognitive_dict.read().await;
+            thought_trajectory
+                .iter()
+                .map(|id| dict.get_op(*id))
+                .collect()
+        };
+        let mut outcome = execute_plan(&task, &canonical_ops);
+        if render_output(&task, &outcome).is_none() {
+            // Ensure reasoning tasks remain executable even when inferred ThoughtOps are noisy.
+            let fallback_ops = recommended_ops(&task);
+            outcome = execute_plan(&task, &fallback_ops);
+            if render_output(&task, &outcome).is_some() {
+                *pc_thoughts_string = fallback_ops
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+            }
+        }
+        if let Some(answer) = render_output(&task, &outcome) {
+            *raw_confidence = raw_confidence.max(0.95);
+            *effective_expected_output = Some(answer.clone());
+            self.ui_push_step("Deterministic reasoning execution".to_string())
+                .await;
+            Ok(Some(answer))
+        } else if self.proxy_config.require_thought_ops {
+            self.ui_set_status("error").await;
+            Err(ProxyError::PCError(format!(
+                "Reasoning required but state execution failed: {}",
+                outcome.errors.join(" | ")
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn prepare_execution_context(
         &self,
         req: &OpenAiRequest,
@@ -638,66 +713,18 @@ impl OpenAiProxy {
             tracing::info!("Injected assistant guidance into prompt");
         }
 
-        if let Some(task) = effective_reasoning_task.clone() {
-            if thought_trajectory.is_empty() {
-                let canonical_ops = recommended_ops(&task);
-                let dict = self.cognitive_dict.read().await;
-                thought_trajectory = canonical_ops
-                    .iter()
-                    .filter_map(|op| dict.op_to_id.get(op).copied())
-                    .collect();
-                pc_thoughts_string = canonical_ops
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                if !pc_thoughts_string.is_empty() {
-                    self.ui_push_step(format!("ThoughtOps: {}", pc_thoughts_string))
-                        .await;
-                }
-            }
-
-            let canonical_ops: Vec<_> = if thought_trajectory.is_empty() {
-                recommended_ops(&task)
-            } else {
-                let dict = self.cognitive_dict.read().await;
-                thought_trajectory
-                    .iter()
-                    .map(|id| dict.get_op(*id))
-                    .collect()
-            };
-            let mut outcome = execute_plan(&task, &canonical_ops);
-            if render_output(&task, &outcome).is_none() {
-                // Ensure reasoning tasks remain executable even when inferred ThoughtOps are noisy.
-                let fallback_ops = recommended_ops(&task);
-                outcome = execute_plan(&task, &fallback_ops);
-                if render_output(&task, &outcome).is_some() {
-                    pc_thoughts_string = fallback_ops
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" -> ");
-                }
-            }
-            if let Some(answer) = render_output(&task, &outcome) {
-                final_text = answer.clone();
-                last_source = "reasoning_state";
-                raw_confidence = raw_confidence.max(0.95);
-                effective_expected_output = Some(answer);
-                self.ui_push_step("Deterministic reasoning execution".to_string())
-                    .await;
-            } else if self.proxy_config.require_thought_ops {
-                self.ui_set_status("error").await;
-                return Err(ProxyError::PCError(format!(
-                    "Reasoning required but state execution failed: {}",
-                    outcome.errors.join(" | ")
-                )));
-            }
-        } else if self.proxy_config.require_thought_ops && thought_trajectory.is_empty() {
-            self.ui_set_status("error").await;
-            return Err(ProxyError::PCError(
-                "Reasoning required but no ThoughtOp sequence produced".to_string(),
-            ));
+        if let Some(answer) = self
+            .try_execute_reasoning_task(
+                &effective_reasoning_task,
+                &mut thought_trajectory,
+                &mut pc_thoughts_string,
+                &mut raw_confidence,
+                &mut effective_expected_output,
+            )
+            .await?
+        {
+            final_text = answer;
+            last_source = "reasoning_state";
         }
 
         // Step 2: Remote LLM attempt
