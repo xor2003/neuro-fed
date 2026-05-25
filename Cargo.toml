@@ -55,7 +55,7 @@ uuid = { version = "1.22", features = ["v4"] }
 log = "0.4"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
-walkdir = "2.2.5" # Fast directory traversal for bootstrap
+walkdir = "2.2" # Fast directory traversal for bootstrap
 tempfile = "3.27"
 libc = "0.2"
 
@@ -119,7 +119,8 @@ axum-server = "0.8"
 # Optional for web UI (Phase 3)
 
 tauri = { version = "2.10", optional = true, features = ["tray-icon", "image-png"] }
-thread-priority = "3.0.0"
+thread-priority = "3.0"
+metal = { version = "0.29", optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2.5" }
@@ -127,13 +128,16 @@ tauri-build = { version = "2.5" }
 [dev-dependencies]
 tempfile = "3.27"
 
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }
+
 [features]
 default = []
 privacy = []
 federation = ["bitcoin", "lightning"]
 virality = []
 web-ui = ["tauri"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = ["dep:metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
 vulkan = []

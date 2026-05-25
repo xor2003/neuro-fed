@@ -29,6 +29,7 @@ use neuro_fed_node::{
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::VecDeque;
 use std::env;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,16 @@ use thread_priority::*; // <--- NEW IMPORT
 use tokio::sync::mpsc::channel;
 use tokio::sync::{RwLock, mpsc};
 use walkdir::WalkDir;
+
+#[cfg(feature = "metal")]
+fn metal_devices_available() -> bool {
+    metal::Device::system_default().is_some() || !metal::Device::all().is_empty()
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_devices_available() -> bool {
+    false
+}
 
 /// Динамический выбор устройства на основе конфигурации
 fn select_device(config: &NodeConfig) -> Device {
@@ -55,18 +66,23 @@ fn select_device(config: &NodeConfig) -> Device {
         }
 
         // 3. Try Apple Silicon (Metal)
-        if metal_is_available() {
-            match Device::new_metal(0) {
-                Ok(dev) => return dev,
-                Err(err) => tracing::warn!(
+        if metal_is_available() && metal_devices_available() {
+            match catch_unwind(AssertUnwindSafe(|| Device::new_metal(0))) {
+                Ok(Ok(dev)) => return dev,
+                Ok(Err(err)) => tracing::warn!(
                     "Metal support compiled in, but device creation failed: {}",
                     err
                 ),
+                Err(_) => tracing::warn!(
+                    "Metal backend panicked during device creation. Falling back to CPU."
+                ),
             }
-        } else {
+        } else if !metal_is_available() {
             tracing::warn!(
                 "Metal support is not compiled into this binary. Rebuild with `cargo build --release --features metal`."
             );
+        } else {
+            tracing::warn!("Metal runtime is present but no Metal devices were discovered.");
         }
 
         tracing::warn!(
@@ -229,7 +245,10 @@ async fn main() -> Result<()> {
     tracing::info!("Using device for PC tensors: {:?}", device);
 
     // 3. Инициализация основных AI-компонентов с tokio::sync::RwLock
-    let ml_engine = Arc::new(RwLock::new(MLEngine::new(&config.model_path, device_type)?));
+    let ml_engine = Arc::new(RwLock::new(MLEngine::new_on_device(
+        &config.model_path,
+        device.clone(),
+    )?));
     let embedding_dim = ml_engine.read().await.embedding_dim();
 
     let mut pc_config = config.pc_config.clone();

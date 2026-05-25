@@ -8,6 +8,7 @@ use ahash::AHashMap;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use sha2::{Digest, Sha256};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
@@ -25,6 +26,34 @@ pub struct MLEngine {
 }
 
 impl MLEngine {
+    #[cfg(feature = "metal")]
+    fn metal_devices_available() -> bool {
+        metal::Device::system_default().is_some() || !metal::Device::all().is_empty()
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn metal_devices_available() -> bool {
+        false
+    }
+
+    fn try_metal_device() -> Result<Device, MLError> {
+        if !Self::metal_devices_available() {
+            return Err(MLError::ModelLoadError(
+                "No Metal devices were discovered".to_string(),
+            ));
+        }
+        match catch_unwind(AssertUnwindSafe(|| Device::new_metal(0))) {
+            Ok(Ok(dev)) => Ok(dev),
+            Ok(Err(e)) => Err(MLError::ModelLoadError(format!(
+                "Failed to create Metal device: {}",
+                e
+            ))),
+            Err(_) => Err(MLError::ModelLoadError(
+                "Metal backend panicked during device creation".to_string(),
+            )),
+        }
+    }
+
     /// Load the Motor Cortex (Eyes and Mouth) from a GGUF file
     pub fn new(model_path: &str, _device_type: DeviceType) -> Result<Self, MLError> {
         // Default tokenizer path: tokenizer.json in same directory as model
@@ -36,6 +65,17 @@ impl MLEngine {
             .to_string();
 
         Self::new_with_tokenizer(model_path, &tokenizer_path, _device_type)
+    }
+
+    pub fn new_on_device(model_path: &str, device: Device) -> Result<Self, MLError> {
+        let tokenizer_path = Path::new(model_path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("tokenizer.json")
+            .to_string_lossy()
+            .to_string();
+
+        Self::new_with_tokenizer_on_device(model_path, &tokenizer_path, device)
     }
 
     /// Create an ML engine using a ModelManager to handle model selection and downloading
@@ -88,7 +128,14 @@ impl MLEngine {
         device_type: DeviceType,
     ) -> Result<Self, MLError> {
         let device = Self::resolve_device(&device_type)?;
+        Self::new_with_tokenizer_on_device(model_path, tokenizer_path, device)
+    }
 
+    pub fn new_with_tokenizer_on_device(
+        model_path: &str,
+        tokenizer_path: &str,
+        device: Device,
+    ) -> Result<Self, MLError> {
         // 1. Load Tokenizer from specified path
         let tokenizer = if Path::new(tokenizer_path).exists() {
             Tokenizer::from_file(tokenizer_path).map_err(|e| {
@@ -200,16 +247,14 @@ impl MLEngine {
             "cuda" => Device::new_cuda(0).map_err(|e| {
                 MLError::ModelLoadError(format!("Failed to create CUDA device: {}", e))
             }),
-            "metal" => Device::new_metal(0).map_err(|e| {
-                MLError::ModelLoadError(format!("Failed to create Metal device: {}", e))
-            }),
+            "metal" => Self::try_metal_device(),
             "cpu" => Ok(Device::Cpu),
             "auto" => {
                 if device_type.supported {
                     if let Ok(dev) = Device::new_cuda(0) {
                         return Ok(dev);
                     }
-                    if let Ok(dev) = Device::new_metal(0) {
+                    if let Ok(dev) = Self::try_metal_device() {
                         return Ok(dev);
                     }
                 }
