@@ -360,6 +360,50 @@ fn parse_detail_log(path: &PathBuf) -> Result<Vec<LearningRecord>> {
     Ok(results)
 }
 
+fn parse_synthetic_output(raw: &str) -> Vec<LearningRecord> {
+    let mut results = Vec::new();
+    for line in raw.lines() {
+        if !line.contains("Epoch ") || !line.contains("Loss = ") {
+            continue;
+        }
+        let Some(epoch_part) = line.split("Epoch ").nth(1) else {
+            continue;
+        };
+        let Some(epoch_str) = epoch_part.split(':').next() else {
+            continue;
+        };
+        let epoch = epoch_str
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if epoch.is_empty() {
+            continue;
+        }
+        let Some(loss_part) = line.split("Loss = ").nth(1) else {
+            continue;
+        };
+        let Some(loss_raw) = loss_part.split(',').next() else {
+            continue;
+        };
+        let loss = loss_raw.trim();
+        if loss.is_empty() {
+            continue;
+        }
+        results.push(LearningRecord {
+            task_id: format!("SyntheticEpoch:{epoch}"),
+            intent: "BootstrapSynthetic".to_string(),
+            loss: loss.to_string(),
+            trajectory: None,
+            structured_section_score: 0,
+            structured_quality_score: 0,
+            evidence_point_count: 0,
+            verification_command_count: 0,
+        });
+    }
+    results
+}
+
 fn export_csv(records: &[LearningRecord], output: &PathBuf) -> Result<()> {
     let mut wtr = csv::Writer::from_path(output)?;
     wtr.write_record(&[
@@ -1321,6 +1365,7 @@ mod tests {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let mut run_output: Option<String> = None;
 
     if args.reasoning_check {
         run_reasoning_checks(&args.reasoning_output)?;
@@ -1365,18 +1410,29 @@ fn main() -> Result<()> {
             "limited",
         ]);
         // For now we just run existing binary; in future replace with targeted logic.
-        let status = cmd.status().context("launching neuro-fed-node")?;
-        if !status.success() {
+        let output = cmd.output().context("launching neuro-fed-node")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        fs::write("output.log", &combined).context("writing output.log")?;
+        run_output = Some(combined);
+        if !output.status.success() {
             anyhow::bail!("learning run failed")
         }
     }
 
     let log_path = PathBuf::from("detail.log");
-    if !log_path.exists() {
+    let records = if log_path.exists() {
+        parse_detail_log(&log_path)?
+    } else if let Some(raw) = run_output.as_deref() {
+        let fallback = parse_synthetic_output(raw);
+        if fallback.is_empty() {
+            anyhow::bail!("detail.log not found and synthetic fallback parsing produced no rows")
+        }
+        fallback
+    } else {
         anyhow::bail!("detail.log not found; run learning first")
-    }
-
-    let records = parse_detail_log(&log_path)?;
+    };
     export_csv(&records, &args.output)?;
     println!(
         "Exported {} rows to {}",
