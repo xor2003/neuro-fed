@@ -3172,4 +3172,69 @@ mod reasoning_consistency_tests {
         );
         assert_eq!(last.expected_output.as_deref(), Some("391"));
     }
+
+    #[tokio::test]
+    async fn test_proxy_code_task_uses_single_pass_executor_contract() {
+        let mut config = NodeConfig::load_or_default();
+        config.proxy_config.pc_learning_enabled = false;
+        config.proxy_config.require_thought_ops = true;
+        let device = Device::Cpu;
+        let engine = Arc::new(RwLock::new(MLEngine::mock().unwrap()));
+        let embedding_dim = engine.read().await.embedding_dim();
+        let dict = Arc::new(RwLock::new(CognitiveDictionary::default()));
+        let pc_hierarchy = Arc::new(RwLock::new(
+            PredictiveCoding::new(config.pc_config.clone()).unwrap(),
+        ));
+        let dict_len = dict.read().await.len();
+        let vocab_capacity = config.pc_config.thought_vocab_capacity.max(dict_len);
+        let thought_decoder = Arc::new(RwLock::new(
+            ThoughtDecoder::new(512, vocab_capacity, &device).unwrap(),
+        ));
+        let study_state = Arc::new(RwLock::new(StudyState::default()));
+        let episodic_memory = Arc::new(RwLock::new(VecDeque::new()));
+        let calibration = Arc::new(RwLock::new(CalibrationStore::default()));
+
+        let proxy = OpenAiProxy::new(
+            config,
+            ProxyConfig::default(),
+            engine,
+            pc_hierarchy,
+            embedding_dim,
+            thought_decoder,
+            dict,
+            study_state,
+            episodic_memory,
+            calibration,
+            None,
+            None,
+        );
+
+        let response = proxy
+            .handle_chat_completion(OpenAiRequest {
+                model: "neurofed-response".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("fix parser bug in src/openai_proxy/mod.rs"),
+                    name: None,
+                }],
+                ..OpenAiRequest::default()
+            })
+            .await
+            .expect("code-task request should succeed");
+
+        let content = response.choices[0]
+            .message
+            .content
+            .as_str()
+            .expect("assistant response should be a string");
+        assert!(content.contains("Goal:"));
+        assert!(content.contains("Plan:"));
+        assert!(content.contains("Implementation:"));
+        assert!(content.contains("Verification:"));
+        assert!(content.contains("Risks:"));
+        assert_eq!(
+            response.neurofed_source.as_deref(),
+            Some("code_executor_single_pass")
+        );
+    }
 }
