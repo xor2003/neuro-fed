@@ -79,6 +79,14 @@ struct PlannedRequest {
     req: OpenAiRequest,
 }
 
+struct ExecutionContext {
+    state: StructuredState,
+    related_investigation_notes: Vec<InvestigationNote>,
+    related_workflow_notes: Vec<WorkflowMemoryNote>,
+    estimated_prompt_tokens: usize,
+    start_time: Instant,
+}
+
 impl<'a> RequestExecutor<'a> {
     fn new(proxy: &'a OpenAiProxy) -> Self {
         Self { proxy }
@@ -130,6 +138,62 @@ impl<'a> RequestExecutor<'a> {
 }
 
 impl OpenAiProxy {
+    async fn prepare_execution_context(
+        &self,
+        req: &OpenAiRequest,
+    ) -> Result<ExecutionContext, ProxyError> {
+        let estimated_prompt_tokens = estimate_tokens_from_messages(&req.messages);
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_requests += 1;
+            metrics.status_message = "Answering...".to_string();
+        }
+        self.ui_reset("Answering...").await;
+        let state = self.extract_structured_state(req).await;
+        let related_investigation_notes =
+            if matches!(state.intent, AssistantIntent::Investigation) {
+                let notes = self.retrieve_investigation_notes(&state.raw_query).await;
+                if !notes.is_empty() {
+                    self.ui_push_step(format!("Investigation memory hits: {}", notes.len()))
+                        .await;
+                }
+                notes
+            } else {
+                Vec::new()
+            };
+        let related_workflow_notes = if matches!(
+            state.intent,
+            AssistantIntent::CodeTask | AssistantIntent::TextTask
+        ) {
+            let notes = self
+                .retrieve_workflow_memory_notes(&state.intent, &state.raw_query)
+                .await;
+            if !notes.is_empty() {
+                self.ui_push_step(format!("Workflow memory hits: {}", notes.len()))
+                    .await;
+            }
+            notes
+        } else {
+            Vec::new()
+        };
+        self.ui_set_intent(&state.intent).await;
+        self.ui_set_memory_hits(
+            related_investigation_notes.len(),
+            related_workflow_notes.len(),
+        )
+        .await;
+        self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
+            .await;
+        self.ui_push_step("PC reasoning: embed + infer").await;
+        Ok(ExecutionContext {
+            state,
+            related_investigation_notes,
+            related_workflow_notes,
+            estimated_prompt_tokens,
+            start_time: Instant::now(),
+        })
+    }
+
     pub async fn load_investigation_notes(&self) -> Result<(), ProxyError> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
@@ -400,50 +464,12 @@ impl OpenAiProxy {
         req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
         let mut req = req;
-        let estimated_prompt_tokens = estimate_tokens_from_messages(&req.messages);
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_requests += 1;
-            metrics.status_message = "Answering...".to_string();
-        }
-        self.ui_reset("Answering...").await;
-        let state = self.extract_structured_state(&req).await;
-        let related_investigation_notes = if matches!(state.intent, AssistantIntent::Investigation)
-        {
-            let notes = self.retrieve_investigation_notes(&state.raw_query).await;
-            if !notes.is_empty() {
-                self.ui_push_step(format!("Investigation memory hits: {}", notes.len()))
-                    .await;
-            }
-            notes
-        } else {
-            Vec::new()
-        };
-        let related_workflow_notes = if matches!(
-            state.intent,
-            AssistantIntent::CodeTask | AssistantIntent::TextTask
-        ) {
-            let notes = self
-                .retrieve_workflow_memory_notes(&state.intent, &state.raw_query)
-                .await;
-            if !notes.is_empty() {
-                self.ui_push_step(format!("Workflow memory hits: {}", notes.len()))
-                    .await;
-            }
-            notes
-        } else {
-            Vec::new()
-        };
-        self.ui_set_intent(&state.intent).await;
-        self.ui_set_memory_hits(
-            related_investigation_notes.len(),
-            related_workflow_notes.len(),
-        )
-        .await;
-        self.ui_push_step(format!("Intent: {}", intent_label(&state.intent)))
-            .await;
-        self.ui_push_step("PC reasoning: embed + infer").await;
-        let start_time = Instant::now();
+        let execution_context = self.prepare_execution_context(&req).await?;
+        let state = execution_context.state;
+        let related_investigation_notes = execution_context.related_investigation_notes;
+        let related_workflow_notes = execution_context.related_workflow_notes;
+        let estimated_prompt_tokens = execution_context.estimated_prompt_tokens;
+        let start_time = execution_context.start_time;
         let mut final_text = String::new();
         let mut thought_trajectory: Vec<u32> = Vec::new();
         let mut sequence_tensors_vec = Vec::new();
