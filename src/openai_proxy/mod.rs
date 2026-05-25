@@ -79,6 +79,12 @@ struct PlannedRequest {
     req: OpenAiRequest,
 }
 
+struct CodeExecutionContract {
+    touched_area_summary: String,
+    verification_command: String,
+    residual_risk_focus: String,
+}
+
 struct ExecutionContext {
     state: StructuredState,
     related_investigation_notes: Vec<InvestigationNote>,
@@ -133,17 +139,33 @@ impl<'a> RequestExecutor<'a> {
         &self,
         mut req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
+        let raw_query = req
+            .messages
+            .last()
+            .map(extract_message_text)
+            .unwrap_or_default();
+        let contract = build_code_execution_contract(&raw_query);
+
         // Dedicated seam for the forthcoming code-task executor loop.
         self.proxy
             .ui_push_step("Code executor path".to_string())
+            .await;
+        self.proxy
+            .ui_push_step(format!(
+                "Verification command selected: {}",
+                contract.verification_command
+            ))
             .await;
         req.messages.insert(
             0,
             Message {
                 role: "system".to_string(),
-                content: serde_json::json!(
-                    "For code tasks, respond with explicit sections: Goal, Plan, Implementation, Verification, Risks."
-                ),
+                content: serde_json::json!(format!(
+                    "For code tasks, respond with explicit sections: Goal, Plan, Implementation, Verification, Risks.\nTouched area summary: {}\nVerification command to run (narrowest first): {}\nResidual risk focus: {}",
+                    contract.touched_area_summary,
+                    contract.verification_command,
+                    contract.residual_risk_focus
+                )),
                 name: None,
             },
         );
@@ -166,6 +188,60 @@ impl<'a> RequestExecutor<'a> {
             ));
         }
         Ok(response)
+    }
+}
+
+fn build_code_execution_contract(raw_query: &str) -> CodeExecutionContract {
+    let lower = raw_query.to_lowercase();
+    let touched_area_summary = extract_touched_area_summary(raw_query);
+    let verification_command = select_verification_command(&lower);
+    let residual_risk_focus = if lower.contains("parser") || lower.contains("token") {
+        "edge-case parsing and malformed input handling".to_string()
+    } else if lower.contains("async") || lower.contains("concurrency") || lower.contains("lock") {
+        "lock contention, race conditions, and cancellation behavior".to_string()
+    } else if lower.contains("config") || lower.contains("startup") {
+        "startup regressions and configuration compatibility".to_string()
+    } else {
+        "behavior regressions outside touched files".to_string()
+    };
+
+    CodeExecutionContract {
+        touched_area_summary,
+        verification_command,
+        residual_risk_focus,
+    }
+}
+
+fn extract_touched_area_summary(raw_query: &str) -> String {
+    let mut paths = Vec::new();
+    for token in raw_query.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| {
+            c == ',' || c == ';' || c == ')' || c == '(' || c == '"' || c == '\''
+        });
+        if cleaned.contains('/')
+            || cleaned.ends_with(".rs")
+            || cleaned.ends_with(".toml")
+            || cleaned.ends_with(".md")
+        {
+            paths.push(cleaned.to_string());
+        }
+    }
+    if paths.is_empty() {
+        "not explicitly specified; infer from failing behavior and nearest owner module".to_string()
+    } else {
+        format!("focus on {}", paths.join(", "))
+    }
+}
+
+fn select_verification_command(lower_query: &str) -> String {
+    if lower_query.contains("integration") {
+        "cargo test --test integration_tests".to_string()
+    } else if lower_query.contains("clippy") || lower_query.contains("lint") {
+        "cargo clippy --all-targets -- -D warnings".to_string()
+    } else if lower_query.contains("build") {
+        "cargo build --release --features metal".to_string()
+    } else {
+        "cargo test --lib".to_string()
     }
 }
 
