@@ -138,6 +138,195 @@ impl<'a> RequestExecutor<'a> {
 }
 
 impl OpenAiProxy {
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_response(
+        &self,
+        state: &StructuredState,
+        mut final_text: String,
+        related_investigation_notes: &[InvestigationNote],
+        related_workflow_notes: &[WorkflowMemoryNote],
+        sequence_tensors_vec: Vec<Vec<f32>>,
+        initial_novelty: f32,
+        raw_confidence: f32,
+        thought_trajectory: Vec<u32>,
+        mut effective_reasoning_task: Option<ReasoningTask>,
+        mut effective_expected_output: Option<String>,
+        estimated_prompt_tokens: usize,
+        last_source: &str,
+        start_time: Instant,
+    ) -> Result<OpenAiResponse, ProxyError> {
+        final_text = structure_assistant_output(
+            state,
+            &final_text,
+            related_investigation_notes,
+            related_workflow_notes,
+        );
+
+        let _verification_result: Result<String, String> = Ok("Verification skipped".to_string());
+        let success = !final_text.starts_with("No response");
+
+        if success && self.config.proxy_config.pc_learning_enabled {
+            let learn_text = format!("User: {}\nAssistant: {}", state.raw_query, final_text);
+            match self
+                .local_engine
+                .read()
+                .await
+                .process_text_sequence(&learn_text)
+                .await
+            {
+                Ok(seq) => {
+                    match self.pc_hierarchy.try_write() {
+                        Ok(mut pc) => match pc.learn_sequence(&seq, None) {
+                            Ok(_) => {
+                                let mut metrics = self.metrics.write().await;
+                                metrics.pc_learning_calls += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!("PC learning failed: {}", e);
+                            }
+                        },
+                        Err(_) => {
+                            tracing::debug!(
+                                "Skipping immediate PC learning update because study/inference lock is busy."
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("PC learning embedding failed: {}", e);
+                }
+            }
+        }
+
+        self.calibration
+            .write()
+            .await
+            .record_outcome(raw_confidence, success);
+
+        if success && matches!(state.intent, AssistantIntent::Investigation) {
+            if let Err(err) = self.persist_investigation_note(state, &final_text).await {
+                tracing::warn!("Failed to persist investigation note: {}", err);
+            }
+        }
+        if success
+            && matches!(
+                state.intent,
+                AssistantIntent::CodeTask | AssistantIntent::TextTask
+            )
+        {
+            if let Err(err) = self.persist_workflow_memory_note(state, &final_text).await {
+                tracing::warn!("Failed to persist workflow memory note: {}", err);
+            }
+        }
+
+        self.episodic_memory.write().await.push_back(Episode {
+            raw_query: state.raw_query.clone(),
+            query_sequence: sequence_tensors_vec,
+            novelty: initial_novelty,
+            confidence: raw_confidence,
+            generated_code: final_text.clone(),
+            thought_sequence: thought_trajectory,
+            success,
+            assistant_intent: Some(state.intent.clone()),
+            goal: Some(state.goal.clone()),
+            plan_steps: state.plan_steps.clone(),
+            deliverables: state.deliverables.clone(),
+            verification_checks: state.verification_checks.clone(),
+            constraints: state.constraints.clone(),
+            assumptions: state.assumptions.clone(),
+            tests: if state.tests.trim().is_empty() {
+                None
+            } else {
+                Some(state.tests.clone())
+            },
+            reasoning_task: effective_reasoning_task.take(),
+            expected_output: effective_expected_output.take(),
+        });
+
+        // 🔴 FIX: PREVENT OOM AND ENFORCE SLEEP CYCLE WHEN MEMORY IS FULL
+        if self.episodic_memory.read().await.len() >= EPISODIC_MEMORY_CAPACITY {
+            tracing::warn!(
+                "🧠 Episodic memory full ({} entries). Forcing sleep cycle.",
+                EPISODIC_MEMORY_CAPACITY
+            );
+            let pc_clone = self.pc_hierarchy.clone();
+            let decoder_clone = self.thought_decoder.clone();
+            let dict_clone = self.cognitive_dict.clone();
+            let mem_clone = self.episodic_memory.clone();
+            let state_clone = self.study_state.clone();
+
+            tokio::spawn(async move {
+                {
+                    let mut state = state_clone.write().await;
+                    state.is_studying = true;
+                    state.current_file = "Forced Sleep Phase (Memory Full)".to_string();
+                    state.progress_percent = 0.0;
+                }
+
+                let sleep_mgr = SleepManager::new(pc_clone, decoder_clone, dict_clone, mem_clone);
+                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
+                    tracing::error!("Forced sleep cycle failed: {}", e);
+                }
+
+                let mut state = state_clone.write().await;
+                state.is_studying = false;
+                state.current_file = "".to_string();
+                state.progress_percent = 100.0;
+            });
+        }
+
+        let estimated_completion_tokens = estimate_tokens_from_text(&final_text);
+        let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
+        let actual_cost = if last_source == "remote_llm" {
+            (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
+        } else {
+            0.0
+        };
+        let _saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
+            - actual_cost)
+            .max(0.0);
+        self.ui_set_source(last_source).await;
+        self.ui_add_saved(_saved).await;
+
+        // 🔴 FIX 3: Reset UI Status
+        {
+            let mut state = self.study_state.write().await;
+            state.is_studying = false;
+            state.progress_percent = 100.0;
+        }
+
+        let response = OpenAiResponse {
+            id: format!("agent-{}", Utc::now().timestamp()),
+            object: "chat.completion".to_string(),
+            created: Utc::now().timestamp(),
+            model: "neurofed-response".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!(final_text),
+                    name: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Usage::default(),
+            neurofed_source: Some(last_source.to_string()),
+        };
+
+        self.update_metrics_success(start_time.elapsed(), &response)
+            .await;
+
+        {
+            let mut metrics = self.metrics.write().await;
+            if metrics.status_message != "Idle" {
+                metrics.status_message = "Idle".to_string();
+            }
+        }
+        self.ui_set_status("Idle").await;
+        Ok(response)
+    }
+
     async fn resolve_response_text(
         &self,
         req: &OpenAiRequest,
@@ -631,7 +820,7 @@ impl OpenAiProxy {
         let mut pc_error: Option<String> = None;
         let mut pc_thoughts_string = String::new();
         let mut pc_surface_belief: Option<Tensor> = None;
-        let mut effective_reasoning_task = state.reasoning_task.clone();
+        let effective_reasoning_task = state.reasoning_task.clone();
         let mut effective_expected_output = state.expected_output.clone();
 
         tracing::info!("🤖 STARTING COGNITIVE STEP: Attempting PC Inference first...");
@@ -824,176 +1013,22 @@ impl OpenAiProxy {
             "local_pc"
         };
 
-        final_text = structure_assistant_output(
+        self.finalize_response(
             &state,
-            &final_text,
+            final_text,
             &related_investigation_notes,
             &related_workflow_notes,
-        );
-
-        let _verification_result: Result<String, String> = Ok("Verification skipped".to_string());
-        let success = !final_text.starts_with("No response");
-
-        if success && self.config.proxy_config.pc_learning_enabled {
-            let learn_text = format!("User: {}\nAssistant: {}", state.raw_query, final_text);
-            match self
-                .local_engine
-                .read()
-                .await
-                .process_text_sequence(&learn_text)
-                .await
-            {
-                Ok(seq) => {
-                    match self.pc_hierarchy.try_write() {
-                        Ok(mut pc) => match pc.learn_sequence(&seq, None) {
-                            Ok(_) => {
-                                let mut metrics = self.metrics.write().await;
-                                metrics.pc_learning_calls += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!("PC learning failed: {}", e);
-                            }
-                        },
-                        Err(_) => {
-                            tracing::debug!(
-                                "Skipping immediate PC learning update because study/inference lock is busy."
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("PC learning embedding failed: {}", e);
-                }
-            }
-        }
-
-        self.calibration
-            .write()
-            .await
-            .record_outcome(raw_confidence, success);
-
-        if success && matches!(state.intent, AssistantIntent::Investigation) {
-            if let Err(err) = self.persist_investigation_note(&state, &final_text).await {
-                tracing::warn!("Failed to persist investigation note: {}", err);
-            }
-        }
-        if success
-            && matches!(
-                state.intent,
-                AssistantIntent::CodeTask | AssistantIntent::TextTask
-            )
-        {
-            if let Err(err) = self.persist_workflow_memory_note(&state, &final_text).await {
-                tracing::warn!("Failed to persist workflow memory note: {}", err);
-            }
-        }
-
-        self.episodic_memory.write().await.push_back(Episode {
-            raw_query: state.raw_query.clone(),
-            query_sequence: sequence_tensors_vec,
-            novelty: initial_novelty,
-            confidence: raw_confidence,
-            generated_code: final_text.clone(),
-            thought_sequence: thought_trajectory,
-            success,
-            assistant_intent: Some(state.intent.clone()),
-            goal: Some(state.goal.clone()),
-            plan_steps: state.plan_steps.clone(),
-            deliverables: state.deliverables.clone(),
-            verification_checks: state.verification_checks.clone(),
-            constraints: state.constraints.clone(),
-            assumptions: state.assumptions.clone(),
-            tests: if state.tests.trim().is_empty() {
-                None
-            } else {
-                Some(state.tests.clone())
-            },
-            reasoning_task: effective_reasoning_task.take(),
-            expected_output: effective_expected_output.take(),
-        });
-
-        // 🔴 FIX: PREVENT OOM AND ENFORCE SLEEP CYCLE WHEN MEMORY IS FULL
-        if self.episodic_memory.read().await.len() >= EPISODIC_MEMORY_CAPACITY {
-            tracing::warn!(
-                "🧠 Episodic memory full ({} entries). Forcing sleep cycle.",
-                EPISODIC_MEMORY_CAPACITY
-            );
-            let pc_clone = self.pc_hierarchy.clone();
-            let decoder_clone = self.thought_decoder.clone();
-            let dict_clone = self.cognitive_dict.clone();
-            let mem_clone = self.episodic_memory.clone();
-            let state_clone = self.study_state.clone();
-
-            tokio::spawn(async move {
-                {
-                    let mut state = state_clone.write().await;
-                    state.is_studying = true;
-                    state.current_file = "Forced Sleep Phase (Memory Full)".to_string();
-                    state.progress_percent = 0.0;
-                }
-
-                let sleep_mgr = SleepManager::new(pc_clone, decoder_clone, dict_clone, mem_clone);
-                if let Err(e) = sleep_mgr.process_sleep_cycle().await {
-                    tracing::error!("Forced sleep cycle failed: {}", e);
-                }
-
-                let mut state = state_clone.write().await;
-                state.is_studying = false;
-                state.current_file = "".to_string();
-                state.progress_percent = 100.0;
-            });
-        }
-
-        let estimated_completion_tokens = estimate_tokens_from_text(&final_text);
-        let total_tokens = estimated_prompt_tokens + estimated_completion_tokens;
-        let actual_cost = if last_source == "remote_llm" {
-            (total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
-        } else {
-            0.0
-        };
-        let _saved = ((total_tokens as f64 / 1000.0) * REMOTE_PRICE_PER_1K_TOKENS_USD
-            - actual_cost)
-            .max(0.0);
-        self.ui_set_source(last_source).await;
-        self.ui_add_saved(_saved).await;
-
-        // 🔴 FIX 3: Reset UI Status
-        {
-            let mut state = self.study_state.write().await;
-            state.is_studying = false;
-            state.progress_percent = 100.0;
-        }
-
-        let response = OpenAiResponse {
-            id: format!("agent-{}", Utc::now().timestamp()),
-            object: "chat.completion".to_string(),
-            created: Utc::now().timestamp(),
-            model: "neurofed-response".to_string(),
-            choices: vec![Choice {
-                index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!(final_text),
-                    name: None,
-                },
-                finish_reason: Some("stop".to_string()),
-                logprobs: None,
-            }],
-            usage: Usage::default(),
-            neurofed_source: Some(last_source.to_string()),
-        };
-
-        self.update_metrics_success(start_time.elapsed(), &response)
-            .await;
-
-        {
-            let mut metrics = self.metrics.write().await;
-            if metrics.status_message != "Idle" {
-                metrics.status_message = "Idle".to_string();
-            }
-        }
-        self.ui_set_status("Idle").await;
-        Ok(response)
+            sequence_tensors_vec,
+            initial_novelty,
+            raw_confidence,
+            thought_trajectory,
+            effective_reasoning_task,
+            effective_expected_output,
+            estimated_prompt_tokens,
+            last_source,
+            start_time,
+        )
+        .await
     }
 
     async fn extract_structured_state(&self, req: &OpenAiRequest) -> StructuredState {
