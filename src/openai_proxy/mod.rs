@@ -2479,6 +2479,37 @@ mod proxy_utility_tests {
     }
 
     #[test]
+    fn test_select_verification_command_prefers_narrow_checks() {
+        assert_eq!(
+            select_verification_command("run integration tests for proxy"),
+            "cargo test --test integration_tests"
+        );
+        assert_eq!(
+            select_verification_command("please lint this"),
+            "cargo clippy --all-targets -- -D warnings"
+        );
+        assert_eq!(
+            select_verification_command("just build release"),
+            "cargo build --release --features metal"
+        );
+        assert_eq!(
+            select_verification_command("fix parser bug"),
+            "cargo test --lib"
+        );
+    }
+
+    #[test]
+    fn test_extract_touched_area_summary_detects_paths() {
+        let query = "fix lock issue in src/openai_proxy/mod.rs and config.toml";
+        let summary = extract_touched_area_summary(query);
+        assert!(summary.contains("src/openai_proxy/mod.rs"));
+        assert!(summary.contains("config.toml"));
+
+        let generic = extract_touched_area_summary("fix startup race condition");
+        assert!(generic.contains("not explicitly specified"));
+    }
+
+    #[test]
     fn test_render_local_intent_response_for_code_task() {
         let state = StructuredState {
             intent: AssistantIntent::CodeTask,
