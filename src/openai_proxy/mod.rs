@@ -342,6 +342,11 @@ fn build_single_pass_code_executor_response(
     } else {
         "pending"
     };
+    let executor_artifact_path = if verification_executed {
+        "artifact://verification/stdout"
+    } else {
+        "pending"
+    };
     let verification_result = derive_code_executor_verification_result(&phase_outcomes);
     let executor_next_action = if verification_result == "passed" {
         "none"
@@ -377,7 +382,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         phase_trace,
@@ -389,6 +394,7 @@ fn build_single_pass_code_executor_response(
         executor_next_action,
         executor_blockers,
         contract.verification_command,
+        executor_artifact_path,
         contract.touched_area_summary,
         contract.verification_command,
         verification_exit_code,
@@ -2764,6 +2770,7 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_next_action=none"));
         assert!(response.contains("executor_blockers=none"));
         assert!(response.contains("executor_recommended_command=cargo test --lib"));
+        assert!(response.contains("executor_artifact_path=artifact://verification/stdout"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
         assert!(response.contains("Stop Condition:"));
@@ -2791,6 +2798,7 @@ mod proxy_utility_tests {
         assert!(response.contains(
             "executor_recommended_command=cargo clippy --all-targets -- -D warnings"
         ));
+        assert!(response.contains("executor_artifact_path=pending"));
     }
 
     #[test]
