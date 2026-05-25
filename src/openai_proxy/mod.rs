@@ -367,7 +367,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         phase_trace,
@@ -2736,6 +2736,7 @@ mod proxy_utility_tests {
         assert!(response.contains("Iteration 2/3 [completed]"));
         assert!(response.contains("Iteration 3/3 [pending]"));
         assert!(response.contains("executor_state=bounded_single_pass"));
+        assert!(response.contains("executor_contract_version=v1"));
         assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains(
             "Executor phase outcomes: plan=completed, execute=completed, verify=completed, done=completed"
