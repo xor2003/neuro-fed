@@ -327,6 +327,7 @@ fn build_single_pass_code_executor_response(
 ) -> String {
     let phase_trace = build_code_executor_phase_trace();
     let phase_outcomes = build_code_executor_phase_outcomes();
+    let verification_result = derive_code_executor_verification_result(&phase_outcomes);
     let phase_state = CodeExecutorPhaseState {
         phase: CodeExecutorPhase::Execute.as_str(),
         iteration: 1,
@@ -351,7 +352,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         phase_trace,
@@ -362,6 +363,7 @@ fn build_single_pass_code_executor_response(
         phase_state.remaining_iterations,
         contract.touched_area_summary,
         contract.verification_command,
+        verification_result,
         contract.residual_risk_focus,
         bounded_plan.stop_reason
     )
@@ -391,6 +393,14 @@ fn build_code_executor_phase_outcomes() -> String {
     .map(|(phase, status)| format!("{}={}", phase.as_str(), status))
     .collect::<Vec<_>>()
     .join(", ")
+}
+
+fn derive_code_executor_verification_result(phase_outcomes: &str) -> &'static str {
+    if phase_outcomes.contains("verify=completed") && phase_outcomes.contains("done=completed") {
+        "passed"
+    } else {
+        "pending"
+    }
 }
 
 fn build_bounded_code_executor_plan(contract: &CodeExecutionContract) -> CodeExecutorPlan {
@@ -2705,6 +2715,7 @@ mod proxy_utility_tests {
         assert!(response.contains(
             "Executor phase outcomes: plan=completed, execute=completed, verify=pending, done=pending"
         ));
+        assert!(response.contains("verification_result=pending"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
         assert!(response.contains("Remaining iteration budget: 0"));
@@ -2726,6 +2737,16 @@ mod proxy_utility_tests {
         assert_eq!(
             build_code_executor_phase_outcomes(),
             "plan=completed, execute=completed, verify=pending, done=pending"
+        );
+    }
+
+    #[test]
+    fn test_derive_code_executor_verification_result_pending() {
+        assert_eq!(
+            derive_code_executor_verification_result(
+                "plan=completed, execute=completed, verify=pending, done=pending"
+            ),
+            "pending"
         );
     }
 
