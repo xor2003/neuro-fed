@@ -71,6 +71,23 @@ pub struct OpenAiProxy {
     pub ui_state: Arc<RwLock<UiState>>,
 }
 
+struct RequestExecutor<'a> {
+    proxy: &'a OpenAiProxy,
+}
+
+impl<'a> RequestExecutor<'a> {
+    fn new(proxy: &'a OpenAiProxy) -> Self {
+        Self { proxy }
+    }
+
+    async fn run(&self, req: OpenAiRequest) -> Result<OpenAiResponse, ProxyError> {
+        // Phase 1 (plan): derive structured state and execution context.
+        // Phase 2 (execute): run PC/reasoning and model fallback chain.
+        // Phase 3 (verify/finalize): package response, metrics, and memory writes.
+        self.proxy.handle_chat_completion_impl(req).await
+    }
+}
+
 impl OpenAiProxy {
     pub async fn load_investigation_notes(&self) -> Result<(), ProxyError> {
         let Some(persistence) = &self.persistence else {
@@ -331,6 +348,13 @@ impl OpenAiProxy {
 
     /// Main handler with iterative reasoning, calibration, and verification
     pub async fn handle_chat_completion(
+        &self,
+        req: OpenAiRequest,
+    ) -> Result<OpenAiResponse, ProxyError> {
+        RequestExecutor::new(self).run(req).await
+    }
+
+    async fn handle_chat_completion_impl(
         &self,
         req: OpenAiRequest,
     ) -> Result<OpenAiResponse, ProxyError> {
