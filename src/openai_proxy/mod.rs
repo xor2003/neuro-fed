@@ -156,6 +156,33 @@ impl<'a> RequestExecutor<'a> {
                 contract.verification_command
             ))
             .await;
+        if self.proxy.config.proxy_config.require_thought_ops {
+            let single_pass = format!(
+                "Goal:\n{}\n\nPlan:\n- Inspect touched area.\n- Apply minimal coherent change.\n- Validate with the selected command.\n\nImplementation:\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- {}\n\nRisks:\n- {}",
+                raw_query,
+                contract.touched_area_summary,
+                contract.verification_command,
+                contract.residual_risk_focus
+            );
+            return Ok(OpenAiResponse {
+                id: format!("agent-{}", Utc::now().timestamp()),
+                object: "chat.completion".to_string(),
+                created: Utc::now().timestamp(),
+                model: "neurofed-response".to_string(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!(single_pass),
+                        name: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    logprobs: None,
+                }],
+                usage: Usage::default(),
+                neurofed_source: Some("code_executor_single_pass".to_string()),
+            });
+        }
         req.messages.insert(
             0,
             Message {
