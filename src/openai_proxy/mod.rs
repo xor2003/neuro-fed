@@ -349,6 +349,11 @@ fn build_single_pass_code_executor_response(
         "pending"
     };
     let verification_result = derive_code_executor_verification_result(&phase_outcomes);
+    let executor_transition = if verification_result == "passed" {
+        "verify->done"
+    } else {
+        "execute->verify"
+    };
     let executor_next_action = if verification_result == "passed" {
         "none"
     } else {
@@ -383,10 +388,11 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_cycle_id,
+        executor_transition,
         phase_trace,
         phase_outcomes,
         phase_state.phase,
@@ -2759,6 +2765,7 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_state=bounded_single_pass"));
         assert!(response.contains("executor_contract_version=v1"));
         assert!(response.contains("executor_cycle_id=cycle-1"));
+        assert!(response.contains("executor_transition=verify->done"));
         assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains(
             "Executor phase outcomes: plan=completed, execute=completed, verify=completed, done=completed"
@@ -2802,6 +2809,7 @@ mod proxy_utility_tests {
             "executor_recommended_command=cargo clippy --all-targets -- -D warnings"
         ));
         assert!(response.contains("executor_artifact_path=pending"));
+        assert!(response.contains("executor_transition=execute->verify"));
     }
 
     #[test]
