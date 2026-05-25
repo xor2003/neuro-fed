@@ -41,3 +41,6 @@ models/
 .venv/
 __pycache__/
 *.pyc
+
+# Local tool/cache artifacts
+.cache/

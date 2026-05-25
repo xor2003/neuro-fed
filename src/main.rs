@@ -828,6 +828,7 @@ async fn main() -> Result<()> {
             db_missing,
             has_weights,
         );
+        let has_document_paths = !config.bootstrap_config.document_paths.is_empty();
 
         if disable_http {
             if training_needed || !config.bootstrap_config.document_paths.is_empty() {
@@ -842,14 +843,14 @@ async fn main() -> Result<()> {
         }
 
         tokio::spawn(async move {
-            if training_needed {
-                tracing::info!("🚀 Running synthetic bootstrap training...");
-                if let Err(e) = bootstrap.run_synthetic_training().await {
-                    tracing::warn!("Bootstrap synthetic training failed: {}", e);
+            if training_needed || has_document_paths {
+                tracing::info!("🚀 Running full bootstrap training (documents + synthetic)...");
+                if let Err(e) = bootstrap.run_full_bootstrap().await {
+                    tracing::warn!("Bootstrap full training failed: {}", e);
                 }
             } else {
                 tracing::info!(
-                    "Synthetic bootstrap training skipped: brain already trained and force flag is off."
+                    "Bootstrap training skipped: brain already trained and no document paths configured."
                 );
             }
         });
@@ -874,36 +875,37 @@ async fn main() -> Result<()> {
 
     // Start persistent event-driven study system with notify watcher
     if !config.bootstrap_config.document_paths.is_empty() {
-        let watch_path = config.bootstrap_config.document_paths[0].clone();
-        let watch_path_for_log = watch_path.clone();
-        let persistence_clone = persistence.clone();
-        let ml_engine_clone = ml_engine.clone();
-        let thought_decoder_clone = thought_decoder.clone();
-        let cognitive_dict_clone = cognitive_dict.clone();
-        let pc_hierarchy_clone = pc_hierarchy.clone();
-        let bootstrap_config_clone = config.bootstrap_config.clone();
+        for watch_path in config.bootstrap_config.document_paths.clone() {
+            let watch_path_for_log = watch_path.clone();
+            let persistence_clone = persistence.clone();
+            let ml_engine_clone = ml_engine.clone();
+            let thought_decoder_clone = thought_decoder.clone();
+            let cognitive_dict_clone = cognitive_dict.clone();
+            let pc_hierarchy_clone = pc_hierarchy.clone();
+            let bootstrap_config_clone = config.bootstrap_config.clone();
 
-        let study_state_clone = study_state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = start_file_watcher(
-                watch_path,
-                persistence_clone,
-                ml_engine_clone,
-                thought_decoder_clone,
-                cognitive_dict_clone,
-                pc_hierarchy_clone,
-                bootstrap_config_clone,
-                study_state_clone,
-            )
-            .await
-            {
-                tracing::error!("File watcher failed: {}", e);
-            }
-        });
-        tracing::info!(
-            "📁 Started persistent event-driven study system watching: {}",
-            watch_path_for_log
-        );
+            let study_state_clone = study_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_file_watcher(
+                    watch_path,
+                    persistence_clone,
+                    ml_engine_clone,
+                    thought_decoder_clone,
+                    cognitive_dict_clone,
+                    pc_hierarchy_clone,
+                    bootstrap_config_clone,
+                    study_state_clone,
+                )
+                .await
+                {
+                    tracing::error!("File watcher failed: {}", e);
+                }
+            });
+            tracing::info!(
+                "📁 Started persistent event-driven study system watching: {}",
+                watch_path_for_log
+            );
+        }
     } else {
         tracing::info!("📁 No document paths configured for persistent study system");
     }

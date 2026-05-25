@@ -401,7 +401,7 @@ impl OpenAiProxy {
         let mut remote_error: Option<String> = None;
         let mut local_error: Option<String> = None;
         let mut pc_thoughts_string = String::new();
-        let mut pc_belief: Option<Tensor> = None;
+        let mut pc_surface_belief: Option<Tensor> = None;
         let mut effective_reasoning_task = state.reasoning_task.clone();
         let mut effective_expected_output = state.expected_output.clone();
 
@@ -431,10 +431,19 @@ impl OpenAiProxy {
                     let mut pc = self.pc_hierarchy.write().await;
                     match pc.infer_sequence(&query_seq, 5) {
                         Ok(stats) => {
-                            raw_confidence = stats.confidence_score;
+                            raw_confidence = if stats.confidence_score.is_finite() {
+                                stats.confidence_score
+                            } else {
+                                0.0
+                            };
                             initial_novelty = stats.novelty_score;
+                            let surface = pc
+                                .levels
+                                .first()
+                                .map(|level| level.beliefs.clone())
+                                .or_else(|| pc.levels.last().map(|level| level.beliefs.clone()));
                             match pc.get_top_belief() {
-                                Ok(belief) => Some(belief),
+                                Ok(belief) => Some((belief, surface)),
                                 Err(e) => {
                                     pc_error = Some(format!("Failed to get top belief: {}", e));
                                     None
@@ -448,10 +457,10 @@ impl OpenAiProxy {
                     }
                 };
 
-                if let Some(belief) = pc_result {
+                if let Some((belief, surface)) = pc_result {
                     let decoder = self.thought_decoder.read().await;
                     let dict = self.cognitive_dict.read().await;
-                    pc_belief = Some(belief.clone());
+                    pc_surface_belief = surface.or_else(|| Some(belief.clone()));
 
                     self.metrics_inc_thought_decoder().await;
                     let decode_result = if self.proxy_config.require_thought_ops {
@@ -625,7 +634,7 @@ impl OpenAiProxy {
         if final_text.trim().is_empty() {
             self.ui_push_step("Local LLM request".to_string()).await;
             match self
-                .forward_to_local(&state, &pc_thoughts_string, pc_belief.as_ref())
+                .forward_to_local(&state, &pc_thoughts_string, pc_surface_belief.as_ref())
                 .await
             {
                 Ok(resp) => {
@@ -679,14 +688,20 @@ impl OpenAiProxy {
                 .await
             {
                 Ok(seq) => {
-                    let mut pc = self.pc_hierarchy.write().await;
-                    match pc.learn_sequence(&seq, None) {
-                        Ok(_) => {
-                            let mut metrics = self.metrics.write().await;
-                            metrics.pc_learning_calls += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!("PC learning failed: {}", e);
+                    match self.pc_hierarchy.try_write() {
+                        Ok(mut pc) => match pc.learn_sequence(&seq, None) {
+                            Ok(_) => {
+                                let mut metrics = self.metrics.write().await;
+                                metrics.pc_learning_calls += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!("PC learning failed: {}", e);
+                            }
+                        },
+                        Err(_) => {
+                            tracing::debug!(
+                                "Skipping immediate PC learning update because study/inference lock is busy."
+                            );
                         }
                     }
                 }
@@ -1819,6 +1834,16 @@ fn render_local_intent_response(
     } else {
         format!("ThoughtOps: {}.", pc_summary)
     };
+    let useful_hint = {
+        let trimmed = decoded_hint.trim();
+        let has_alpha_num = trimmed.chars().any(|c| c.is_ascii_alphanumeric());
+        if has_alpha_num && trimmed.len() > 2 {
+            Some(trimmed)
+        } else {
+            None
+        }
+    };
+    let query_lower = state.raw_query.to_lowercase();
 
     match state.intent {
         AssistantIntent::Investigation => format!(
@@ -1915,10 +1940,20 @@ fn render_local_intent_response(
             "Reasoning fallback:\n- Goal: {}\n- Working local clue: {}\n{}\n{}",
             state.raw_query, decoded_hint, guidance_line, signal_line
         ),
-        AssistantIntent::Chat => format!(
-            "Chat fallback:\n- User request: {}\n- Working local clue: {}\n{}\n{}",
-            state.raw_query, decoded_hint, guidance_line, signal_line
-        ),
+        AssistantIntent::Chat => {
+            if query_lower.contains("predictive coding") {
+                "Predictive coding is a learning/inference approach where each layer predicts incoming signals and updates itself using the prediction error. A practical coding use case is anomaly detection: train the model to predict normal telemetry windows and flag large residual error spikes as anomalies."
+                    .to_string()
+            } else {
+                let hint_line = useful_hint
+                    .map(|hint| format!("Local clue: {}.\n", hint))
+                    .unwrap_or_default();
+                format!(
+                    "I can answer locally, but remote model fallback is unavailable without an API key.\n{}Based on your request: {}",
+                    hint_line, state.raw_query
+                )
+            }
+        }
     }
 }
 

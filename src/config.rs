@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use tracing::{info, warn};
+use walkdir::WalkDir;
 
 use crate::privacy_networks::PrivacyNetworkConfig;
 
@@ -311,21 +312,74 @@ impl From<config::ConfigError> for NodeError {
 }
 
 impl NodeConfig {
+    fn has_supported_study_files(path: &Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        if path.is_file() {
+            return path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| matches!(ext, "txt" | "md" | "jsonl" | "pdf" | "epub" | "parquet"))
+                .unwrap_or(false);
+        }
+        WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                if !entry.file_type().is_file() {
+                    return false;
+                }
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext, "txt" | "md" | "jsonl" | "pdf" | "epub" | "parquet"))
+                    .unwrap_or(false)
+            })
+    }
+
+    fn discover_project_study_paths() -> Vec<String> {
+        let candidates = ["study", "human-eval", "data", "docs", "examples"];
+        candidates
+            .iter()
+            .filter_map(|name| {
+                let path = Path::new(name);
+                if Self::has_supported_study_files(path) {
+                    Some(format!("{name}/"))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn normalize_for_runtime(mut config: Self) -> Self {
         let study_dir = Path::new("study");
         let human_eval_dir = Path::new("human-eval");
 
         let configured_paths = &config.bootstrap_config.document_paths;
         let paths_empty = configured_paths.is_empty();
+        let default_study_only = configured_paths.len() == 1
+            && configured_paths[0].trim().trim_end_matches('/') == "study";
         let default_human_eval_only = configured_paths.len() == 1
             && configured_paths[0].trim().trim_end_matches('/') == "human-eval";
 
-        if study_dir.exists() && (paths_empty || default_human_eval_only) {
-            config.bootstrap_config.document_paths = vec!["study/".to_string()];
-            info!("Bootstrap document paths normalized to study/ (project corpus).");
-        } else if paths_empty && human_eval_dir.exists() {
-            config.bootstrap_config.document_paths = vec!["human-eval/".to_string()];
-            info!("Bootstrap document paths defaulted to human-eval/.");
+        if paths_empty || default_human_eval_only || default_study_only {
+            let discovered = Self::discover_project_study_paths();
+            if !discovered.is_empty() {
+                config.bootstrap_config.document_paths = discovered;
+                info!(
+                    "Bootstrap document paths normalized to discovered project corpora: {:?}",
+                    config.bootstrap_config.document_paths
+                );
+            } else if study_dir.exists() {
+                config.bootstrap_config.document_paths = vec!["study/".to_string()];
+                info!("Bootstrap document paths normalized to study/.");
+            } else if human_eval_dir.exists() {
+                config.bootstrap_config.document_paths = vec!["human-eval/".to_string()];
+                info!("Bootstrap document paths defaulted to human-eval/.");
+            }
         }
 
         if config.proxy_config.require_thought_ops && config.proxy_config.min_thought_ops < 2 {

@@ -99,9 +99,6 @@ impl BootstrapManager {
                 .progress_chars("#>-"),
         );
 
-        let engine = self.ml_engine.read().await;
-        let mut pc = self.pc_hierarchy.write().await;
-
         for file_path in all_files {
             let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
             bar.set_message(format!("Studying: {}", file_name));
@@ -211,13 +208,26 @@ impl BootstrapManager {
                             preview
                         );
 
-                        let sequence_tensor = engine.process_text_sequence(&chunk).await?;
+                        let sequence_tensor = {
+                            let engine = self.ml_engine.read().await;
+                            engine.process_text_sequence(&chunk).await?
+                        };
 
-                        // Clear temporal state between chunks to prevent "thought bleeding"
-                        pc.reset_state()?;
-
-                        let learn_result = pc.learn_sequence(&sequence_tensor, None);
+                        let learn_result = {
+                            // Keep lock scope narrow so answering is not blocked during long study runs.
+                            let mut pc = self.pc_hierarchy.write().await;
+                            pc.reset_state()?;
+                            pc.learn_sequence(&sequence_tensor, None)
+                        };
                         if let Ok(stats) = &learn_result {
+                            if !stats.total_surprise.is_finite() {
+                                warn!(
+                                    "Non-finite study loss detected for line {} paragraph {}. Skipping stats entry.",
+                                    idx + 1,
+                                    paragraph_idx + 1
+                                );
+                                continue;
+                            }
                             let n_levels = stats.level_surprises.len();
                             if n_levels >= 2 {
                                 let top_l = n_levels.saturating_sub(2);
@@ -641,9 +651,17 @@ impl BootstrapManager {
                     }).ok()?;
 
                     local_pc.reset_state().ok()?;
+                    local_pc.checkpoint_weights().ok()?;
 
                     let learn_result = local_pc.learn_sequence(&sequence_tensor, None);
         if let Ok(stats) = &learn_result {
+            if !stats.total_surprise.is_finite() {
+                local_pc.rollback_weights().ok()?;
+                tracing::warn!(
+                    "Non-finite study loss for paragraph; rolled back local weights."
+                );
+                continue;
+            }
             let full_input = p.clone();
             let parsed_question = serde_json::from_str::<Value>(&full_input).ok();
             let canonical_solution_value = parsed_question
@@ -713,17 +731,21 @@ impl BootstrapManager {
                                     if let Ok(guided_stats) =
                                         local_pc.learn_sequence(&canonical_tensor, None)
                                     {
-                                        let guided_belief =
-                                            local_pc.levels.last().unwrap().beliefs.clone();
-                                        let guided_plan = decode_plan_from_belief(
-                                            &guided_belief,
-                                            &decoder_arc_for_blocking,
-                                            &dict_arc_for_blocking,
-                                        );
-                                        guided_replay_info = Some(GuidedReplayInfo {
-                                            plan: guided_plan,
-                                            loss: guided_stats.total_surprise,
-                                        });
+                                        if !guided_stats.total_surprise.is_finite() {
+                                            local_pc.rollback_weights().ok()?;
+                                        } else {
+                                            let guided_belief =
+                                                local_pc.levels.last().unwrap().beliefs.clone();
+                                            let guided_plan = decode_plan_from_belief(
+                                                &guided_belief,
+                                                &decoder_arc_for_blocking,
+                                                &dict_arc_for_blocking,
+                                            );
+                                            guided_replay_info = Some(GuidedReplayInfo {
+                                                plan: guided_plan,
+                                                loss: guided_stats.total_surprise,
+                                            });
+                                        }
                                     }
                                 }
                             }
