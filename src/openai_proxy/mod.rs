@@ -397,7 +397,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_reasoning_mode=deterministic_bounded\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_cycle_id,
@@ -2775,6 +2775,7 @@ mod proxy_utility_tests {
         assert!(response.contains("Iteration 2/3 [completed]"));
         assert!(response.contains("Iteration 3/3 [pending]"));
         assert!(response.contains("executor_state=bounded_single_pass"));
+        assert!(response.contains("executor_reasoning_mode=deterministic_bounded"));
         assert!(response.contains("executor_contract_version=v1"));
         assert!(response.contains("executor_cycle_id=cycle-1"));
         assert!(response.contains("executor_transition=verify->done"));
@@ -2828,6 +2829,7 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_transition=execute->verify"));
         assert!(response.contains("executor_phase_index=2"));
         assert!(response.contains("executor_phase_total=4"));
+        assert!(response.contains("executor_reasoning_mode=deterministic_bounded"));
     }
 
     #[test]
