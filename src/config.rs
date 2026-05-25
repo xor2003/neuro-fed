@@ -311,6 +311,31 @@ impl From<config::ConfigError> for NodeError {
 }
 
 impl NodeConfig {
+    fn normalize_for_runtime(mut config: Self) -> Self {
+        let study_dir = Path::new("study");
+        let human_eval_dir = Path::new("human-eval");
+
+        let configured_paths = &config.bootstrap_config.document_paths;
+        let paths_empty = configured_paths.is_empty();
+        let default_human_eval_only = configured_paths.len() == 1
+            && configured_paths[0].trim().trim_end_matches('/') == "human-eval";
+
+        if study_dir.exists() && (paths_empty || default_human_eval_only) {
+            config.bootstrap_config.document_paths = vec!["study/".to_string()];
+            info!("Bootstrap document paths normalized to study/ (project corpus).");
+        } else if paths_empty && human_eval_dir.exists() {
+            config.bootstrap_config.document_paths = vec!["human-eval/".to_string()];
+            info!("Bootstrap document paths defaulted to human-eval/.");
+        }
+
+        if config.proxy_config.require_thought_ops && config.proxy_config.min_thought_ops < 2 {
+            config.proxy_config.min_thought_ops = 2;
+            info!("Raised min_thought_ops to 2 for more reliable reasoning trajectories.");
+        }
+
+        config
+    }
+
     pub fn load_from_file(path: &str) -> Result<Self, NodeError> {
         let path = Path::new(path);
         if !path.exists() {
@@ -344,14 +369,14 @@ impl NodeConfig {
         match Self::load_from_file(CONFIG_FILE) {
             Ok(config) => {
                 info!("Configuration loaded from {}", CONFIG_FILE);
-                config
+                Self::normalize_for_runtime(config)
             }
             Err(e) => {
                 warn!(
                     "Failed to load configuration from {}: {}. Using default configuration.",
                     CONFIG_FILE, e
                 );
-                Self::default()
+                Self::normalize_for_runtime(Self::default())
             }
         }
     }
@@ -513,7 +538,7 @@ impl Default for BootstrapConfig {
             batch_size: 32,
             max_epochs: 100, // Increased from 10 to ensure better decoder convergence
             learning_rate: 0.001,
-            document_paths: vec!["human-eval/".to_string()],
+            document_paths: vec!["study/".to_string()],
         }
     }
 }
