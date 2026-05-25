@@ -343,6 +343,16 @@ fn build_single_pass_code_executor_response(
         "pending"
     };
     let verification_result = derive_code_executor_verification_result(&phase_outcomes);
+    let executor_next_action = if verification_result == "passed" {
+        "none"
+    } else {
+        "run verification command and collect artifact"
+    };
+    let executor_blockers = if verification_result == "passed" {
+        "none"
+    } else {
+        "verification not executed in this bounded cycle"
+    };
     let phase_state = CodeExecutorPhaseState {
         phase: CodeExecutorPhase::Execute.as_str(),
         iteration: 1,
@@ -367,7 +377,7 @@ fn build_single_pass_code_executor_response(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_contract_version=v1\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         phase_trace,
@@ -376,6 +386,8 @@ fn build_single_pass_code_executor_response(
         phase_state.iteration,
         phase_state.max_iterations,
         phase_state.remaining_iterations,
+        executor_next_action,
+        executor_blockers,
         contract.touched_area_summary,
         contract.verification_command,
         verification_exit_code,
@@ -2748,6 +2760,8 @@ mod proxy_utility_tests {
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
         assert!(response.contains("Remaining iteration budget: 0"));
+        assert!(response.contains("executor_next_action=none"));
+        assert!(response.contains("executor_blockers=none"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
         assert!(response.contains("Stop Condition:"));
@@ -2770,6 +2784,8 @@ mod proxy_utility_tests {
         assert!(response.contains("verification_exit_code=pending"));
         assert!(response.contains("verification_artifact=pending"));
         assert!(response.contains("verification_result=pending"));
+        assert!(response.contains("executor_next_action=run verification command and collect artifact"));
+        assert!(response.contains("executor_blockers=verification not executed in this bounded cycle"));
     }
 
     #[test]
