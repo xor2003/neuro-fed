@@ -310,7 +310,8 @@ fn build_single_pass_code_executor_response(
         iteration: 1,
         max_iterations: 1,
     };
-    let bounded_plan = build_bounded_code_executor_plan(contract);
+    let mut bounded_plan = build_bounded_code_executor_plan(contract);
+    advance_code_executor_plan(&mut bounded_plan, 2);
     let plan_lines = bounded_plan
         .steps
         .iter()
@@ -357,6 +358,18 @@ fn build_bounded_code_executor_plan(contract: &CodeExecutionContract) -> CodeExe
     CodeExecutorPlan {
         steps,
         stop_reason: "stop after one bounded executor cycle; report residual risk instead of speculative extra changes".to_string(),
+    }
+}
+
+fn advance_code_executor_plan(plan: &mut CodeExecutorPlan, max_completed_steps: usize) {
+    let mut completed = 0usize;
+    for step in &mut plan.steps {
+        if completed < max_completed_steps {
+            step.status = "completed";
+            completed += 1;
+        } else {
+            step.status = "pending";
+        }
     }
 }
 
@@ -2634,6 +2647,8 @@ mod proxy_utility_tests {
         let response = build_single_pass_code_executor_response("fix parser bug", &contract);
         assert!(response.contains("Goal:"));
         assert!(response.contains("Iteration 1/3"));
+        assert!(response.contains("Iteration 2/3 [completed]"));
+        assert!(response.contains("Iteration 3/3 [pending]"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
         assert!(response.contains("cargo test --lib"));
@@ -2656,6 +2671,20 @@ mod proxy_utility_tests {
         assert_eq!(plan.steps[1].status, "pending");
         assert_eq!(plan.steps[2].status, "pending");
         assert!(plan.stop_reason.contains("bounded executor cycle"));
+    }
+
+    #[test]
+    fn test_advance_code_executor_plan_marks_progress() {
+        let contract = CodeExecutionContract {
+            touched_area_summary: "focus on src/main.rs".to_string(),
+            verification_command: "cargo test --lib".to_string(),
+            residual_risk_focus: "startup regressions".to_string(),
+        };
+        let mut plan = build_bounded_code_executor_plan(&contract);
+        advance_code_executor_plan(&mut plan, 2);
+        assert_eq!(plan.steps[0].status, "completed");
+        assert_eq!(plan.steps[1].status, "completed");
+        assert_eq!(plan.steps[2].status, "pending");
     }
 
     #[test]
