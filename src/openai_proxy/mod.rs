@@ -402,14 +402,16 @@ fn build_single_pass_code_executor_response(
     } else {
         "single_pass_waiting_verification"
     };
+    let executor_plan_revision_reason = derive_executor_plan_revision_reason(verification_result);
     let executor_completed_steps = count_completed_executor_steps(&bounded_plan);
     let executor_total_steps = bounded_plan.steps.len();
     format!(
-        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_plan_state={}\n- executor_execution_state={}\n- executor_reasoning_mode=deterministic_bounded\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- executor_completed_steps={}\n- executor_total_steps={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
+        "Goal:\n{}\n\nPlan:\n{}\n\nImplementation:\n- executor_state=bounded_single_pass\n- executor_plan_state={}\n- executor_execution_state={}\n- executor_plan_revision_reason={}\n- executor_reasoning_mode=deterministic_bounded\n- executor_contract_version=v1\n- executor_cycle_id={}\n- executor_transition={}\n- executor_phase_index={}\n- executor_phase_total={}\n- executor_completed_steps={}\n- executor_total_steps={}\n- Executor phase trace: {}\n- Executor phase outcomes: {}\n- Executor phase: {} ({}/{})\n- Remaining iteration budget: {}\n- executor_next_action={}\n- executor_blockers={}\n- executor_ready_for_next_cycle={}\n- executor_recommended_command={}\n- executor_artifact_path={}\n- Touched area summary: {}\n- Intended change scope: keep edits local to the touched area.\n\nVerification:\n- verification_command={}\n- verification_exit_code={}\n- verification_artifact={}\n- verification_result={}\n\nRisks:\n- {}\n\nStop Condition:\n- {}",
         raw_query,
         plan_lines,
         executor_plan_state,
         executor_execution_state,
+        executor_plan_revision_reason,
         executor_cycle_id,
         executor_transition,
         phase_state.phase_index,
@@ -475,6 +477,14 @@ fn derive_code_executor_verification_result(phase_outcomes: &str) -> &'static st
         "passed"
     } else {
         "pending"
+    }
+}
+
+fn derive_executor_plan_revision_reason(verification_result: &str) -> &'static str {
+    if verification_result == "passed" {
+        "none"
+    } else {
+        "verification_pending"
     }
 }
 
@@ -2796,6 +2806,7 @@ mod proxy_utility_tests {
         assert!(response.contains("executor_state=bounded_single_pass"));
         assert!(response.contains("executor_plan_state=bounded_v1_ready"));
         assert!(response.contains("executor_execution_state=single_pass_validated"));
+        assert!(response.contains("executor_plan_revision_reason=none"));
         assert!(response.contains("executor_reasoning_mode=deterministic_bounded"));
         assert!(response.contains("executor_contract_version=v1"));
         assert!(response.contains("executor_cycle_id=cycle-1"));
@@ -2844,6 +2855,7 @@ mod proxy_utility_tests {
         assert!(response.contains("verification_result=pending"));
         assert!(response.contains("executor_plan_state=bounded_v1_ready"));
         assert!(response.contains("executor_execution_state=single_pass_waiting_verification"));
+        assert!(response.contains("executor_plan_revision_reason=verification_pending"));
         assert!(response.contains("executor_next_action=run verification command and collect artifact"));
         assert!(response.contains("executor_blockers=verification not executed in this bounded cycle"));
         assert!(response.contains("executor_ready_for_next_cycle=true"));
@@ -2923,6 +2935,15 @@ mod proxy_utility_tests {
             stop_reason: "stop".to_string(),
         };
         assert_eq!(count_completed_executor_steps(&plan), 2);
+    }
+
+    #[test]
+    fn test_derive_executor_plan_revision_reason() {
+        assert_eq!(derive_executor_plan_revision_reason("passed"), "none");
+        assert_eq!(
+            derive_executor_plan_revision_reason("pending"),
+            "verification_pending"
+        );
     }
 
     #[test]
