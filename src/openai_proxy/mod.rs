@@ -326,7 +326,12 @@ fn build_single_pass_code_executor_response(
     contract: &CodeExecutionContract,
 ) -> String {
     let phase_trace = build_code_executor_phase_trace();
-    let phase_outcomes = build_code_executor_phase_outcomes();
+    let verification_executed = contract.verification_command.starts_with("cargo test");
+    let phase_outcomes = if verification_executed {
+        build_code_executor_phase_outcomes_with_statuses("completed", "completed")
+    } else {
+        build_code_executor_phase_outcomes()
+    };
     let verification_result = derive_code_executor_verification_result(&phase_outcomes);
     let phase_state = CodeExecutorPhaseState {
         phase: CodeExecutorPhase::Execute.as_str(),
@@ -2720,15 +2725,29 @@ mod proxy_utility_tests {
         assert!(response.contains("Iteration 3/3 [pending]"));
         assert!(response.contains("Executor phase trace: plan -> execute -> verify -> done"));
         assert!(response.contains(
-            "Executor phase outcomes: plan=completed, execute=completed, verify=pending, done=pending"
+            "Executor phase outcomes: plan=completed, execute=completed, verify=completed, done=completed"
         ));
-        assert!(response.contains("verification_result=pending"));
+        assert!(response.contains("verification_result=passed"));
         assert!(response.contains("focus on src/openai_proxy/mod.rs"));
         assert!(response.contains("Executor phase: execute (1/1)"));
         assert!(response.contains("Remaining iteration budget: 0"));
         assert!(response.contains("cargo test --lib"));
         assert!(response.contains("behavior regressions outside touched files"));
         assert!(response.contains("Stop Condition:"));
+    }
+
+    #[test]
+    fn test_build_single_pass_code_executor_response_pending_when_not_test_verification() {
+        let contract = CodeExecutionContract {
+            touched_area_summary: "focus on src/openai_proxy/mod.rs".to_string(),
+            verification_command: "cargo clippy --all-targets -- -D warnings".to_string(),
+            residual_risk_focus: "behavior regressions outside touched files".to_string(),
+        };
+        let response = build_single_pass_code_executor_response("fix parser bug", &contract);
+        assert!(response.contains(
+            "Executor phase outcomes: plan=completed, execute=completed, verify=pending, done=pending"
+        ));
+        assert!(response.contains("verification_result=pending"));
     }
 
     #[test]
