@@ -115,7 +115,29 @@ impl<'a> RequestExecutor<'a> {
     }
 
     async fn execute_phase(&self, planned: PlannedRequest) -> Result<OpenAiResponse, ProxyError> {
-        self.proxy.handle_chat_completion_impl(planned.req).await
+        let raw_query = planned
+            .req
+            .messages
+            .last()
+            .map(extract_message_text)
+            .unwrap_or_default();
+        let (reasoning_task, _) = detect_reasoning_task(&raw_query);
+        let intent = detect_intent(&raw_query, reasoning_task.is_some());
+        match intent {
+            AssistantIntent::CodeTask => self.execute_code_task_phase(planned.req).await,
+            _ => self.proxy.handle_chat_completion_impl(planned.req).await,
+        }
+    }
+
+    async fn execute_code_task_phase(
+        &self,
+        req: OpenAiRequest,
+    ) -> Result<OpenAiResponse, ProxyError> {
+        // Dedicated seam for the forthcoming code-task executor loop.
+        self.proxy
+            .ui_push_step("Code executor path".to_string())
+            .await;
+        self.proxy.handle_chat_completion_impl(req).await
     }
 
     async fn verify_phase(
