@@ -26,3 +26,18 @@ config.toml
 !.cargo/config.toml
 .env
 .env.local
+
+# Runtime / local state
+neurofed.db
+detail.log
+output.log
+learning_feedback.csv
+reasoning_feedback.csv
+
+# Local model cache and managed model downloads
+models/
+
+# Python/venv artifacts used by data scripts
+.venv/
+__pycache__/
+*.pyc

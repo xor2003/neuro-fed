@@ -313,11 +313,20 @@ impl BootstrapManager {
                     "Epoch {}: Loss = {:.4}, LR = {:.6}, best_loss = {:.4}, plateau_count = {}",
                     epoch, avg_loss, lr, best_loss, patience
                 );
+                let learning_msg = format!(
+                    "Bootstrap learning\nQuestion: {{\"task_id\":\"synthetic_epoch_{epoch}\"}}\nAnswer: synthetic bootstrap epoch\nDecoded Output: synthetic\nTrajectory: synthetic_training\nLoss: {:.4}\nResults: lr={:.6} best_loss={:.4} plateau_count={}",
+                    avg_loss, lr, best_loss, patience
+                );
+                append_learning_detail(&learning_msg);
             } else {
                 warn!(
                     "Epoch {} produced non-finite loss, aborting synthetic training.",
                     epoch
                 );
+                let fail_msg = format!(
+                    "Bootstrap learning\nQuestion: {{\"task_id\":\"synthetic_epoch_{epoch}\"}}\nAnswer: synthetic bootstrap epoch\nDecoded Output: synthetic\nTrajectory: synthetic_training\nLoss: nan\nResults: non_finite_loss"
+                );
+                append_learning_detail(&fail_msg);
                 break;
             }
 

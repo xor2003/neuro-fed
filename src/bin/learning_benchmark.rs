@@ -1388,6 +1388,8 @@ fn main() -> Result<()> {
             "Running learning benchmark for paths: {:?}",
             args.study_paths
         );
+        let _ = fs::remove_file("detail.log");
+        let _ = fs::remove_file("output.log");
         let config_path = env::temp_dir().join("learning_benchmark.toml");
         let mut config = format!(
             "[bootstrap_config]\ndocument_paths = {}\n",
